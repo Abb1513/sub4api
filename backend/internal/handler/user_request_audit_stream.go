@@ -11,21 +11,25 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
-const userRequestAuditResponseLimit = 256 * 1024
+const userRequestAuditResponseLimit = 16 * 1024 * 1024
 
 // auditResponseWriter records the bytes actually written to the downstream
 // client. It deliberately delegates all optional interfaces to gin's writer.
 type auditResponseWriter struct {
 	gin.ResponseWriter
-	mu     sync.Mutex
-	body   bytes.Buffer
-	status int
+	mu           sync.Mutex
+	body         bytes.Buffer
+	status       int
+	truncated    bool
+	terminalSeen bool
+	terminalTail []byte
 }
 
 func (w *auditResponseWriter) WriteHeader(status int) {
@@ -44,13 +48,60 @@ func (w *auditResponseWriter) WriteString(s string) (int, error) { return w.Writ
 func (w *auditResponseWriter) capture(p []byte) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	terminal, tail := auditStreamChunkTerminal(w.terminalTail, p)
+	w.terminalTail = tail
 	if w.body.Len() < userRequestAuditResponseLimit {
 		n := userRequestAuditResponseLimit - w.body.Len()
 		if len(p) > n {
 			p = p[:n]
+			w.truncated = true
 		}
 		_, _ = w.body.Write(p)
+	} else if len(p) > 0 {
+		w.truncated = true
 	}
+	if terminal {
+		w.terminalSeen = true
+	}
+}
+func auditStreamChunkTerminal(previous, chunk []byte) (bool, []byte) {
+	const prefixLimit = 8192
+	terminal := false
+	for len(chunk) > 0 {
+		end := bytes.IndexByte(chunk, '\n')
+		line := chunk
+		if end >= 0 {
+			line = chunk[:end]
+		}
+		if len(previous) > 0 {
+			remaining := prefixLimit - len(previous)
+			if remaining > 0 {
+				previous = append(previous, line[:min(len(line), remaining)]...)
+			}
+			line = previous
+		}
+		if end < 0 {
+			if len(previous) == 0 {
+				previous = append([]byte(nil), line[:min(len(line), prefixLimit)]...)
+			}
+			return terminal, previous
+		}
+		terminal = terminal || auditTerminalLine(line)
+		previous = nil
+		chunk = chunk[end+1:]
+	}
+	return terminal, previous
+}
+
+func auditTerminalLine(line []byte) bool {
+	line = bytes.TrimSpace(line)
+	if bytes.HasPrefix(line, []byte("data:")) {
+		line = bytes.TrimSpace(line[5:])
+		if bytes.Equal(line, []byte("[DONE]")) {
+			return true
+		}
+	}
+	return openAIWSAuditTerminal(line) || gjson.GetBytes(line, "type").String() == "message_stop"
 }
 func (w *auditResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
@@ -99,7 +150,7 @@ func beginUserRequestAudit(c *gin.Context, svc *service.UserRequestAuditService,
 	if apiKey.Group != nil {
 		groupName = apiKey.Group.Name
 	}
-	capture := service.UserRequestAuditCapture{UserID: userID, APIKeyID: apiKey.ID, GroupID: groupID, GroupName: groupName, Protocol: protocol, Endpoint: endpoint, RequestedModel: model, ClientRequestID: strings.TrimSpace(c.GetHeader("X-Request-ID")), ResponseID: strings.TrimSpace(gjson.GetBytes(body, "response.id").String()), PreviousResponseID: strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()), Body: body, Metadata: map[string]any{"user_agent": c.GetHeader("User-Agent")}}
+	capture := service.UserRequestAuditCapture{UserID: userID, SessionID: auditSessionID(c, body), APIKeyID: apiKey.ID, GroupID: groupID, GroupName: groupName, Protocol: protocol, Endpoint: endpoint, RequestedModel: model, ClientRequestID: strings.TrimSpace(c.GetHeader("X-Request-ID")), ResponseID: strings.TrimSpace(gjson.GetBytes(body, "response.id").String()), PreviousResponseID: strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()), Body: body, Metadata: map[string]any{"user_agent": c.GetHeader("User-Agent")}}
 	rec := &userRequestAuditRecorder{service: svc, key: svc.Enqueue(capture), protocol: protocol}
 	if rec.key == "" {
 		return rec
@@ -120,18 +171,27 @@ func (r *userRequestAuditRecorder) Finish(status int, err error, metadata map[st
 		return
 	}
 	var raw []byte
+	truncated := false
 	if r.writer != nil {
 		r.writer.mu.Lock()
 		raw = append([]byte(nil), r.writer.body.Bytes()...)
+		truncated = r.writer.truncated
+		terminalSeen := r.writer.terminalSeen
+		if !terminalSeen && len(r.writer.terminalTail) > 0 {
+			terminalSeen, _ = auditStreamChunkTerminal(nil, append(append([]byte(nil), r.writer.terminalTail...), '\n'))
+		}
 		if status == 0 {
 			status = r.writer.status
 		}
 		r.writer.mu.Unlock()
+		if err == nil && truncated && !terminalSeen {
+			err = errors.New("response capture truncated before terminal response")
+		}
 	}
 	if status == 0 {
 		status = http.StatusOK
 	}
-	if err == nil && auditStreamIncomplete(raw) {
+	if err == nil && !truncated && auditStreamIncomplete(raw) {
 		err = errors.New("stream ended before terminal response")
 	}
 	state := "completed"
@@ -142,6 +202,9 @@ func (r *userRequestAuditRecorder) Finish(status int, err error, metadata map[st
 		metadata = map[string]any{}
 	}
 	metadata["response_bytes"] = len(raw)
+	if truncated {
+		metadata["response_truncated"] = true
+	}
 	if len(raw) > 0 {
 		metadata["response_sha256"] = auditSHA256(raw)
 	}
@@ -223,24 +286,68 @@ func endpointForAudit(c *gin.Context, fallback string) string {
 }
 
 type wsAuditTurn struct {
-	key   string
-	body  bytes.Buffer
-	model string
+	key       string
+	body      bytes.Buffer
+	model     string
+	truncated bool
+	terminal  bool
 }
 type wsAuditRecorder struct {
-	svc    *service.UserRequestAuditService
-	apiKey *service.APIKey
-	userID int64
-	mu     sync.Mutex
-	turns  map[int]*wsAuditTurn
-	active int
+	svc       *service.UserRequestAuditService
+	apiKey    *service.APIKey
+	userID    int64
+	sessionID string
+	mu        sync.Mutex
+	turns     map[int]*wsAuditTurn
+	active    int
 }
 
-func newWSAuditRecorder(svc *service.UserRequestAuditService, apiKey *service.APIKey, userID int64) *wsAuditRecorder {
+func auditSessionID(c *gin.Context, body []byte) string {
+	if sessionID := service.ExtractClientSessionID(c); sessionID != "" {
+		return sessionID
+	}
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	if sessionID := validAuditSessionID(c.GetHeader("X-Session-Id")); sessionID != "" {
+		return sessionID
+	}
+	if parsed := service.ParseMetadataUserID(strings.TrimSpace(gjson.GetBytes(body, "metadata.user_id").String())); parsed != nil {
+		if sessionID := validAuditSessionID(parsed.SessionID); sessionID != "" {
+			return sessionID
+		}
+	}
+	for _, path := range []string{"session_id", "conversation_id", "client_metadata.session_id", "client_metadata.conversation_id"} {
+		if sessionID := validAuditSessionID(gjson.GetBytes(body, path).String()); sessionID != "" {
+			return sessionID
+		}
+	}
+	return ""
+}
+
+func validAuditSessionID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !utf8.ValidString(raw) {
+		return ""
+	}
+	count := 0
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+		count++
+		if count > 255 {
+			return ""
+		}
+	}
+	return raw
+}
+
+func newWSAuditRecorder(svc *service.UserRequestAuditService, apiKey *service.APIKey, userID int64, sessionID string) *wsAuditRecorder {
 	if svc == nil || apiKey == nil {
 		return nil
 	}
-	return &wsAuditRecorder{svc: svc, apiKey: apiKey, userID: userID, turns: make(map[int]*wsAuditTurn)}
+	return &wsAuditRecorder{svc: svc, apiKey: apiKey, userID: userID, sessionID: sessionID, turns: make(map[int]*wsAuditTurn)}
 }
 func (r *wsAuditRecorder) Start(turn int, body []byte, model string) {
 	if r == nil || turn <= 0 {
@@ -255,7 +362,7 @@ func (r *wsAuditRecorder) Start(turn int, body []byte, model string) {
 	if r.apiKey.Group != nil {
 		name = r.apiKey.Group.Name
 	}
-	key := r.svc.Enqueue(service.UserRequestAuditCapture{UserID: r.userID, APIKeyID: r.apiKey.ID, GroupID: gid, GroupName: name, Protocol: "openai_responses_ws", Endpoint: "/openai/v1/responses", RequestedModel: model, PreviousResponseID: strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()), Body: body, Metadata: map[string]any{"transport": "websocket", "turn": turn}})
+	key := r.svc.Enqueue(service.UserRequestAuditCapture{UserID: r.userID, SessionID: r.sessionID, APIKeyID: r.apiKey.ID, GroupID: gid, GroupName: name, Protocol: "openai_responses_ws", Endpoint: "/openai/v1/responses", RequestedModel: model, PreviousResponseID: strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()), Body: body, Metadata: map[string]any{"transport": "websocket", "turn": turn}})
 	if key == "" {
 		return
 	}
@@ -265,18 +372,27 @@ func (r *wsAuditRecorder) Start(turn int, body []byte, model string) {
 	r.mu.Unlock()
 }
 func (r *wsAuditRecorder) Observe(direction string, _ int, payload []byte) {
-	if r == nil || len(payload) == 0 {
+	if r == nil || len(payload) == 0 || direction != "server" {
 		return
 	}
 	r.mu.Lock()
 	turn := r.active
 	t := r.turns[turn]
-	if t != nil && len(payload)+t.body.Len() <= userRequestAuditResponseLimit {
-		_, _ = t.body.Write(payload)
-		_, _ = t.body.Write([]byte("\n"))
+	terminal := false
+	if t != nil {
+		if len(payload)+t.body.Len() > userRequestAuditResponseLimit {
+			t.truncated = true
+		} else {
+			_, _ = t.body.Write(payload)
+			_, _ = t.body.Write([]byte("\n"))
+		}
+		if direction == "server" && openAIWSAuditTerminal(payload) {
+			t.terminal = true
+			terminal = true
+		}
 	}
 	r.mu.Unlock()
-	if direction == "server" && openAIWSAuditTerminal(payload) {
+	if terminal {
 		r.Finish(turn, nil)
 	}
 }
@@ -302,14 +418,18 @@ func (r *wsAuditRecorder) Finish(turn int, err error) {
 	if model == "" {
 		model = t.model
 	}
-	if err == nil && !auditWSHasTerminal(raw) {
+	if err == nil && !t.terminal && !auditWSHasTerminal(raw) {
 		err = errors.New("websocket turn ended before terminal response")
 	}
 	status := "completed"
 	if err != nil {
 		status = "failed"
 	}
-	r.svc.Complete(service.UserRequestAuditCompletion{LogicalKey: t.key, ResponseID: id, UpstreamModel: model, ResponseChatML: auditResponseChatML(raw), Status: status, LastError: auditErrorString(err), Metadata: map[string]any{"transport": "websocket", "response_bytes": len(raw)}})
+	metadata := map[string]any{"transport": "websocket", "response_bytes": len(raw)}
+	if t.truncated {
+		metadata["response_truncated"] = true
+	}
+	r.svc.Complete(service.UserRequestAuditCompletion{LogicalKey: t.key, ResponseID: id, UpstreamModel: model, ResponseChatML: auditResponseChatML(raw), Status: status, LastError: auditErrorString(err), Metadata: metadata})
 }
 func (r *wsAuditRecorder) FinishAll(err error) {
 	if r == nil {
@@ -339,23 +459,10 @@ func auditStreamIncomplete(raw []byte) bool {
 	if !bytes.Contains(raw, []byte("data:")) {
 		return false
 	}
-	if bytes.Contains(raw, []byte("[DONE]")) || bytes.Contains(raw, []byte("message_stop")) {
-		return false
-	}
-	for _, line := range bytes.Split(raw, []byte("\n")) {
-		line = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if openAIWSAuditTerminal(line) {
-			return false
-		}
-	}
-	return true
+	terminal, tail := auditStreamChunkTerminal(nil, raw)
+	return !terminal && !auditTerminalLine(tail)
 }
 func auditWSHasTerminal(raw []byte) bool {
-	for _, line := range bytes.Split(raw, []byte("\n")) {
-		line = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if openAIWSAuditTerminal(line) {
-			return true
-		}
-	}
-	return bytes.Contains(raw, []byte("[DONE]"))
+	terminal, tail := auditStreamChunkTerminal(nil, raw)
+	return terminal || auditTerminalLine(tail)
 }

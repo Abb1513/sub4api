@@ -2523,7 +2523,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	)
 	setOpsRequestContext(c, reqModel, true)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeWSV2))
-	wsAudit := newWSAuditRecorder(h.userRequestAuditService, apiKey, subject.UserID)
+	wsAudit := newWSAuditRecorder(h.userRequestAuditService, apiKey, subject.UserID, auditSessionID(c, firstMessage))
 	if wsAudit != nil {
 		wsAudit.Start(1, firstMessage, reqModel)
 		defer wsAudit.FinishAll(ctx.Err())

@@ -28,24 +28,54 @@ export interface UserRequestAudit {
   response_chatml?: string
   chatml?: string
   conversation_key?: string
+  user_label?: string
+  request_count?: number
+}
+export interface UserRequestAuditMessage {
+  role: string
+  content: string
+  reasoning?: string
+  tool_name?: string
+  call_id?: string
+  kind: 'text' | 'think' | 'tool_call' | 'tool_result' | 'metadata' | 'error'
+  request_id: number
+  incomplete?: boolean
+}
+export interface UserRequestAuditConversation {
+  id: number
+  user_label: string
+  request_count: number
+  messages: UserRequestAuditMessage[]
+  requests: UserRequestAudit[]
 }
 export interface UserRequestAuditQuery {
-  page?: number; page_size?: number; user_id?: number | string; group_id?: number | string; group_name?: string; requested_model?: string; response_id?: string; client_request_id?: string; status?: string; protocol?: string; start_time?: string; end_time?: string; q?: string
+  page?: number; page_size?: number; user_id?: number; group_id?: number; group_name?: string; requested_model?: string; response_id?: string; client_request_id?: string; status?: string; protocol?: string; start_time?: string; end_time?: string; q?: string
 }
 export interface UserRequestAuditConfig {
   retention_days: number
   cleanup_interval_hours: number
-  max_shard_bytes: number
   group_ids: number[]
 }
-export interface UserRequestAuditStatus { total_bytes: number; file_count: number; current_shard_bytes: number; oldest_at?: string; latest_at?: string; last_cleanup_at?: string }
-export interface UserRequestAuditGroupStat { group_id?: number; group_name?: string; total: number; completed: number; failed: number; input_total: number; output_total: number; latest_at?: string }
+export interface UserRequestAuditStatus { total_bytes: number; file_count: number; disk_total_bytes: number; disk_free_bytes: number; recording_paused: boolean; pause_reason?: string; oldest_at?: string; latest_at?: string; last_cleanup_at?: string }
+export interface UserRequestAuditGroupStat { group_id?: number; group_name?: string; count: number; completed: number; failed: number; input_total: number; output_total: number; latest_at?: string }
 export type UserRequestAuditGroupStatsResponse = UserRequestAuditGroupStat[]
 export type UserRequestAuditExportFormat = 'jsonl' | 'json'
 export interface UserRequestAuditExportResult { blob: Blob; filename: string }
+export interface UserRequestAuditExportJob {
+  id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  format: UserRequestAuditExportFormat
+  created_at: string
+  completed_at?: string
+  expires_at?: string
+  filename?: string
+  error?: string
+  rows: number
+  size_bytes?: number
+}
 const exportFilters = (filters: UserRequestAuditQuery): Omit<UserRequestAuditQuery, 'page' | 'page_size'> => { const { page: _page, page_size: _pageSize, ...rest } = filters; return rest }
 function filenameFromDisposition(value: unknown, format: UserRequestAuditExportFormat): string {
-  const fallback = `user-request-audit.${format}`
+  const fallback = `user-request-audit.${format}.gz`
   if (typeof value !== 'string') return fallback
   const match = value.match(/filename\*?=(?:UTF-8''|"?)([^";]+)"?/i)
   let candidate = ''
@@ -56,14 +86,37 @@ function filenameFromDisposition(value: unknown, format: UserRequestAuditExportF
 export const userRequestAuditAPI = {
   async list(params: UserRequestAuditQuery): Promise<PaginatedResponse<UserRequestAudit>> { return (await apiClient.get('/admin/user-request-audit', { params })).data },
   async get(id: number): Promise<UserRequestAudit> { return (await apiClient.get(`/admin/user-request-audit/${id}`)).data },
+  async getConversation(id: number, signal?: AbortSignal): Promise<UserRequestAuditConversation> { return (await apiClient.get(`/admin/user-request-audit/${id}/conversation`, { signal })).data },
   async getGroupStats(params: UserRequestAuditQuery): Promise<UserRequestAuditGroupStatsResponse> { return (await apiClient.get('/admin/user-request-audit/groups', { params: exportFilters(params) })).data },
   async getStatus(): Promise<UserRequestAuditStatus> { return (await apiClient.get('/admin/user-request-audit/status')).data },
   async getConfig(): Promise<UserRequestAuditConfig> { return (await apiClient.get('/admin/user-request-audit/config')).data },
   async updateConfig(config: Partial<UserRequestAuditConfig>): Promise<UserRequestAuditConfig> { return (await apiClient.put('/admin/user-request-audit/config', config)).data },
   async cleanup(): Promise<void> { await apiClient.post('/admin/user-request-audit/cleanup') },
-  async export(params: UserRequestAuditQuery, format: UserRequestAuditExportFormat): Promise<UserRequestAuditExportResult> {
-    const response = await apiClient.post('/admin/user-request-audit/export', { format, ...exportFilters(params) }, { responseType: 'blob' })
-    return { blob: response.data as Blob, filename: filenameFromDisposition(response.headers?.['content-disposition'], format) }
+  async clear(): Promise<{ message?: string }> { return (await apiClient.post('/admin/user-request-audit/clear')).data },
+  async export(params: UserRequestAuditQuery, format: UserRequestAuditExportFormat, conversationIDs?: number[]): Promise<UserRequestAuditExportJob> {
+    const selection = conversationIDs?.length ? { conversation_ids: conversationIDs } : exportFilters(params)
+    return (await apiClient.post('/admin/user-request-audit/export', { format, ...selection })).data
+  },
+  async getExports(signal?: AbortSignal): Promise<UserRequestAuditExportJob[]> {
+    return (await apiClient.get('/admin/user-request-audit/exports', { signal })).data
+  },
+  async downloadExport(job: UserRequestAuditExportJob): Promise<UserRequestAuditExportResult> {
+    const response = await apiClient.get(`/admin/user-request-audit/exports/${encodeURIComponent(job.id)}/download`, {
+      responseType: 'blob',
+      timeout: 0,
+      // Keep 401 on the authenticated client's refresh path; decode other blob errors here.
+      validateStatus: status => (status >= 200 && status < 300) || (status >= 400 && status !== 401)
+    })
+    if (response.status >= 400) {
+      const text = await (response.data as Blob).text()
+      let message = text
+      try {
+        const error = JSON.parse(text)
+        message = error.message || error.detail || text
+      } catch { /* Plain-text server errors are already readable. */ }
+      throw new Error(message || `HTTP ${response.status}`)
+    }
+    return { blob: response.data as Blob, filename: filenameFromDisposition(response.headers?.['content-disposition'], job.format) }
   }
 }
 export default userRequestAuditAPI

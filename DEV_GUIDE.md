@@ -500,7 +500,22 @@ sub2api-bmai/
 
 用户请求审计的分组记录开关默认全部关闭（空的 `group_ids` allowlist）。管理员必须在“用户请求审计”页面选择分组并显式保存；页面可选择启用或停用的分组。只会记录保存选择之后发生的请求，已有审计记录不会因修改 allowlist 被删除。
 
-审计配置接口为 `GET/PUT /api/v1/admin/user-request-audit/config`。`group_ids` 是分组 ID 数组：显式发送 `[]` 会清空 allowlist 并停止所有新记录；PUT 省略该字段时保留现有选择。保留天数、清理间隔和分片大小等归档设置与该 allowlist 分开维护。
+审计配置接口为 `GET/PUT /api/v1/admin/user-request-audit/config`。`group_ids` 是分组 ID 数组：显式发送 `[]` 会清空 allowlist 并停止所有新记录；PUT 省略该字段时保留现有选择。保留天数和清理间隔与该 allowlist 分开维护；JSON 会话存储不再使用分片大小设置。
+
+每个会话只保存一个 `$DATA_DIR/user-request-audit/conversations/<首条请求ID>.json`，包括 `messages`、原始 `requests` 和恢复所需的逻辑键。同一会话追加请求后原子替换同一个文件；临时文件及持久化操作日志保证中断恢复。迁移 248 新建 `user_request_audit_conversations` 和 `user_request_audit_request_index`，只存检索元数据、关联关系及相对文件路径，不存请求/响应正文。普通列表查询走数据库索引；正文搜索才读取候选文件。
+
+会话关联限定在用户/API Key 范围内，优先使用真实客户端会话标识，再使用 response 链或唯一、完整且有助手/工具证据的精确历史前缀。不使用 prompt-cache key、相同首问或被截断的前缀猜测会话。显示用户名（缺失时邮箱）及 `#UID`、请求数；筛选条件选择会话，不截断会话内容，分页仅影响列表。
+
+`GET /api/v1/admin/user-request-audit/:id/conversation` 返回完整结构化会话。页面展开卡片后按顺序渲染用户、助手、工具调用、工具结果；THINK 和系统/元数据默认折叠。支持 Responses、Chat Completions、Anthropic 的实际明文推理及工具事件，禁止把 reasoning 配置或加密推理当作 THINK。助手 Markdown 经消毒，不自动加载外部媒体。重发历史去重时保留先前保存、客户端未重发的 THINK。
+
+启动时将旧 NDJSON 的最新记录迁移为会话 JSON，验证后把原文件移至 `$DATA_DIR/user-request-audit-migration-backup`；索引可由 JSON 重建。清空同时删除迁移备份，保留配置及单调 ID，重启不会恢复已清空的数据。旧版 32 KiB 截断造成的历史缺失不可恢复，阅读器会显示边界说明。新请求投影及响应捕获上限为 16 MiB，超过时明确标记截断；元数据仍限制为 32 KiB。
+
+`POST /api/v1/admin/user-request-audit/export` 提交后台任务，接收 `format: json|jsonl` 和可选 `conversation_ids`（列表代表记录 ID 数组），返回任务信息而不是文件。空 ID 筛选字段应省略，非空 ID 必须为 JSON 整数。单 worker 有界队列生成 `.json.gz`/`.jsonl.gz`，每个对象包含与阅读器一致的 `messages`、原始 `requests` 及合并 `chatml`，不再有 10,000 条导出截断。JSONL 仅是批量导出格式，不是持久化格式。`GET /exports` 获取状态，完成后通过 `GET /exports/:job_id/download` 下载；所有路由继续要求管理员认证。
+
+导出文件位于审计目录的 `exports` 子目录，任务及文件 24 小时过期。任务状态保存在当前进程内，重启清理旧导出产物，原始审计记录不受影响。导出失败不会发布残缺压缩包；清空会取消运行任务、使旧队列写入失效并删除归档与导出文件，保留记录分组和归档配置。`POST /clear` 只在页面显式确认后调用；仍启用记录的分组可继续产生新记录。
+
+`GET /status` 返回审计占用以及所在磁盘的总量、可用量、`recording_paused`、`pause_reason`。实际写入前检查可用空间：低于 2 GiB（2,147,483,648 字节）或容量查询失败时停止记录；恢复空间后自动恢复。导出写入也受磁盘余量保护。清空不会自动删除显式 legacy 查询的旧 SQL 审计表。
+
 
 ## 七、参考资源
 

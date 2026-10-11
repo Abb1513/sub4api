@@ -1,40 +1,61 @@
 package repository
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
+	"github.com/shirou/gopsutil/v4/disk"
 )
 
-const userRequestAuditShardMaxBytes int64 = 64 * 1024 * 1024
-const userRequestAuditScanCap = 200000
+const userRequestAuditMinFreeBytes int64 = 2 * 1024 * 1024 * 1024
 
-type userRequestAuditFileLine struct {
-	Event      string `json:"event"`
-	LogicalKey string `json:"logical_key"`
-	*service.UserRequestAudit
+type auditArchiveEntry struct {
+	row            service.UserRequestAudit
+	conversationID int64
+	proof          service.UserRequestAuditContinuityProof
+}
+type auditDocumentMeta struct {
+	summary service.UserRequestAudit
+	path    string
+	expires time.Time
+}
+type auditDiskConversation struct {
+	Version int `json:"version"`
+	*service.UserRequestAuditConversation
+	LogicalKeys map[string]string `json:"logical_keys"`
+}
+type auditArchiveState struct {
+	NextID      int64   `json:"next_id"`
+	Migrated    bool    `json:"legacy_import_complete"`
+	DeleteIDs   []int64 `json:"pending_delete_ids,omitempty"`
+	Clear       bool    `json:"pending_clear,omitempty"`
+	PendingIDs  []int64 `json:"pending_document_ids,omitempty"`
+	ObsoleteIDs []int64 `json:"obsolete_document_ids,omitempty"`
 }
 
-// FileUserRequestAuditRepository is an append-only NDJSON archive. Complete
-// appends a replacement snapshot; readers fold snapshots by logical key.
+// Payloads are authoritative atomic JSON documents. SQL contains only metadata
+// and relative paths; the in-memory maps support capture association, not polling.
 type FileUserRequestAuditRepository struct {
-	root          string
-	legacy        *UserRequestAuditRepository
-	mu            sync.Mutex
-	maxShardBytes int64
-	lastCleanup   time.Time
-	nextID        atomic.Int64
+	root         string
+	legacy       *UserRequestAuditRepository
+	mu           sync.Mutex
+	lastCleanup  time.Time
+	state        auditArchiveState
+	index        map[int64]auditArchiveEntry
+	documents    map[int64]auditDocumentMeta
+	logicalIndex map[string]int64
+	diskUsage    func(context.Context, string) (int64, int64, error)
 }
 
 func NewFileUserRequestAuditRepository(db *sql.DB) *FileUserRequestAuditRepository {
@@ -42,377 +63,538 @@ func NewFileUserRequestAuditRepository(db *sql.DB) *FileUserRequestAuditReposito
 	if root == "" {
 		root = "./data"
 	}
-	root = filepath.Join(root, "user-request-audit")
-	r := &FileUserRequestAuditRepository{root: filepath.Clean(root), maxShardBytes: 64 * 1024 * 1024}
+	r := &FileUserRequestAuditRepository{root: filepath.Join(root, "user-request-audit")}
 	if db != nil {
 		r.legacy = NewUserRequestAuditRepository(db)
 	}
-	if cfg, ok := r.readConfig(); ok {
-		r.maxShardBytes = cfg.MaxShardBytes
-	}
-	var max int64
-	for _, item := range r.readAll(context.Background(), false) {
-		if item.ID > max {
-			max = item.ID
-		}
-	}
-	r.nextID.Store(max)
+	// The Ent provider completes SQL migrations before exposing this DB. Any
+	// recovery error remains fail-closed and is retried by the first operation.
+	_ = r.ensureIndexLocked(context.Background())
 	return r
 }
 
-func (r *FileUserRequestAuditRepository) Create(ctx context.Context, audit *service.UserRequestAudit) error {
-	if audit == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := os.MkdirAll(r.root, 0o750); err != nil {
+func (r *FileUserRequestAuditRepository) conversationPath(id int64) string {
+	return filepath.Join(r.root, "conversations", strconv.FormatInt(id, 10)+".json")
+}
+func (r *FileUserRequestAuditRepository) statePath() string {
+	return filepath.Join(r.root, "archive-state.json")
+}
+func auditAtomicJSON(path string, value any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	if audit.CreatedAt.IsZero() {
-		audit.CreatedAt = now
-	}
-	if audit.UpdatedAt.IsZero() {
-		audit.UpdatedAt = audit.CreatedAt
-	}
-	if audit.ExpiresAt.IsZero() {
-		audit.ExpiresAt = audit.CreatedAt.AddDate(0, 0, service.UserRequestAuditDefaultRetentionDays)
-	}
-	if audit.ID <= 0 {
-		audit.ID = r.nextID.Add(1)
-	}
-	if audit.ConversationKey == "" {
-		if audit.PreviousResponseID != "" {
-			for _, prior := range r.readAllLocked() {
-				if prior.UserID == audit.UserID && sameGroup(prior.GroupID, audit.GroupID) && prior.Protocol == audit.Protocol && prior.ResponseID == audit.PreviousResponseID && prior.ConversationKey != "" {
-					audit.ConversationKey = prior.ConversationKey
-					break
-				}
-			}
-		}
-		if audit.ConversationKey == "" && audit.FallbackHash != "" {
-			audit.ConversationKey = "fallback:" + audit.FallbackHash
-		}
-		if audit.ConversationKey == "" {
-			audit.ConversationKey = "request:" + audit.LogicalKey
-		}
-	}
-	return r.appendLocked(ctx, "create", audit)
-}
-
-func (r *FileUserRequestAuditRepository) Complete(ctx context.Context, completion *service.UserRequestAuditCompletion) error {
-	if completion == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rows := r.readAllLocked()
-	var found *service.UserRequestAudit
-	for _, row := range rows {
-		if row.LogicalKey == completion.LogicalKey {
-			found = row
-		}
-	}
-	if found == nil {
-		return sql.ErrNoRows
-	}
-	found.UpdatedAt = time.Now().UTC()
-	if completion.ResponseID != "" {
-		found.ResponseID = completion.ResponseID
-		if completion.ResponseID != "" && (strings.HasPrefix(found.ConversationKey, "fallback:") || strings.HasPrefix(found.ConversationKey, "request:")) {
-			found.ConversationKey = "response:" + completion.ResponseID
-		}
-	}
-	if completion.UpstreamModel != "" {
-		found.UpstreamModel = completion.UpstreamModel
-	}
-	if completion.ResponseChatML != "" {
-		found.ResponseChatML = appendAuditChatMLFile(found.ResponseChatML, completion.ResponseChatML)
-	}
-	if completion.Status != "" {
-		found.Status = completion.Status
-	}
-	if completion.InputUsage != nil {
-		found.InputUsage = completion.InputUsage
-	}
-	if completion.OutputUsage != nil {
-		found.OutputUsage = completion.OutputUsage
-	}
-	if completion.CacheUsage != nil {
-		found.CacheUsage = completion.CacheUsage
-	}
-	if completion.LastError != "" {
-		found.LastError = completion.LastError
-	}
-	if len(completion.Metadata) != 0 {
-		if found.Metadata == nil {
-			found.Metadata = map[string]any{}
-		}
-		for k, v := range completion.Metadata {
-			found.Metadata[k] = v
-		}
-	}
-	if err := r.appendLocked(ctx, "complete", found); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (r *FileUserRequestAuditRepository) List(ctx context.Context, filter service.UserRequestAuditFilter) ([]*service.UserRequestAudit, int64, error) {
-	if filter.Legacy && r.legacy != nil {
-		return r.legacy.List(ctx, filter)
-	}
-	rows := r.filtered(ctx, filter)
-	if len(rows) == 0 && r.legacy != nil && len(r.readAll(ctx, false)) == 0 {
-		return r.legacy.List(ctx, filter)
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
-			return rows[i].ID > rows[j].ID
-		}
-		return rows[i].CreatedAt.After(rows[j].CreatedAt)
-	})
-	total := int64(len(rows))
-	page, size := filter.Page, filter.PageSize
-	if page < 1 {
-		page = 1
-	}
-	if size < 1 {
-		size = 20
-	}
-	if size > 200 {
-		size = 200
-	}
-	start := (page - 1) * size
-	if start >= len(rows) {
-		return []*service.UserRequestAudit{}, total, nil
-	}
-	end := start + size
-	if end > len(rows) {
-		end = len(rows)
-	}
-	return rows[start:end], total, nil
-}
-
-func (r *FileUserRequestAuditRepository) GetByID(ctx context.Context, id int64) (*service.UserRequestAudit, error) {
-	for _, row := range r.readAll(ctx, true) {
-		if row.ID == id {
-			row.ChatML = row.RequestChatML + "\n" + row.ResponseChatML
-			return row, nil
-		}
-	}
-	if r.legacy != nil {
-		return r.legacy.GetByID(ctx, id)
-	}
-	return nil, sql.ErrNoRows
-}
-
-func (r *FileUserRequestAuditRepository) DeleteExpired(ctx context.Context, before time.Time, batchSize int) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rows := r.readAllLocked()
-	var deleted int64
-	kept := make([]*service.UserRequestAudit, 0, len(rows))
-	limit := batchSize
-	if limit <= 0 {
-		limit = 500
-	}
-	for _, row := range rows {
-		if row.ExpiresAt.Before(before) && int(deleted) < limit {
-			deleted++
-			continue
-		}
-		kept = append(kept, row)
-	}
-	if deleted == 0 {
-		return 0, nil
-	}
-	if err := r.rewriteLocked(kept); err != nil {
-		return 0, err
-	}
-	r.lastCleanup = time.Now().UTC()
-	return deleted, nil
-}
-
-func (r *FileUserRequestAuditRepository) readAll(ctx context.Context, includeContent bool) []*service.UserRequestAudit {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.readAllLockedCtx(ctx, includeContent)
-}
-func (r *FileUserRequestAuditRepository) readAllLocked() []*service.UserRequestAudit {
-	return r.readAllLockedCtx(context.Background(), true)
-}
-func (r *FileUserRequestAuditRepository) readAllLockedCtx(ctx context.Context, includeContent bool) []*service.UserRequestAudit {
-	files, _ := filepath.Glob(filepath.Join(r.root, "*.ndjson"))
-	sort.Strings(files)
-	latest := make(map[string]*service.UserRequestAudit)
-	byID := make(map[int64]*service.UserRequestAudit)
-	scanned := 0
-	for _, name := range files {
-		f, err := os.Open(name)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-		for scanner.Scan() {
-			if err := ctx.Err(); err != nil {
-				_ = f.Close()
-				return values(latest, byID, includeContent)
-			}
-			scanned++
-			if scanned > userRequestAuditScanCap {
-				break
-			}
-			var line userRequestAuditFileLine
-			if json.Unmarshal(scanner.Bytes(), &line) != nil || line.UserRequestAudit == nil {
-				continue
-			}
-			if line.UserRequestAudit.LogicalKey == "" {
-				line.UserRequestAudit.LogicalKey = line.LogicalKey
-			}
-			row := line.UserRequestAudit
-			if !includeContent {
-				row.RequestChatML = ""
-				row.ResponseChatML = ""
-			}
-			if row.LogicalKey != "" {
-				latest[row.LogicalKey] = row
-			}
-			byID[row.ID] = row
-		}
-		_ = f.Close()
-		if scanned > userRequestAuditScanCap {
-			break
-		}
-	}
-	return values(latest, byID, includeContent)
-}
-func values(latest map[string]*service.UserRequestAudit, byID map[int64]*service.UserRequestAudit, includeContent bool) []*service.UserRequestAudit {
-	out := make([]*service.UserRequestAudit, 0, len(latest))
-	seen := map[int64]bool{}
-	for _, row := range latest {
-		normalizeConversationKey(row)
-		if !seen[row.ID] {
-			out = append(out, row)
-			seen[row.ID] = true
-		}
-	}
-	for id, row := range byID {
-		normalizeConversationKey(row)
-		if !seen[id] && row.LogicalKey == "" {
-			out = append(out, row)
-		}
-	}
-	return out
-}
-
-func normalizeConversationKey(row *service.UserRequestAudit) {
-	if row == nil || row.ResponseID == "" {
-		return
-	}
-	if strings.HasPrefix(row.ConversationKey, "fallback:") || strings.HasPrefix(row.ConversationKey, "request:") {
-		row.ConversationKey = "response:" + row.ResponseID
-	}
-}
-
-func (r *FileUserRequestAuditRepository) filtered(ctx context.Context, filter service.UserRequestAuditFilter) []*service.UserRequestAudit {
-	rows := r.readAll(ctx, strings.TrimSpace(filter.Q) != "")
-	out := rows[:0]
-	q := strings.ToLower(strings.TrimSpace(filter.Q))
-	for _, row := range rows {
-		if filter.UserID != nil && row.UserID != *filter.UserID || filter.APIKeyID != nil && row.APIKeyID != *filter.APIKeyID || filter.GroupID != nil && !sameGroup(row.GroupID, filter.GroupID) || filter.GroupName != "" && !strings.EqualFold(row.GroupName, filter.GroupName) || filter.Protocol != "" && !strings.EqualFold(row.Protocol, filter.Protocol) || filter.RequestedModel != "" && !strings.EqualFold(row.RequestedModel, filter.RequestedModel) || filter.ResponseID != "" && !strings.EqualFold(row.ResponseID, filter.ResponseID) || filter.ClientRequestID != "" && !strings.EqualFold(row.ClientRequestID, filter.ClientRequestID) || filter.Status != "" && !strings.EqualFold(row.Status, filter.Status) {
-			continue
-		}
-		if filter.StartTime != nil && row.CreatedAt.Before(*filter.StartTime) {
-			continue
-		}
-		if filter.EndTime != nil && !row.CreatedAt.Before(*filter.EndTime) {
-			continue
-		}
-		if q != "" {
-			blob := strings.ToLower(row.GroupName + " " + row.Protocol + " " + row.RequestedModel + " " + row.ClientRequestID + " " + row.ResponseID + " " + row.LastError + " " + string(mustJSON(row.Metadata)) + " " + row.RequestChatML + " " + row.ResponseChatML)
-			if !strings.Contains(blob, q) {
-				continue
-			}
-		}
-		out = append(out, row)
-	}
-	return out
-}
-
-func (r *FileUserRequestAuditRepository) appendLocked(ctx context.Context, event string, row *service.UserRequestAudit) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	payload, err := json.Marshal(userRequestAuditFileLine{Event: event, LogicalKey: row.LogicalKey, UserRequestAudit: row})
+	f, err := os.CreateTemp(filepath.Dir(path), ".audit-*.tmp")
 	if err != nil {
 		return err
 	}
-	payload = append(payload, '\n')
-	path, err := r.shardPathLocked(row.CreatedAt, len(payload))
-	if err != nil {
-		return err
+	name := f.Name()
+	defer os.Remove(name)
+	if err = f.Chmod(0o640); err == nil {
+		err = json.NewEncoder(f).Encode(value)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
-	if err != nil {
-		return err
+	if err == nil {
+		err = f.Sync()
 	}
-	_, err = f.Write(payload)
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
-	return err
-}
-func (r *FileUserRequestAuditRepository) shardPathLocked(at time.Time, add int) (string, error) {
-	if err := os.MkdirAll(r.root, 0o750); err != nil {
-		return "", err
-	}
-	limit := r.maxShardBytes
-	if limit < 8*1024*1024 {
-		limit = 64 * 1024 * 1024
-	}
-	day := at.UTC().Format("2006-01-02")
-	idx := 0
-	for {
-		name := filepath.Join(r.root, day+"-"+strconv.Itoa(idx)+".ndjson")
-		st, err := os.Stat(name)
-		if os.IsNotExist(err) {
-			return name, nil
-		}
-		if err != nil {
-			return "", err
-		}
-		if st.Size()+int64(add) <= limit {
-			return name, nil
-		}
-		idx++
-	}
-}
-func (r *FileUserRequestAuditRepository) rewriteLocked(rows []*service.UserRequestAudit) error {
-	tmp := r.root + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 	if err != nil {
 		return err
 	}
-	enc := json.NewEncoder(f)
+	if err = os.Rename(name, path); err != nil {
+		return err
+	}
+	return auditSyncDirectory(filepath.Dir(path))
+}
+func auditSyncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+func (r *FileUserRequestAuditRepository) saveStateLocked() error {
+	return auditAtomicJSON(r.statePath(), r.state)
+}
+func readAuditConversation(path string) (*auditDiskConversation, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var doc auditDiskConversation
+	if err = json.NewDecoder(f).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("decode audit conversation %s: %w", filepath.Base(path), err)
+	}
+	if doc.Version != 1 || doc.UserRequestAuditConversation == nil || doc.ID <= 0 || len(doc.Requests) == 0 {
+		return nil, fmt.Errorf("invalid audit conversation %s", filepath.Base(path))
+	}
+	seen := make(map[int64]bool, len(doc.Requests))
+	for _, row := range doc.Requests {
+		if row == nil || row.ID <= 0 || seen[row.ID] || row.UserID != doc.Requests[0].UserID || row.APIKeyID != doc.Requests[0].APIKeyID {
+			return nil, fmt.Errorf("invalid audit request membership %s", filepath.Base(path))
+		}
+		seen[row.ID] = true
+		row.LogicalKey = doc.LogicalKeys[strconv.FormatInt(row.ID, 10)]
+	}
+	if !seen[doc.ID] {
+		return nil, fmt.Errorf("missing audit root %d", doc.ID)
+	}
+	return &doc, nil
+}
+func auditMetadata(row *service.UserRequestAudit) service.UserRequestAudit {
+	result := *row
+	result.RequestChatML = ""
+	result.ResponseChatML = ""
+	result.ChatML = ""
+	result.RequestCount = 0
+	result.UserLabel = ""
+	return result
+}
+func (r *FileUserRequestAuditRepository) indexDocumentLocked(doc *auditDiskConversation) {
+	rows := doc.Requests
+	summary := auditConversationSummary(auditConversation{rows: rows, representative: rows[0], latest: rows[len(rows)-1]})
+	summary.ID = doc.ID
+	expires := rows[0].ExpiresAt
 	for _, row := range rows {
-		if err := enc.Encode(userRequestAuditFileLine{Event: "snapshot", LogicalKey: row.LogicalKey, UserRequestAudit: row}); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
+		if row.ExpiresAt.After(expires) {
+			expires = row.ExpiresAt
+		}
+		if row.ID > r.state.NextID {
+			r.state.NextID = row.ID
+		}
+		meta := auditMetadata(row)
+		r.index[row.ID] = auditArchiveEntry{row: meta, conversationID: doc.ID, proof: service.UserRequestAuditProof(row)}
+		if row.LogicalKey != "" {
+			r.logicalIndex[row.LogicalKey] = row.ID
+		}
+	}
+	r.documents[doc.ID] = auditDocumentMeta{summary: *summary, path: r.conversationPath(doc.ID), expires: expires}
+}
+func (r *FileUserRequestAuditRepository) ensureIndexLocked(ctx context.Context) (err error) {
+	if r.index != nil {
+		return ctx.Err()
+	}
+	defer func() {
+		if err != nil {
+			r.index = nil
+			r.documents = nil
+			r.logicalIndex = nil
+		}
+	}()
+	if err = os.MkdirAll(filepath.Join(r.root, "conversations"), 0o750); err != nil {
+		return err
+	}
+	if b, e := os.ReadFile(r.statePath()); e == nil {
+		if err = json.Unmarshal(b, &r.state); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(e) {
+		return e
+	}
+	if err = r.finishWritesLocked(ctx); err != nil {
+		return err
+	}
+	if err = os.RemoveAll(filepath.Join(r.root, "pending")); err != nil {
+		return err
+	}
+	if err = r.finishDeletesLocked(ctx); err != nil {
+		return err
+	}
+	r.index = make(map[int64]auditArchiveEntry)
+	r.documents = make(map[int64]auditDocumentMeta)
+	r.logicalIndex = make(map[string]int64)
+	files, err := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
+	if err != nil {
+		return err
+	}
+	// Overlapping files can only be left by an interrupted consolidation. Fold
+	// latest rows, then rewrite the proven groups before publishing the index.
+	latest := make(map[int64]*service.UserRequestAudit)
+	overlap := false
+	for _, path := range files {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		doc, e := readAuditConversation(path)
+		if e != nil {
+			return e
+		}
+		if filepath.Clean(path) != filepath.Clean(r.conversationPath(doc.ID)) {
+			return fmt.Errorf("audit file identity mismatch")
+		}
+		for _, row := range doc.Requests {
+			if old := latest[row.ID]; old != nil {
+				overlap = true
+				if old.UpdatedAt.After(row.UpdatedAt) {
+					continue
+				}
+			}
+			latest[row.ID] = row
+		}
+		r.indexDocumentLocked(doc)
+	}
+	if !r.state.Migrated {
+		if err = r.importLegacyLocked(ctx, latest); err != nil {
+			return err
+		}
+	} else if overlap {
+		rows := make([]*service.UserRequestAudit, 0, len(latest))
+		for _, row := range latest {
+			rows = append(rows, row)
+		}
+		if err = r.replaceAllDocumentsLocked(ctx, rows); err != nil {
 			return err
 		}
 	}
-	if err = f.Close(); err != nil {
-		_ = os.Remove(tmp)
+	if err = r.reconcileSQLLocked(ctx); err != nil {
 		return err
 	}
-	files, _ := filepath.Glob(filepath.Join(r.root, "*.ndjson"))
-	for _, name := range files {
-		_ = os.Remove(name)
+	return r.saveStateLocked()
+}
+func (r *FileUserRequestAuditRepository) makeDocument(rows []*service.UserRequestAudit, id int64) *auditDiskConversation {
+	sort.Slice(rows, func(i, j int) bool { return auditRowBefore(rows[i], rows[j]) })
+	keys := make(map[string]string, len(rows))
+	for _, row := range rows {
+		keys[strconv.FormatInt(row.ID, 10)] = row.LogicalKey
 	}
-	return os.Rename(tmp, filepath.Join(r.root, "retained-"+time.Now().UTC().Format("20060102T150405")+".ndjson"))
+	return &auditDiskConversation{Version: 1, UserRequestAuditConversation: &service.UserRequestAuditConversation{ID: id, UserLabel: "#" + strconv.FormatInt(rows[0].UserID, 10), RequestCount: len(rows), Messages: service.BuildUserRequestAuditTranscript(rows), Requests: rows}, LogicalKeys: keys}
+}
+func (r *FileUserRequestAuditRepository) persistRowLocked(ctx context.Context, row *service.UserRequestAudit) (err error) {
+	defer func() {
+		if err != nil {
+			r.index = nil
+		}
+	}()
+	metas := make([]*service.UserRequestAudit, 0, len(r.index)+1)
+	proofs := make(map[int64]service.UserRequestAuditContinuityProof, len(r.index)+1)
+	for id, entry := range r.index {
+		if id == row.ID {
+			continue
+		}
+		copy := entry.row
+		metas = append(metas, &copy)
+		proofs[id] = entry.proof
+	}
+	meta := auditMetadata(row)
+	metas = append(metas, &meta)
+	proofs[row.ID] = service.UserRequestAuditProof(row)
+	groups := groupAuditConversationsWithProof(metas, proofs)
+	loaded := make(map[int64]*auditDiskConversation)
+	changed := make([]*auditDiskConversation, 0)
+	keep := make(map[int64]bool)
+	for _, group := range groups {
+		id := group.representative.ID
+		keep[id] = true
+		needs := false
+		for _, m := range group.rows {
+			old, ok := r.index[m.ID]
+			needs = needs || m.ID == row.ID || !ok || old.conversationID != id
+		}
+		if existing, ok := r.documents[id]; !ok || existing.summary.RequestCount != len(group.rows) {
+			needs = true
+		}
+		if !needs {
+			continue
+		}
+		full := make([]*service.UserRequestAudit, 0, len(group.rows))
+		for _, m := range group.rows {
+			if m.ID == row.ID {
+				full = append(full, row)
+				continue
+			}
+			entry := r.index[m.ID]
+			doc := loaded[entry.conversationID]
+			if doc == nil {
+				var e error
+				doc, e = readAuditConversation(r.conversationPath(entry.conversationID))
+				if e != nil {
+					return e
+				}
+				loaded[entry.conversationID] = doc
+			}
+			found := false
+			for _, prior := range doc.Requests {
+				if prior.ID == m.ID {
+					full = append(full, prior)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("audit request %d missing from file", m.ID)
+			}
+		}
+		changed = append(changed, r.makeDocument(full, id))
+	}
+	obsolete := make([]int64, 0)
+	for id := range r.documents {
+		if !keep[id] {
+			obsolete = append(obsolete, id)
+		}
+	}
+	if err = r.commitDocumentsLocked(ctx, changed, obsolete); err != nil {
+		return err
+	}
+	for _, id := range obsolete {
+		delete(r.documents, id)
+	}
+	for _, doc := range changed {
+		r.indexDocumentLocked(doc)
+	}
+	return r.syncSQLDocumentsLocked(ctx, changed, obsolete, false)
+}
+func (r *FileUserRequestAuditRepository) Create(ctx context.Context, row *service.UserRequestAudit) error {
+	if row == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.ensureIndexLocked(ctx); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if row.CreatedAt.IsZero() {
+		row.CreatedAt = now
+	}
+	if row.UpdatedAt.IsZero() {
+		row.UpdatedAt = row.CreatedAt
+	}
+	if row.ExpiresAt.IsZero() {
+		row.ExpiresAt = row.CreatedAt.AddDate(0, 0, service.UserRequestAuditDefaultRetentionDays)
+	}
+	if row.ID <= 0 {
+		r.state.NextID++
+		row.ID = r.state.NextID
+	}
+	if row.ID > r.state.NextID {
+		r.state.NextID = row.ID
+	}
+	if err := r.saveStateLocked(); err != nil {
+		return err
+	}
+	if row.ConversationKey == "" {
+		if row.SessionID != "" {
+			row.ConversationKey = "session:" + row.SessionID
+		} else if row.ResponseID != "" {
+			row.ConversationKey = "response:" + row.ResponseID
+		} else {
+			row.ConversationKey = "request:" + strconv.FormatInt(row.ID, 10)
+		}
+	}
+	return r.persistRowLocked(ctx, row)
+}
+func (r *FileUserRequestAuditRepository) Complete(ctx context.Context, c *service.UserRequestAuditCompletion) error {
+	if c == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.ensureIndexLocked(ctx); err != nil {
+		return err
+	}
+	id, ok := r.logicalIndex[c.LogicalKey]
+	if !ok {
+		return sql.ErrNoRows
+	}
+	entry := r.index[id]
+	doc, err := readAuditConversation(r.conversationPath(entry.conversationID))
+	if err != nil {
+		return err
+	}
+	var row *service.UserRequestAudit
+	for _, candidate := range doc.Requests {
+		if candidate.ID == id {
+			row = candidate
+			break
+		}
+	}
+	if row == nil {
+		return sql.ErrNoRows
+	}
+	row.UpdatedAt = time.Now().UTC()
+	if c.ResponseID != "" {
+		row.ResponseID = c.ResponseID
+		normalizeConversationKey(row)
+	}
+	if c.UpstreamModel != "" {
+		row.UpstreamModel = c.UpstreamModel
+	}
+	if c.ResponseChatML != "" {
+		row.ResponseChatML = appendAuditChatMLFile(row.ResponseChatML, c.ResponseChatML)
+	}
+	if c.Status != "" {
+		row.Status = c.Status
+	}
+	if c.InputUsage != nil {
+		row.InputUsage = c.InputUsage
+	}
+	if c.OutputUsage != nil {
+		row.OutputUsage = c.OutputUsage
+	}
+	if c.CacheUsage != nil {
+		row.CacheUsage = c.CacheUsage
+	}
+	if c.LastError != "" {
+		row.LastError = c.LastError
+	}
+	if len(c.Metadata) > 0 {
+		if row.Metadata == nil {
+			row.Metadata = make(map[string]any)
+		}
+		for key, value := range c.Metadata {
+			row.Metadata[key] = value
+		}
+	}
+	return r.persistRowLocked(ctx, row)
+}
+func (r *FileUserRequestAuditRepository) GetConversation(ctx context.Context, id int64) (*service.UserRequestAuditConversation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.ensureIndexLocked(ctx); err != nil {
+		return nil, err
+	}
+	entry, ok := r.index[id]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	doc, err := readAuditConversation(r.conversationPath(entry.conversationID))
+	if err != nil {
+		return nil, err
+	}
+	if err = r.labelUsers(ctx, doc.Requests); err != nil {
+		return nil, err
+	}
+	doc.UserLabel = doc.Requests[0].UserLabel
+	return doc.UserRequestAuditConversation, nil
+}
+func (r *FileUserRequestAuditRepository) GetByID(ctx context.Context, id int64) (*service.UserRequestAudit, error) {
+	conversation, err := r.GetConversation(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range conversation.Requests {
+		if row.ID == id {
+			normalizeConversationKey(row)
+			row.ChatML = auditMessagesTranscript(conversation.Messages)
+			row.RequestCount = conversation.RequestCount
+			return row, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+func (r *FileUserRequestAuditRepository) finishDeletesLocked(ctx context.Context) error {
+	ids := r.state.DeleteIDs
+	if r.state.Clear {
+		files, err := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
+		if err != nil {
+			return err
+		}
+		for _, path := range files {
+			if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	} else {
+		for _, id := range ids {
+			if err := os.Remove(r.conversationPath(id)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	if r.state.Clear {
+		if err := os.RemoveAll(r.root + "-migration-backup"); err != nil {
+			return err
+		}
+		if err := auditSyncDirectory(filepath.Dir(r.root)); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(filepath.Join(r.root, "pending")); err != nil {
+			return err
+		}
+	}
+	if r.state.Clear || len(ids) > 0 {
+		if err := auditSyncDirectory(filepath.Join(r.root, "conversations")); err != nil {
+			return err
+		}
+	}
+	if r.legacy != nil && (r.state.Clear || len(ids) > 0) {
+		if r.state.Clear {
+			if _, err := r.legacy.db.ExecContext(ctx, "DELETE FROM user_request_audit_conversations"); err != nil {
+				return err
+			}
+		} else {
+			for _, id := range ids {
+				if _, err := r.legacy.db.ExecContext(ctx, "DELETE FROM user_request_audit_conversations WHERE id=$1", id); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if r.state.Clear || len(ids) > 0 {
+		r.state.Clear = false
+		r.state.DeleteIDs = nil
+		return r.saveStateLocked()
+	}
+	return nil
+}
+func (r *FileUserRequestAuditRepository) Clear(ctx context.Context) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.ensureIndexLocked(ctx); err != nil {
+		return 0, err
+	}
+	count := int64(len(r.index))
+	r.state.Migrated = true
+	r.state.Clear = true
+	r.index = nil
+	r.documents = nil
+	r.logicalIndex = nil
+	if err := r.saveStateLocked(); err != nil {
+		return 0, err
+	}
+	if err := r.finishDeletesLocked(ctx); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+func (r *FileUserRequestAuditRepository) DeleteExpired(ctx context.Context, before time.Time, batchSize int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.ensureIndexLocked(ctx); err != nil {
+		return 0, err
+	}
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	var count int64
+	for id, doc := range r.documents {
+		if doc.expires.Before(before) && len(r.state.DeleteIDs) < batchSize {
+			r.state.DeleteIDs = append(r.state.DeleteIDs, id)
+			count += int64(doc.summary.RequestCount)
+		}
+	}
+	if len(r.state.DeleteIDs) == 0 {
+		return 0, nil
+	}
+	r.index = nil
+	if err := r.saveStateLocked(); err != nil {
+		return 0, err
+	}
+	if err := r.finishDeletesLocked(ctx); err != nil {
+		return 0, err
+	}
+	r.lastCleanup = time.Now().UTC()
+	return count, nil
+}
+func normalizeConversationKey(row *service.UserRequestAudit) {
+	if row != nil && row.ResponseID != "" && (strings.HasPrefix(row.ConversationKey, "fallback:") || strings.HasPrefix(row.ConversationKey, "request:")) {
+		row.ConversationKey = "response:" + row.ResponseID
+	}
 }
 func sameGroup(a, b *int64) bool {
 	if a == nil || b == nil {
@@ -428,15 +610,8 @@ func appendAuditChatMLFile(a, b string) string {
 	if b == "" || a == b {
 		return a
 	}
-	const max = 128 * 1024
-	v := a + "\n" + b
-	if len(v) <= max {
-		return v
-	}
-	return v[:max]
+	return a + "\n" + b
 }
-
-// UserRequestAuditRoot reports the archive directory for status/config endpoints.
 func (r *FileUserRequestAuditRepository) UserRequestAuditRoot() string {
 	if r == nil {
 		return ""
@@ -449,13 +624,13 @@ var _ service.UserRequestAuditRepository = (*FileUserRequestAuditRepository)(nil
 func (r *FileUserRequestAuditRepository) StorageStatus() service.UserRequestAuditStorageStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var out service.UserRequestAuditStorageStatus
-	out.LastCleanup = r.lastCleanup
-	files, _ := filepath.Glob(filepath.Join(r.root, "*.ndjson"))
+	out := service.UserRequestAuditStorageStatus{LastCleanup: r.lastCleanup}
+	out.DiskTotalBytes, out.DiskFreeBytes, out.PauseReason = r.diskStatusLocked(context.Background())
+	out.RecordingPaused = out.PauseReason != ""
+	files, _ := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
 	out.FileCount = len(files)
-	latestMod := time.Time{}
-	for _, name := range files {
-		st, err := os.Stat(name)
+	for _, path := range files {
+		st, err := os.Stat(path)
 		if err != nil {
 			continue
 		}
@@ -465,10 +640,6 @@ func (r *FileUserRequestAuditRepository) StorageStatus() service.UserRequestAudi
 		}
 		if out.Oldest.IsZero() || st.ModTime().Before(out.Oldest) {
 			out.Oldest = st.ModTime()
-		}
-		if st.ModTime().After(latestMod) {
-			latestMod = st.ModTime()
-			out.CurrentShardBytes = st.Size()
 		}
 	}
 	return out
@@ -488,25 +659,51 @@ func (r *FileUserRequestAuditRepository) GetAuditConfig() service.UserRequestAud
 	if cfg, ok := r.readConfig(); ok {
 		return cfg
 	}
-	return service.UserRequestAuditConfig{CleanupIntervalHours: service.UserRequestAuditDefaultCleanupIntervalHours, MaxShardBytes: service.UserRequestAuditDefaultMaxShardBytes}
+	return service.UserRequestAuditConfig{CleanupIntervalHours: service.UserRequestAuditDefaultCleanupIntervalHours}
 }
 func (r *FileUserRequestAuditRepository) SetAuditConfig(cfg service.UserRequestAuditConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := os.MkdirAll(r.root, 0o750); err != nil {
-		return err
-	}
-	b, err := json.Marshal(cfg)
+	return auditAtomicJSON(r.configPath(), cfg)
+}
+
+func (r *FileUserRequestAuditRepository) diskStatusLocked(ctx context.Context) (int64, int64, string) {
+	path, err := filepath.Abs(r.root)
 	if err != nil {
-		return err
+		return 0, 0, "disk space unavailable"
 	}
-	tmp := r.configPath() + ".tmp"
-	if err = os.WriteFile(tmp, b, 0o640); err != nil {
-		return err
+	for {
+		_, err = os.Stat(path)
+		if err == nil {
+			break
+		}
+		if !os.IsNotExist(err) || filepath.Dir(path) == path {
+			return 0, 0, "disk space unavailable"
+		}
+		path = filepath.Dir(path)
 	}
-	if err = os.Rename(tmp, r.configPath()); err != nil {
-		return err
+	var total, free int64
+	if r.diskUsage != nil {
+		total, free, err = r.diskUsage(ctx, path)
+	} else {
+		var usage *disk.UsageStat
+		usage, err = disk.UsageWithContext(ctx, path)
+		if err == nil && usage != nil {
+			total, free = int64(usage.Total), int64(usage.Free)
+		}
 	}
-	r.maxShardBytes = cfg.MaxShardBytes
+	if err != nil || total <= 0 || free < 0 {
+		return 0, 0, "disk space unavailable"
+	}
+	if free < userRequestAuditMinFreeBytes {
+		return total, free, "less than 2 GiB free disk space"
+	}
+	return total, free, ""
+}
+func (r *FileUserRequestAuditRepository) checkDiskLocked(ctx context.Context) error {
+	_, _, reason := r.diskStatusLocked(ctx)
+	if reason != "" {
+		return fmt.Errorf("audit recording paused: %s", reason)
+	}
 	return nil
 }

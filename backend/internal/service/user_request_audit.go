@@ -22,7 +22,8 @@ import (
 
 const (
 	UserRequestAuditDefaultRetentionDays = 7
-	userRequestAuditMaxChatML            = 32 * 1024
+	userRequestAuditMaxChatML            = 16 * 1024 * 1024
+	userRequestAuditMaxMetadata          = 32 * 1024
 	userRequestAuditQueueSize            = 2048
 	userRequestAuditShutdownDrainLimit   = 256
 	userRequestAuditCleanupBatch         = 500
@@ -41,6 +42,9 @@ type UserRequestAudit struct {
 	UpdatedAt          time.Time      `json:"updated_at"`
 	ExpiresAt          time.Time      `json:"expires_at"`
 	UserID             int64          `json:"user_id"`
+	SessionID          string         `json:"session_id,omitempty"`
+	UserLabel          string         `json:"user_label"`
+	RequestCount       int            `json:"request_count"`
 	APIKeyID           int64          `json:"api_key_id"`
 	GroupID            *int64         `json:"group_id,omitempty"`
 	GroupName          string         `json:"group_name,omitempty"`
@@ -106,6 +110,7 @@ type UserRequestAuditRepository interface {
 
 type UserRequestAuditCapture struct {
 	UserID             int64
+	SessionID          string
 	APIKeyID           int64
 	GroupID            *int64
 	GroupName          string
@@ -132,10 +137,26 @@ type UserRequestAuditService struct {
 	groupIDsMu     sync.RWMutex
 	groupIDs       []int64
 	groupIDsLoaded bool
+	writeMu        sync.Mutex
+	generationMu   sync.RWMutex
+	generation     uint64
+	exportMu       sync.Mutex
+	exportStop     chan struct{}
+	exportDone     chan struct{}
+	exportQueue    chan auditExportTask
+	exportCancelMu sync.Mutex
+	exportCancel   context.CancelFunc
+	exportJobsMu   sync.RWMutex
+	exportJobs     map[string]*UserRequestAuditExportJob
 }
 
 func NewUserRequestAuditService(repo UserRequestAuditRepository, settings SettingRepository) *UserRequestAuditService {
-	return &UserRequestAuditService{repo: repo, settings: settings, queue: make(chan func(context.Context), userRequestAuditQueueSize)}
+	return &UserRequestAuditService{
+		repo: repo, settings: settings,
+		queue:       make(chan func(context.Context), userRequestAuditQueueSize),
+		exportQueue: make(chan auditExportTask, userRequestAuditExportQueueSize),
+		exportJobs:  make(map[string]*UserRequestAuditExportJob),
+	}
 }
 
 func ProvideUserRequestAuditService(repo UserRequestAuditRepository, settings SettingRepository) *UserRequestAuditService {
@@ -151,7 +172,11 @@ func (s *UserRequestAuditService) Start() {
 	s.startOnce.Do(func() {
 		s.stop = make(chan struct{})
 		s.done = make(chan struct{})
+		s.exportStop = make(chan struct{})
+		s.exportDone = make(chan struct{})
+		s.cleanupOrphanExports()
 		go s.run()
+		go s.runExportWorker()
 	})
 }
 
@@ -162,6 +187,8 @@ func (s *UserRequestAuditService) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stop)
 		<-s.done
+		close(s.exportStop)
+		<-s.exportDone
 	})
 }
 
@@ -174,6 +201,7 @@ func (s *UserRequestAuditService) run() {
 		case task := <-s.queue:
 			s.runTask(task, 5*time.Second)
 		case <-ticker.C:
+			s.cleanupExportArtifacts()
 			s.cleanupMu.Lock()
 			cfg := s.GetArchiveConfig()
 			due := s.lastCleanupAt.IsZero() || time.Since(s.lastCleanupAt) >= time.Duration(cfg.CleanupIntervalHours)*time.Hour
@@ -256,17 +284,24 @@ func (s *UserRequestAuditService) Enqueue(capture UserRequestAuditCapture) strin
 	}
 	audit := &UserRequestAudit{
 		CreatedAt: time.Now().UTC(),
-		UserID:    capture.UserID, APIKeyID: capture.APIKeyID, GroupID: cloneAuditGroupID(capture.GroupID),
+		UserID:    capture.UserID, SessionID: sanitizeSessionID(capture.SessionID), APIKeyID: capture.APIKeyID, GroupID: cloneAuditGroupID(capture.GroupID),
 		GroupName: bound(capture.GroupName, 256), Protocol: capture.Protocol, Endpoint: bound(capture.Endpoint, 512),
 		RequestedModel: bound(capture.RequestedModel, 256), ClientRequestID: bound(capture.ClientRequestID, 256),
 		ResponseID: bound(capture.ResponseID, 256), PreviousResponseID: bound(capture.PreviousResponseID, 256),
 		FallbackHash: fallback, RequestChatML: requestEvidence, Status: "received",
 		Metadata: boundedMap(capture.Metadata), LogicalKey: userRequestAuditLogicalKey(capture, fallback),
 	}
+	if len(requestEvidence) >= userRequestAuditMaxChatML {
+		if audit.Metadata == nil {
+			audit.Metadata = map[string]any{}
+		}
+		audit.Metadata["request_chatml_truncated"] = true
+	}
+	generation := s.currentGeneration()
 	s.enqueue(func(ctx context.Context) {
 		retention := s.retentionDays()
 		audit.ExpiresAt = audit.CreatedAt.AddDate(0, 0, retention)
-		if err := s.repo.Create(ctx, audit); err != nil {
+		if err := s.runAuditWrite(ctx, generation, func(ctx context.Context) error { return s.repo.Create(ctx, audit) }); err != nil {
 			slog.Warn("user_request_audit.create_failed", "error", err, "protocol", audit.Protocol)
 		}
 	})
@@ -293,14 +328,21 @@ func (s *UserRequestAuditService) Complete(completion UserRequestAuditCompletion
 	if strings.TrimSpace(completion.LogicalKey) == "" {
 		return
 	}
+	if len(completion.ResponseChatML) > userRequestAuditMaxChatML {
+		if completion.Metadata == nil {
+			completion.Metadata = map[string]any{}
+		}
+		completion.Metadata["response_chatml_truncated"] = true
+	}
 	completion.ResponseChatML = bound(completion.ResponseChatML, userRequestAuditMaxChatML)
 	completion.UpstreamModel = bound(completion.UpstreamModel, 256)
 	completion.ResponseID = bound(completion.ResponseID, 256)
 	completion.Status = bound(completion.Status, 32)
 	completion.LastError = bound(completion.LastError, 1024)
 	completion.Metadata = boundedMap(completion.Metadata)
+	generation := s.currentGeneration()
 	s.enqueue(func(ctx context.Context) {
-		if err := s.repo.Complete(ctx, &completion); err != nil {
+		if err := s.runAuditWrite(ctx, generation, func(ctx context.Context) error { return s.repo.Complete(ctx, &completion) }); err != nil {
 			slog.Warn("user_request_audit.complete_failed", "error", err)
 		}
 	})
@@ -309,6 +351,9 @@ func (s *UserRequestAuditService) Complete(completion UserRequestAuditCompletion
 func (s *UserRequestAuditService) List(ctx context.Context, filter UserRequestAuditFilter) ([]*UserRequestAudit, int64, error) {
 	if s == nil || s.repo == nil {
 		return nil, 0, nil
+	}
+	if r, ok := s.repo.(userRequestAuditConversationLister); ok {
+		return r.ListConversations(ctx, filter)
 	}
 	return s.repo.List(ctx, filter)
 }
@@ -338,7 +383,7 @@ func (s *UserRequestAuditService) GroupStats(ctx context.Context, filter UserReq
 	groups := make(map[string]*UserRequestAuditGroupStat)
 	seen := 0
 	for {
-		rows, total, err := s.List(ctx, filter)
+		rows, total, err := s.repo.List(ctx, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -379,8 +424,15 @@ func (s *UserRequestAuditService) GroupStats(ctx context.Context, filter UserReq
 }
 
 func (s *UserRequestAuditService) StreamExport(ctx context.Context, filter UserRequestAuditFilter, format string, w io.Writer) (int, error) {
+	if s == nil || s.repo == nil {
+		return 0, sql.ErrNoRows
+	}
 	if format != "json" {
 		format = "jsonl"
+	}
+	if r, ok := s.repo.(userRequestAuditConversationExporter); ok {
+		filter.Page, filter.PageSize = 0, 0
+		return r.ExportConversations(ctx, filter, nil, w, format)
 	}
 	enc := json.NewEncoder(w)
 	written := 0
@@ -389,15 +441,11 @@ func (s *UserRequestAuditService) StreamExport(ctx context.Context, filter UserR
 		if _, err := io.WriteString(w, "["); err != nil {
 			return 0, err
 		}
+		defer func() { _, _ = io.WriteString(w, "]") }()
 	}
-	defer func() {
-		if format == "json" {
-			_, _ = io.WriteString(w, "]")
-		}
-	}()
 	filter.Page, filter.PageSize = 1, 200
-	for written < userRequestAuditMaxExportRows {
-		rows, total, err := s.List(ctx, filter)
+	for {
+		rows, _, err := s.repo.List(ctx, filter)
 		if err != nil {
 			return written, err
 		}
@@ -405,9 +453,6 @@ func (s *UserRequestAuditService) StreamExport(ctx context.Context, filter UserR
 			break
 		}
 		for _, row := range rows {
-			if written >= userRequestAuditMaxExportRows {
-				break
-			}
 			if format == "jsonl" {
 				if err := enc.Encode(row); err != nil {
 					return written, err
@@ -429,7 +474,7 @@ func (s *UserRequestAuditService) StreamExport(ctx context.Context, filter UserR
 			}
 			written++
 		}
-		if written >= int(total) || len(rows) < filter.PageSize {
+		if len(rows) < filter.PageSize {
 			break
 		}
 		filter.Page++
@@ -457,12 +502,15 @@ func auditUsageNumber(values map[string]any, keys ...string) int64 {
 }
 
 type UserRequestAuditStorageStatus struct {
-	TotalBytes        int64     `json:"total_bytes"`
-	FileCount         int       `json:"file_count"`
-	CurrentShardBytes int64     `json:"current_shard_bytes"`
-	Oldest            time.Time `json:"oldest_at,omitempty"`
-	Latest            time.Time `json:"latest_at,omitempty"`
-	LastCleanup       time.Time `json:"last_cleanup_at,omitempty"`
+	TotalBytes      int64     `json:"total_bytes"`
+	FileCount       int       `json:"file_count"`
+	Oldest          time.Time `json:"oldest_at,omitempty"`
+	Latest          time.Time `json:"latest_at,omitempty"`
+	LastCleanup     time.Time `json:"last_cleanup_at,omitempty"`
+	DiskTotalBytes  int64     `json:"disk_total_bytes"`
+	DiskFreeBytes   int64     `json:"disk_free_bytes"`
+	RecordingPaused bool      `json:"recording_paused"`
+	PauseReason     string    `json:"pause_reason"`
 }
 type userRequestAuditStatusRepo interface {
 	StorageStatus() UserRequestAuditStorageStatus
@@ -483,12 +531,10 @@ func (s *UserRequestAuditService) CleanupNow(ctx context.Context) (int64, error)
 type UserRequestAuditConfig struct {
 	RetentionDays        int     `json:"retention_days"`
 	CleanupIntervalHours int     `json:"cleanup_interval_hours"`
-	MaxShardBytes        int64   `json:"max_shard_bytes"`
 	GroupIDs             []int64 `json:"group_ids,omitempty"`
 }
 
 const UserRequestAuditDefaultCleanupIntervalHours = 24
-const UserRequestAuditDefaultMaxShardBytes int64 = 64 * 1024 * 1024
 
 type userRequestAuditConfigRepo interface {
 	GetAuditConfig() UserRequestAuditConfig
@@ -500,15 +546,12 @@ func (s *UserRequestAuditService) GetArchiveConfig() UserRequestAuditConfig {
 	if groupIDs == nil {
 		groupIDs = []int64{}
 	}
-	cfg := UserRequestAuditConfig{RetentionDays: s.retentionDays(), CleanupIntervalHours: UserRequestAuditDefaultCleanupIntervalHours, MaxShardBytes: UserRequestAuditDefaultMaxShardBytes, GroupIDs: groupIDs}
+	cfg := UserRequestAuditConfig{RetentionDays: s.retentionDays(), CleanupIntervalHours: UserRequestAuditDefaultCleanupIntervalHours, GroupIDs: groupIDs}
 	if s != nil {
 		if r, ok := s.repo.(userRequestAuditConfigRepo); ok {
 			x := r.GetAuditConfig()
 			if x.CleanupIntervalHours > 0 {
 				cfg.CleanupIntervalHours = x.CleanupIntervalHours
-			}
-			if x.MaxShardBytes > 0 {
-				cfg.MaxShardBytes = x.MaxShardBytes
 			}
 		}
 	}
@@ -529,9 +572,6 @@ func (s *UserRequestAuditService) SetArchiveConfigPreservingGroups(cfg UserReque
 func (s *UserRequestAuditService) setArchiveConfig(cfg UserRequestAuditConfig, updateGroups bool) error {
 	if cfg.CleanupIntervalHours < 1 || cfg.CleanupIntervalHours > 168 {
 		return fmt.Errorf("cleanup interval must be between 1 and 168 hours")
-	}
-	if cfg.MaxShardBytes < 8*1024*1024 || cfg.MaxShardBytes > 256*1024*1024 {
-		return fmt.Errorf("max shard bytes must be between 8MiB and 256MiB")
 	}
 	if err := s.SetRetentionDays(context.Background(), cfg.RetentionDays); err != nil {
 		return err
@@ -930,7 +970,7 @@ func boundedMap(value map[string]any) map[string]any {
 		return nil
 	}
 	raw, _ := json.Marshal(userRequestAuditRedactValue(value))
-	if len(raw) > userRequestAuditMaxChatML {
+	if len(raw) > userRequestAuditMaxMetadata {
 		return map[string]any{"_truncated": "metadata exceeded audit limit"}
 	}
 	var out map[string]any

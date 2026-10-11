@@ -2,9 +2,9 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +17,7 @@ func TestFileUserRequestAuditConcurrentAppendReadSearch(t *testing.T) {
 	t.Setenv("DATA_DIR", dir)
 	r := NewFileUserRequestAuditRepository(nil)
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -47,8 +47,8 @@ func TestFileUserRequestAuditRestartAndComplete(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforeComplete, beforeErr := r.GetByID(context.Background(), a.ID)
-	if beforeErr != nil || beforeComplete.ConversationKey != "request:logical" {
-		t.Fatalf("initial conversation key=%q err=%v", beforeComplete.ConversationKey, beforeErr)
+	if beforeErr != nil || beforeComplete.RequestChatML != "request" || beforeComplete.ResponseChatML != "" {
+		t.Fatalf("initial request=%+v err=%v", beforeComplete, beforeErr)
 	}
 	if err := r.Complete(context.Background(), &service.UserRequestAuditCompletion{LogicalKey: "logical", ResponseID: "resp_123", ResponseChatML: "response", Status: "completed"}); err != nil {
 		t.Fatal(err)
@@ -78,15 +78,14 @@ func TestFileUserRequestAuditConfigAndRetention(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DATA_DIR", dir)
 	r := NewFileUserRequestAuditRepository(nil)
-	cfg := service.UserRequestAuditConfig{RetentionDays: 3, CleanupIntervalHours: 4, MaxShardBytes: 8 * 1024 * 1024}
+	cfg := service.UserRequestAuditConfig{RetentionDays: 3, CleanupIntervalHours: 4}
 	if err := r.SetAuditConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
 	r2 := NewFileUserRequestAuditRepository(nil)
 	got := r2.GetAuditConfig()
-	b, _ := json.Marshal(got)
-	if string(b) != "{\"retention_days\":3,\"cleanup_interval_hours\":4,\"max_shard_bytes\":8388608}" {
-		t.Fatalf("config=%s", b)
+	if !reflect.DeepEqual(got, cfg) {
+		t.Fatalf("config roundtrip got=%+v want=%+v", got, cfg)
 	}
 	old := time.Now().UTC().Add(-48 * time.Hour)
 	if err := r2.Create(context.Background(), &service.UserRequestAudit{CreatedAt: old, ExpiresAt: old.Add(time.Hour), LogicalKey: "expired", Protocol: "openai_responses"}); err != nil {

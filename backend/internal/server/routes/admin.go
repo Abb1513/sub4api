@@ -159,7 +159,11 @@ func registerUserRequestAuditRoutes(admin *gin.RouterGroup, h *handler.Handlers)
 	audits.GET("/status", h.Admin.UserRequestAudit.Status)
 	audits.POST("/cleanup", h.Admin.UserRequestAudit.Cleanup)
 	audits.POST("/export", h.Admin.UserRequestAudit.Export)
+	audits.GET("/exports", h.Admin.UserRequestAudit.Exports)
+	audits.GET("/exports/:job_id/download", h.Admin.UserRequestAudit.DownloadExport)
+	audits.POST("/clear", h.Admin.UserRequestAudit.Clear)
 	audits.GET("/:id", h.Admin.UserRequestAudit.Get)
+	audits.GET("/:id/conversation", h.Admin.UserRequestAudit.Conversation)
 }
 
 func registerAuditLogRoutes(admin *gin.RouterGroup, h *handler.Handlers, _ middleware.StepUpAuthMiddleware) {
