@@ -2287,6 +2287,43 @@
         </div>
       </div>
 
+      <!-- 自建推理上游：客户端断开即取消上游 / 非流式 Responses 空白心跳 -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'apikey'"
+        class="space-y-4 border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div
+          v-for="item in selfHostedUpstreamToggles"
+          :key="item.key"
+          class="flex items-center justify-between gap-4"
+        >
+          <div>
+            <label class="input-label mb-0">{{ t(item.label) }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t(item.desc) }}
+            </p>
+          </div>
+          <button
+            type="button"
+            :data-testid="item.testId"
+            role="switch"
+            :aria-checked="item.state.value"
+            @click="item.state.value = !item.state.value"
+            :class="[
+              'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+              item.state.value ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+            ]"
+          >
+            <span
+              :class="[
+                'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                item.state.value ? 'translate-x-5' : 'translate-x-0'
+              ]"
+            />
+          </button>
+        </div>
+      </div>
+
       <div
         v-if="account?.platform === 'openai' && (account?.type === 'oauth' || account?.type === 'setup-token')"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3722,6 +3759,25 @@ const openAIRequestTimezone = ref('Asia/Singapore')
 // OpenAI Codex namespace 工具摊平兼容开关（仅 OAuth），缺省关闭即原样保留
 const openaiFlattenNamespacesEnabled = ref(false)
 const openAILongContextBillingEnabled = ref(false)
+// 自建推理上游（OpenAI API Key）：按 GPU 时间付费，缺省关闭即保持原有计费语义
+const cancelUpstreamOnClientDisconnect = ref(false)
+const responsesNonstreamKeepalive = ref(false)
+const selfHostedUpstreamToggles = [
+  {
+    key: 'cancel_upstream_on_client_disconnect',
+    state: cancelUpstreamOnClientDisconnect,
+    label: 'admin.accounts.openai.cancelUpstreamOnClientDisconnect',
+    desc: 'admin.accounts.openai.cancelUpstreamOnClientDisconnectDesc',
+    testId: 'openai-cancel-upstream-on-disconnect-toggle'
+  },
+  {
+    key: 'responses_nonstream_keepalive',
+    state: responsesNonstreamKeepalive,
+    label: 'admin.accounts.openai.responsesNonstreamKeepalive',
+    desc: 'admin.accounts.openai.responsesNonstreamKeepaliveDesc',
+    testId: 'openai-responses-nonstream-keepalive-toggle'
+  }
+] as const
 // OpenAI 订阅档位（Plus / Pro 20x / Pro 5x / Business Standard / Business Premium / Free）手动覆盖值,
 // 存于 credentials.plan_type;'' 表示清空/自动识别
 const editPlanType = ref<string>('')
@@ -4218,6 +4274,10 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   openAIRequestTimezone.value = 'Asia/Singapore'
   openaiFlattenNamespacesEnabled.value = false
   openAILongContextBillingEnabled.value = false
+  cancelUpstreamOnClientDisconnect.value =
+    newAccount.platform === 'openai' && newAccount.type === 'apikey' && extra?.cancel_upstream_on_client_disconnect === true
+  responsesNonstreamKeepalive.value =
+    newAccount.platform === 'openai' && newAccount.type === 'apikey' && extra?.responses_nonstream_keepalive === true
   editPlanType.value = ''
   openAICompactMode.value = 'auto'
   openAIResponsesMode.value = 'auto'
@@ -5742,6 +5802,14 @@ const handleSubmit = async () => {
         delete newExtra.openai_long_context_billing_enabled
       } else {
         newExtra.openai_long_context_billing_enabled = openAILongContextBillingEnabled.value
+      }
+      // 缺省关闭不写入，避免 extra 里堆积默认项
+      for (const item of selfHostedUpstreamToggles) {
+        if (props.account.type === 'apikey' && item.state.value) {
+          newExtra[item.key] = true
+        } else {
+          delete newExtra[item.key]
+        }
       }
       if (openAICompactMode.value === 'auto') {
         delete newExtra.openai_compact_mode

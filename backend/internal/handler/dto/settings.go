@@ -227,6 +227,9 @@ type SystemSettings struct {
 	OpenAICodexTicketPromptTemplate         string `json:"openai_codex_ticket_prompt_template"`
 	OpenAICodexTicketPromptTemplateDefault  string `json:"openai_codex_ticket_prompt_template_default"`
 
+	// 自动降智检测运行器配置（默认关闭）
+	CodexAutoDegradationCheck *service.CodexAutoDegradationCheckSettings `json:"codex_auto_degradation_check"`
+
 	// codex_cli_only 加固
 	MinCodexVersion                      string `json:"min_codex_version"`
 	MaxCodexVersion                      string `json:"max_codex_version"`

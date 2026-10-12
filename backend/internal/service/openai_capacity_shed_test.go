@@ -21,11 +21,19 @@ import (
 type capacityShedAccountRepoStub struct {
 	AccountRepository // 嵌入接口，未实现的方法会 panic（不应被调用）
 
-	tempUnschedCalls int
+	tempUnschedCalls  int
+	modelRateLimitKey string
+	modelRateLimitFor time.Time
 }
 
 func (r *capacityShedAccountRepoStub) SetTempUnschedulable(_ context.Context, _ int64, _ time.Time, _ string) error {
 	r.tempUnschedCalls++
+	return nil
+}
+
+func (r *capacityShedAccountRepoStub) SetModelRateLimit(_ context.Context, _ int64, modelKey string, until time.Time, _ ...string) error {
+	r.modelRateLimitKey = modelKey
+	r.modelRateLimitFor = until
 	return nil
 }
 
@@ -77,10 +85,12 @@ func TestStreamFailedEventCapacityShedRetriesOnSameAccount(t *testing.T) {
 	require.False(t, openAIStreamFailedEventRetryableOnSameAccount(nonPool, other, "boom"))
 }
 
-func TestOpenAIHTTPCapacityShedIsRequestScopedForOAuthAccounts(t *testing.T) {
+// 容量降载不再早退：命中账号配置的 temp_unschedulable 规则时必须照常写入模型级
+// 冷却，否则 503 + overloaded 配置的 30 分钟规则永远拿不到执行入口。
+func TestOpenAIHTTPCapacityShedAppliesConfiguredTempUnschedulable(t *testing.T) {
 	payload := []byte(`{"error":{"type":"server_error","message":"Our servers are currently overloaded. Please try again later."}}`)
 	failoverErr := newOpenAIUpstreamFailoverError(
-		http.StatusBadRequest,
+		http.StatusServiceUnavailable,
 		http.Header{"X-Request-Id": []string{"rid-http-capacity"}},
 		payload,
 		"Our servers are currently overloaded. Please try again later.",
@@ -91,21 +101,30 @@ func TestOpenAIHTTPCapacityShedIsRequestScopedForOAuthAccounts(t *testing.T) {
 	require.True(t, failoverErr.RequestScopedTransient)
 
 	repo := &capacityShedAccountRepoStub{}
-	(&GatewayService{accountRepo: repo}).TempUnscheduleRetryableError(context.Background(), 1, failoverErr)
-	require.Zero(t, repo.tempUnschedCalls)
-
 	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
 	gateway := &OpenAIGatewayService{rateLimitService: rateLimitService}
-	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
-	require.False(t, gateway.handleOpenAIAccountUpstreamError(
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Credentials: map[string]any{
+			"temp_unschedulable_enabled": true,
+			"temp_unschedulable_rules": []any{map[string]any{
+				"error_code":       float64(http.StatusServiceUnavailable),
+				"keywords":         []any{"servers are currently overloaded"},
+				"duration_minutes": float64(30),
+			}},
+		},
+	}
+	before := time.Now()
+	require.True(t, gateway.handleOpenAIAccountUpstreamError(
 		context.Background(),
 		account,
-		http.StatusBadRequest,
+		http.StatusServiceUnavailable,
 		nil,
 		payload,
 		"gpt-5",
 	))
-	require.Zero(t, repo.tempUnschedCalls)
+	require.Zero(t, repo.tempUnschedCalls, "a model-scoped rule must not widen into an account-wide block")
+	require.Equal(t, "gpt-5", repo.modelRateLimitKey)
+	require.WithinDuration(t, before.Add(30*time.Minute), repo.modelRateLimitFor, time.Minute)
 }
 
 // 上游降载的真实序列是「event: error → event: response.failed」。error 帧不算

@@ -193,6 +193,211 @@ func TestHostedResponsesSearchIncompleteCallIsNotExecuted(t *testing.T) {
 	require.NotContains(t, recorder.Body.String(), responsesWebSearchFunctionPrefix)
 }
 
+func TestHostedResponsesSearchReplaysEvidenceWhenNewSearchIsDisabled(t *testing.T) {
+	for index, choice := range []string{`"none"`, `{"type":"allowed_tools","tools":[{"type":"function","name":"read_file"}]}`} {
+		t.Run(choice, func(t *testing.T) {
+			id := responsesWebSearchIDPrefix + "policy-replay"
+			body := `{"model":"test-model","tools":[{"type":"web_search"},{"type":"function","name":"read_file","parameters":{"type":"object"}}],"tool_choice":` + choice + `,"input":[{"type":"web_search_call","id":"` + id + `","status":"completed"}],"metadata":{"large":9007199254740993}}`
+			c, _ := hostedSearchTestContext(t, body, int64(850+index))
+			putResponsesWebSearchReplay(responsesWebSearchScope(c), id, responsesWebSearchReplayEntry{
+				call:   json.RawMessage(`{"type":"function_call","call_id":"search_policy","name":"__sub4api_web_search","arguments":"{\"query\":\"fixture\"}"}`),
+				result: json.RawMessage(`{"type":"function_call_output","call_id":"search_policy","output":"retained provider evidence"}`),
+			})
+			_, err := forwardHostedResponsesWebSearch(context.Background(), c, &Account{}, []byte(body), func(next []byte) (*OpenAIForwardResult, error) {
+				require.Equal(t, "function_call", gjson.GetBytes(next, "input.0.type").String())
+				require.Equal(t, "retained provider evidence", gjson.GetBytes(next, "input.1.output").String())
+				require.Equal(t, "9007199254740993", gjson.GetBytes(next, "metadata.large").Raw)
+				require.JSONEq(t, choice, gjson.GetBytes(next, "tool_choice").Raw)
+				require.Equal(t, int64(1), gjson.GetBytes(next, "tools.#").Int())
+				require.Equal(t, "read_file", gjson.GetBytes(next, "tools.0.name").String())
+				return hostedSearchTestResponse(c, "resp_policy_replayed", nil, 1, 1), nil
+			}, mergeOpenAIWebSearchResult, func(context.Context, *Account, string, *responsesWebSearchPlan) (*websearch.SearchResponse, error) {
+				t.Fatal("history replay must not execute another search")
+				return nil, nil
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestHostedResponsesSearchDisabledRouteStillReplaysAndFailsClosed(t *testing.T) {
+	id := responsesWebSearchIDPrefix + "disabled-replay"
+	body := `{"model":"test-model","tool_choice":"none","input":[{"type":"web_search_call","id":"` + id + `"}]}`
+	c, recorder := hostedSearchTestContext(t, body, 860)
+	putResponsesWebSearchReplay(responsesWebSearchScope(c), id, responsesWebSearchReplayEntry{
+		call:   json.RawMessage(`{"type":"function_call","call_id":"paid_search","name":"__sub4api_web_search","arguments":"{}"}`),
+		result: json.RawMessage(`{"type":"function_call_output","call_id":"paid_search","output":"exact retained evidence"}`),
+	})
+	svc := &GatewayService{} // No settings/provider: new hosted searches disabled.
+	_, err := svc.ForwardResponsesWithWebSearch(context.Background(), c, &Account{}, []byte(body), func(next []byte) (*ForwardResult, error) {
+		require.Equal(t, "function_call", gjson.GetBytes(next, "input.0.type").String())
+		require.Equal(t, "exact retained evidence", gjson.GetBytes(next, "input.1.output").String())
+		return &ForwardResult{}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	other, rejected := hostedSearchTestContext(t, body, 861)
+	_, err = svc.ForwardResponsesWithWebSearch(context.Background(), other, &Account{}, []byte(body), func([]byte) (*ForwardResult, error) {
+		t.Fatal("unknown/other-scope search must not reach the upstream")
+		return nil, nil
+	})
+	require.ErrorContains(t, err, "expired or belongs to another API key")
+	require.Equal(t, http.StatusBadRequest, rejected.Code)
+}
+
+func TestHostedResponsesSearchHistoryResolvesAliasesAndDoesNotDuplicateResults(t *testing.T) {
+	body := []byte(`{"model":"test-model","previous_response_id":"resp_public","tool_choice":"none","input":[{"type":"function_call_output","call_id":"paid_search","output":"already present"}]}`)
+	c, _ := hostedSearchTestContext(t, string(body), 862)
+	scope := responsesWebSearchScope(c)
+	putResponsesWebSearchReplay(scope, "alias:resp_public", responsesWebSearchReplayEntry{alias: "resp_last"})
+	putResponsesWebSearchReplay(scope, "pending:resp_last", responsesWebSearchReplayEntry{pending: []json.RawMessage{
+		json.RawMessage(`{"type":"function_call_output","call_id":"paid_search","output":"retained evidence"}`),
+	}})
+	next, err := normalizeResponsesWebSearchHistory(c, body)
+	require.NoError(t, err)
+	require.Equal(t, "resp_last", gjson.GetBytes(next, "previous_response_id").String())
+	require.Equal(t, int64(1), gjson.GetBytes(next, "input.#").Int())
+	require.Equal(t, "already present", gjson.GetBytes(next, "input.0.output").String())
+}
+
+func TestHostedResponsesSearchReplaysIDStrippedProviderPayload(t *testing.T) {
+	for index, scenario := range []string{
+		"replay", "empty_id", "new_search_disabled", "hosted_gate_disabled", "changed_query", "changed_sources",
+		"missing_status", "failed_status", "incomplete_status", "expired", "other_key",
+		"other_user", "other_group", "unauthenticated", "ambiguous", "foreign_id", "null_id",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			// Mirrors the actual client contract: store=false, function tools only,
+			// no tool_choice, and a provider payload with only action/status/type.
+			body := `{"model":"test-model","store":false,"input":"fixture","tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]}`
+			keyID := int64(900 + index)
+			c, recorder := hostedSearchTestContext(t, body, keyID)
+			clientCall := json.RawMessage(`{"type":"function_call","id":"fc_local","call_id":"local_1","name":"read_file","arguments":"{}","status":"completed"}`)
+			results := []websearch.SearchResult{
+				{URL: "https://example.org/1", Title: "One", Snippet: "complete evidence one"},
+				{URL: "https://example.org/2", Title: "Two", Snippet: "complete evidence two"},
+				{URL: "https://example.org/3", Title: "Three", Snippet: "complete evidence three"},
+				{URL: "https://example.org/4", Title: "Four", Snippet: "complete evidence four"},
+				{URL: "https://example.org/5", Title: "Five", Snippet: "complete evidence five"},
+			}
+			_, err := forwardHostedResponsesWebSearch(context.Background(), c, &Account{}, []byte(body), func(next []byte) (*OpenAIForwardResult, error) {
+				return hostedSearchTestResponse(c, "resp_idless_seed", []json.RawMessage{hostedSearchTestCall(next, "paid_idless"), clientCall}, 5, 3), nil
+			}, mergeOpenAIWebSearchResult, func(context.Context, *Account, string, *responsesWebSearchPlan) (*websearch.SearchResponse, error) {
+				return &websearch.SearchResponse{Results: results}, nil
+			})
+			require.NoError(t, err)
+			var public map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(gjson.Get(recorder.Body.String(), "output.0").Raw), &public))
+			id := responsesSearchString(public["id"])
+			delete(public, "id")
+			// Object key order may change during client serialization.
+			var action map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(public["action"], &action))
+			public["action"] = json.RawMessage(`{"type":` + string(action["type"]) + `,"sources":` + string(action["sources"]) + `,"query":` + string(action["query"]) + `,"queries":` + string(action["queries"]) + `}`)
+			scope := responsesWebSearchScope(c)
+			t.Cleanup(func() {
+				responsesWebSearchReplay.Lock()
+				defer responsesWebSearchReplay.Unlock()
+				for key, entry := range responsesWebSearchReplay.entries {
+					if strings.HasPrefix(key, scope) {
+						delete(responsesWebSearchReplay.entries, key)
+						responsesWebSearchReplay.bytes -= entry.bytes
+					}
+				}
+			})
+			switch scenario {
+			case "empty_id":
+				public["id"] = json.RawMessage(`""`)
+			case "null_id":
+				public["id"] = json.RawMessage(`null`)
+			case "changed_query", "changed_sources":
+				var action map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(public["action"], &action))
+				if scenario == "changed_query" {
+					action["query"] = json.RawMessage(`"changed"`)
+				} else {
+					action["sources"] = json.RawMessage(`[{"type":"url","url":"https://elsewhere.example"}]`)
+				}
+				public["action"] = rawResponsesSearchJSON(action)
+			case "missing_status":
+				delete(public, "status")
+			case "failed_status":
+				public["status"] = json.RawMessage(`"failed"`)
+			case "incomplete_status":
+				public["status"] = json.RawMessage(`"incomplete"`)
+			case "expired":
+				responsesWebSearchReplay.Lock()
+				entry := responsesWebSearchReplay.entries[scope+id]
+				entry.expires = time.Now().Add(-time.Second)
+				responsesWebSearchReplay.entries[scope+id] = entry
+				responsesWebSearchReplay.Unlock()
+			case "ambiguous":
+				entry, ok := getResponsesWebSearchReplay(scope, id)
+				require.True(t, ok)
+				entry.result = json.RawMessage(`{"type":"function_call_output","call_id":"different_search","output":"different actual evidence"}`)
+				putResponsesWebSearchReplay(scope, responsesWebSearchIDPrefix+"ambiguous", entry)
+			case "foreign_id":
+				public["id"] = json.RawMessage(`"ws_other_provider"`)
+			}
+			var request map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal([]byte(body), &request))
+			clientResult := json.RawMessage(`{"type":"function_call_output","call_id":"local_1","output":"local file evidence"}`)
+			request["input"] = rawResponsesSearchJSON([]json.RawMessage{
+				json.RawMessage(`{"type":"message","role":"user","content":"fixture"}`),
+				rawResponsesSearchJSON(public), clientCall, clientResult,
+			})
+			if scenario == "new_search_disabled" {
+				request["tool_choice"] = json.RawMessage(`"none"`)
+			}
+			continuation := rawResponsesSearchJSON(request)
+			continued, rejected := hostedSearchTestContext(t, string(continuation), keyID)
+			switch scenario {
+			case "other_key":
+				continued.Set("api_key", &APIKey{ID: keyID + 1000, UserID: 7})
+			case "other_user":
+				continued.Set("api_key", &APIKey{ID: keyID, UserID: 8})
+			case "other_group":
+				groupID := int64(2)
+				continued.Set("api_key", &APIKey{ID: keyID, UserID: 7, GroupID: &groupID})
+			case "unauthenticated":
+				continued.Set("api_key", (*APIKey)(nil))
+			}
+			success := scenario == "replay" || scenario == "empty_id" || scenario == "new_search_disabled" || scenario == "hosted_gate_disabled"
+			forward := func(next []byte) (*OpenAIForwardResult, error) {
+				require.True(t, success, "irrecoverable history must not reach the upstream")
+				require.Equal(t, int64(5), gjson.GetBytes(next, "input.#").Int())
+				require.Equal(t, "function_call", gjson.GetBytes(next, "input.1.type").String())
+				require.Equal(t, "paid_idless", gjson.GetBytes(next, "input.1.call_id").String())
+				require.Equal(t, "paid_idless", gjson.GetBytes(next, "input.2.call_id").String())
+				require.JSONEq(t, string(rawResponsesSearchJSON(map[string]any{"query": "actual model search query", "results": results})), gjson.GetBytes(next, "input.2.output").String())
+				require.JSONEq(t, string(clientCall), gjson.GetBytes(next, "input.3").Raw)
+				require.JSONEq(t, string(clientResult), gjson.GetBytes(next, "input.4").Raw)
+				return hostedSearchTestResponse(continued, "resp_idless_continued", nil, 8, 1), nil
+			}
+			if scenario == "hosted_gate_disabled" {
+				svc := &GatewayService{}
+				_, err = svc.ForwardResponsesWithWebSearch(context.Background(), continued, &Account{}, continuation, func(next []byte) (*ForwardResult, error) {
+					_, err := forward(next)
+					return &ForwardResult{}, err
+				})
+			} else {
+				_, err = forwardHostedResponsesWebSearch(context.Background(), continued, &Account{}, continuation, forward, mergeOpenAIWebSearchResult, func(context.Context, *Account, string, *responsesWebSearchPlan) (*websearch.SearchResponse, error) {
+					t.Fatal("replay must never execute another search")
+					return nil, nil
+				})
+			}
+			if success {
+				require.NoError(t, err)
+				require.Equal(t, "completed", gjson.Get(rejected.Body.String(), "status").String())
+			} else {
+				require.Error(t, err)
+				require.Equal(t, http.StatusBadRequest, rejected.Code)
+				require.Equal(t, "invalid_request_error", gjson.Get(rejected.Body.String(), "error.type").String())
+			}
+		})
+	}
+}
+
 func TestHostedResponsesSearchGateDisabledAndExplicitNoneRemainTransparent(t *testing.T) {
 	previousManager, previousConfig := getWebSearchManager(), webSearchEmulationCache.Load()
 	t.Cleanup(func() {

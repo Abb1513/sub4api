@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"sort"
 	"strings"
@@ -422,66 +421,6 @@ func (s *UserRequestAuditService) GroupStats(ctx context.Context, filter UserReq
 	}
 	return out, nil
 }
-
-func (s *UserRequestAuditService) StreamExport(ctx context.Context, filter UserRequestAuditFilter, format string, w io.Writer) (int, error) {
-	if s == nil || s.repo == nil {
-		return 0, sql.ErrNoRows
-	}
-	if format != "json" {
-		format = "jsonl"
-	}
-	if r, ok := s.repo.(userRequestAuditConversationExporter); ok {
-		filter.Page, filter.PageSize = 0, 0
-		return r.ExportConversations(ctx, filter, nil, w, format)
-	}
-	enc := json.NewEncoder(w)
-	written := 0
-	first := true
-	if format == "json" {
-		if _, err := io.WriteString(w, "["); err != nil {
-			return 0, err
-		}
-		defer func() { _, _ = io.WriteString(w, "]") }()
-	}
-	filter.Page, filter.PageSize = 1, 200
-	for {
-		rows, _, err := s.repo.List(ctx, filter)
-		if err != nil {
-			return written, err
-		}
-		if len(rows) == 0 {
-			break
-		}
-		for _, row := range rows {
-			if format == "jsonl" {
-				if err := enc.Encode(row); err != nil {
-					return written, err
-				}
-			} else {
-				if !first {
-					if _, err := io.WriteString(w, ","); err != nil {
-						return written, err
-					}
-				}
-				first = false
-				b, err := json.Marshal(row)
-				if err != nil {
-					return written, err
-				}
-				if _, err = w.Write(b); err != nil {
-					return written, err
-				}
-			}
-			written++
-		}
-		if len(rows) < filter.PageSize {
-			break
-		}
-		filter.Page++
-	}
-	return written, nil
-}
-
 func auditUsageNumber(values map[string]any, keys ...string) int64 {
 	for _, key := range keys {
 		if v, ok := values[key]; ok {

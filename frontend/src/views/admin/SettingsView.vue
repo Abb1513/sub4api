@@ -4535,6 +4535,88 @@
                   <textarea id="codex-probe-template" v-model="form.openai_codex_ticket_prompt_template" data-testid="codex-probe-template" aria-describedby="codex-probe-template-help" class="input w-full font-mono text-xs" rows="12" wrap="off" :spellcheck="false" :disabled="saving" />
                 </div>
                 <CodexTicketCadenceSettings ref="codexTicketCadenceRef" :saving="saving" />
+                <!-- 自动降智检测 -->
+                <div class="border-t border-gray-100 pt-4 dark:border-dark-700">
+                  <div class="flex items-center justify-between gap-4">
+                    <div class="min-w-0">
+                      <h3 class="text-base font-semibold text-gray-900 dark:text-white">
+                        {{ t("admin.settings.gatewayForwarding.codexAutoDegradationEnabled") }}
+                      </h3>
+                      <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                        {{ t("admin.settings.gatewayForwarding.codexAutoDegradationEnabledDesc") }}
+                      </p>
+                    </div>
+                    <Toggle
+                      id="codex-auto-degradation-enabled"
+                      v-model="form.codex_auto_degradation_check.enabled"
+                    />
+                  </div>
+                  <div class="mt-4 grid gap-4 sm:grid-cols-2">
+                    <div>
+                      <label
+                        class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300"
+                        for="codex-auto-degradation-interval"
+                      >
+                        {{ t("admin.settings.gatewayForwarding.codexAutoDegradationInterval") }}
+                      </label>
+                      <input
+                        id="codex-auto-degradation-interval"
+                        v-model.number="form.codex_auto_degradation_check.interval_minutes"
+                        type="number"
+                        min="1"
+                        step="1"
+                        class="input w-32"
+                        :disabled="saving"
+                      />
+                    </div>
+                    <div>
+                      <label
+                        class="mb-2 block text-sm font-medium text-gray-700 dark:text-gray-300"
+                        for="codex-auto-degradation-block"
+                      >
+                        {{ t("admin.settings.gatewayForwarding.codexAutoDegradationBlock") }}
+                      </label>
+                      <input
+                        id="codex-auto-degradation-block"
+                        v-model.number="form.codex_auto_degradation_check.block_minutes"
+                        type="number"
+                        min="1"
+                        step="1"
+                        class="input w-32"
+                        :disabled="saving"
+                      />
+                    </div>
+                  </div>
+                  <div class="mt-4">
+                    <label class="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-300">
+                      {{ t("admin.settings.gatewayForwarding.codexAutoDegradationModels") }}
+                    </label>
+                    <p class="mb-2 text-xs text-gray-500 dark:text-gray-400">
+                      {{ t("admin.settings.gatewayForwarding.codexAutoDegradationModelsDesc") }}
+                    </p>
+                    <div class="flex flex-wrap gap-x-5 gap-y-2">
+                      <label
+                        v-for="model in codexAutoDegradationModelChoices"
+                        :key="model"
+                        class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"
+                      >
+                        <input
+                          type="checkbox"
+                          :checked="form.codex_auto_degradation_check.models.includes(model)"
+                          :disabled="saving"
+                          @change="toggleCodexAutoDegradationModel(model, $event)"
+                        />
+                        <span class="font-mono">{{ model }}</span>
+                      </label>
+                      <span
+                        v-if="codexAutoDegradationModelChoices.length === 0"
+                        class="text-xs text-gray-400 dark:text-gray-500"
+                      >
+                        {{ t("admin.settings.gatewayForwarding.codexAutoDegradationModelsEmpty") }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
                 <div>
                   <h3 class="text-base font-semibold text-gray-900 dark:text-white">
                     {{ t("admin.settings.gatewayForwarding.codexClientRestrictionTitle") }}
@@ -9013,6 +9095,7 @@ import { ref, reactive, computed, onMounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { adminAPI } from "@/api";
 import { PLATFORM_QUOTA_PLATFORMS } from "@/api/admin/users";
+import { fingerprint as fetchCodexFingerprint } from "@/api/admin/codexTickets";
 import {
   appendAuthSourceDefaultsToUpdateRequest,
   buildAuthSourceDefaultsState,
@@ -9029,6 +9112,7 @@ import {
 import type {
   AuthSourceDefaultsState,
   AuthSourceType,
+  CodexAutoDegradationCheckSettings,
   SystemSettings,
   UpdateSettingsRequest,
   DefaultSubscriptionSetting,
@@ -10070,6 +10154,13 @@ const form = reactive<SettingsForm>({
   openai_codex_ticket_prompt_template_default: "",
   openai_codex_ticket_harvest_proxy_url: "",
   openai_codex_ticket_harvest_proxy_configured: false,
+  // 自动降智检测（默认关闭；loadSettings 会用后端回显覆盖）
+  codex_auto_degradation_check: {
+    enabled: false,
+    interval_minutes: 10,
+    block_minutes: 30,
+    models: ["gpt-6.1-sol"],
+  },
   // codex_cli_only 加固
   min_codex_version: "",
   max_codex_version: "",
@@ -10998,6 +11089,91 @@ const codexFingerprintRows = ref<FingerprintSignalRow[]>([]);
 const codexFingerprintNoRequired = computed(
   () => !codexFingerprintRows.value.some((r) => r.required),
 );
+
+// 自动降智检测：可选模型来自指纹库版本接口；当前已选但不在库中的模型
+// 同样保留在选项里，否则已保存的选择会从界面上消失、无法取消。
+const codexAutoDegradationFingerprintModels = ref<string[]>([]);
+const codexAutoDegradationModelChoices = computed<string[]>(() => {
+  const selected = Array.isArray(form.codex_auto_degradation_check?.models)
+    ? form.codex_auto_degradation_check.models
+    : [];
+  const merged: string[] = [];
+  for (const model of [...codexAutoDegradationFingerprintModels.value, ...selected]) {
+    if (model && !merged.includes(model)) merged.push(model);
+  }
+  return merged;
+});
+
+function toggleCodexAutoDegradationModel(model: string, event: Event) {
+  const checked = (event.target as HTMLInputElement).checked;
+  const models = new Set(form.codex_auto_degradation_check.models ?? []);
+  if (checked) {
+    models.add(model);
+  } else {
+    models.delete(model);
+  }
+  form.codex_auto_degradation_check.models = [...models];
+}
+
+function normalizeCodexAutoDegradationCheck(value: unknown): CodexAutoDegradationCheckSettings {
+  const fallback: CodexAutoDegradationCheckSettings = {
+    enabled: false,
+    interval_minutes: 10,
+    block_minutes: 30,
+    models: ["gpt-6.1-sol"],
+  };
+  if (!value || typeof value !== "object") return fallback;
+  const source = value as Partial<CodexAutoDegradationCheckSettings>;
+  const interval = Math.floor(Number(source.interval_minutes));
+  const block = Math.floor(Number(source.block_minutes));
+  return {
+    enabled: Boolean(source.enabled),
+    interval_minutes: Number.isFinite(interval) && interval >= 1 ? interval : fallback.interval_minutes,
+    block_minutes: Number.isFinite(block) && block >= 1 ? block : fallback.block_minutes,
+    models:
+      Array.isArray(source.models) && source.models.length > 0
+        ? source.models.map((model) => String(model)).filter(Boolean)
+        : fallback.models,
+  };
+}
+
+// 提交前只做去空白/去重与数值规整（NaN→0），不静默修复 0 或空数组：
+// 非法值交给后端校验，换取明确的错误信息。
+function sanitizeCodexAutoDegradationCheck(value: unknown): CodexAutoDegradationCheckSettings {
+  const source: Partial<CodexAutoDegradationCheckSettings> =
+    value && typeof value === "object" ? (value as Partial<CodexAutoDegradationCheckSettings>) : {};
+  return {
+    enabled: Boolean(source.enabled),
+    interval_minutes: Math.floor(Number(source.interval_minutes)) || 0,
+    block_minutes: Math.floor(Number(source.block_minutes)) || 0,
+    models: Array.isArray(source.models)
+      ? [...new Set(source.models.map((model) => String(model).trim()).filter(Boolean))]
+      : [],
+  };
+}
+
+async function loadCodexAutoDegradationModels() {
+  try {
+    const result = await fetchCodexFingerprint();
+    codexAutoDegradationFingerprintModels.value = Array.isArray(result?.models)
+      ? result.models.filter((model) => typeof model === "string" && model)
+      : [];
+  } catch {
+    codexAutoDegradationFingerprintModels.value = [];
+  }
+}
+
+// 模型候选按需拉取：只有真正进入网关 Tab（本设置所在分组）时才请求
+// 指纹库版本接口——设置页默认落在常规 Tab，多数访问不需要这发请求，
+// 接口失败也只影响候选列表，不阻塞设置页本身。
+watch(
+  () => activeTab.value,
+  (tab) => {
+    if (tab === "gateway") {
+      void loadCodexAutoDegradationModels();
+    }
+  },
+);
 function addCodexFingerprintRow(): void {
   codexFingerprintRows.value.push({ type: "header_exact", match: "", required: false });
 }
@@ -11102,6 +11278,9 @@ async function loadSettings() {
     if (settings.openai_oauth_scheduling_rate_multiplier === null) {
       form.openai_oauth_scheduling_rate_multiplier = null;
     }
+    form.codex_auto_degradation_check = normalizeCodexAutoDegradationCheck(
+      settings.codex_auto_degradation_check,
+    );
     syncCaptchaProviderSelection();
     if (!form.claude_oauth_system_prompt_blocks?.trim()) {
       form.claude_oauth_system_prompt_blocks =
@@ -11753,6 +11932,9 @@ async function saveSettings() {
         form.openai_codex_ticket_prompt_template === form.openai_codex_ticket_prompt_template_default
           ? ""
           : form.openai_codex_ticket_prompt_template,
+      codex_auto_degradation_check: sanitizeCodexAutoDegradationCheck(
+        form.codex_auto_degradation_check,
+      ),
       min_codex_version: form.min_codex_version?.trim() || "",
       max_codex_version: form.max_codex_version?.trim() || "",
       codex_cli_only_allow_app_server_clients:

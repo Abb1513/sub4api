@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -18,11 +20,185 @@ import (
 )
 
 // Turn metadata is also used as an HTTP header, including when carried in WS JSON.
-func marshalCodexTurnMetadata(metadata map[string]any) ([]byte, error) {
-	raw, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, err
+
+// codexTurnMetadataKeyOrder 复刻官方 CodexTurnMetadataPayload 的 serde 字段顺序
+// （codex-rs/core/src/responses_metadata.rs:544-601，全部 skip_serializing_if=none）。
+// serde 按 struct 声明顺序序列化，未知键走 #[serde(flatten)] 的 BTreeMap<String,String>
+// （字典序、排在末尾）。Go map 的 json.Marshal 恒为字母序，与官方线序不一致，
+// 上游可逐字节比对——必须显式复刻。
+var codexTurnMetadataKeyOrder = [...]string{
+	"installation_id",
+	"session_id",
+	"thread_id",
+	"agent_name",
+	"turn_id",
+	"window_id",
+	"window_number",
+	"context_window_id",
+	"request_kind",
+	"forked_from_thread_id",
+	"forked_from_ordinal_exclusive",
+	"parent_thread_id",
+	"parent_turn_id",
+	"root_turn_id",
+	"subagent_kind",
+	"thread_source",
+	"turn_trigger",
+	"sandbox",
+	"sandbox_mode",
+	"auto_review_enabled",
+	"node_repl_auto_review_required",
+	"node_repl_disabled",
+	"workspaces",
+	"tool_namespaces_info",
+	"turn_started_at_unix_ms",
+	"history_ingest_requested",
+	"analytics_enabled",
+	"compaction",
+}
+
+// codexJSONShape 描述一类官方 JSON 对象的线序形状。serde 语义下：
+//   - order 非空：该层是 struct，键按 order（声明序）输出，order 之外的未知键
+//     按字典序追加（复刻 flatten 的 BTreeMap）。
+//   - order 为空：该层是 BTreeMap，键按字典序输出。
+//   - fields：struct 内某键指向的子对象 kind（缺省为叶子）。
+//   - values：BTreeMap 的每个 value 指向的子对象 kind（缺省为叶子）。
+type codexJSONShape struct {
+	order  []string
+	fields map[string]string
+	values string
+}
+
+// codexJSONShapes 复刻官方 turn metadata 里出现的各类对象形状。
+// 依据 codex-rs core/src/responses_metadata.rs（payload 544-601、workspace 186-194、
+// tool namespace 196-222）与 analytics/src/facts.rs（compaction 枚举）。
+var codexJSONShapes = map[string]codexJSONShape{
+	"": { // CodexTurnMetadataPayload 顶层
+		order: codexTurnMetadataKeyOrder[:],
+		fields: map[string]string{
+			"workspaces":           "workspaces",
+			"tool_namespaces_info": "tool_namespaces_info",
+			"compaction":           "compaction",
+		},
+	},
+	"workspaces":           {values: "workspace"}, // BTreeMap<path, TurnMetadataWorkspace>
+	"workspace":            {order: []string{"associated_remote_urls", "latest_git_commit_hash", "has_changes"}, fields: map[string]string{"associated_remote_urls": "remote_urls"}},
+	"remote_urls":          {},                    // BTreeMap<name, SanitizedGitUrl(String)>
+	"tool_namespaces_info": {values: "namespace"}, // BTreeMap<name, TurnToolNamespaceInfo>
+	"namespace":            {order: []string{"name", "functions"}, fields: map[string]string{"functions": "functions"}},
+	"functions":            {values: "function"}, // BTreeMap<name, TurnToolFunctionInfo>
+	"function":             {order: []string{"name", "direct", "code_mode_name", "deferred", "source"}},
+	"compaction":           {order: []string{"trigger", "reason", "implementation", "phase", "strategy"}},
+}
+
+// orderedCodexJSONKeys 先按官方顺序取已出现的键，再把未知键按字典序追加，
+// 复刻 serde struct + flatten(BTreeMap) 的混合输出。
+func orderedCodexJSONKeys(object map[string]any, order []string) []string {
+	keys := make([]string, 0, len(object))
+	seen := make(map[string]struct{}, len(order))
+	for _, key := range order {
+		if _, exists := object[key]; exists {
+			keys = append(keys, key)
+			seen[key] = struct{}{}
+		}
 	}
+	rest := make([]string, 0, len(object)-len(seen))
+	for key := range object {
+		if _, ok := seen[key]; !ok {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	return append(keys, rest...)
+}
+
+// writeCodexJSONString 只转义 JSON 语法必需的字节；非 ASCII 留给
+// escapeCodexNonASCII 统一处理（官方 AsciiJsonFormatter 也是两层语义）。
+// 与官方一致：& < > 不转义。
+func writeCodexJSONString(buf *bytes.Buffer, value string) {
+	buf.WriteByte('"')
+	start := 0
+	for i := range len(value) {
+		switch b := value[i]; b {
+		case '"', '\\':
+			buf.WriteString(value[start:i])
+			buf.WriteByte('\\')
+			buf.WriteByte(b)
+			start = i + 1
+		case '\n':
+			buf.WriteString(value[start:i])
+			buf.WriteString(`\n`)
+			start = i + 1
+		case '\r':
+			buf.WriteString(value[start:i])
+			buf.WriteString(`\r`)
+			start = i + 1
+		case '\t':
+			buf.WriteString(value[start:i])
+			buf.WriteString(`\t`)
+			start = i + 1
+		default:
+			if b < 0x20 {
+				buf.WriteString(value[start:i])
+				fmt.Fprintf(buf, `\u%04x`, b)
+				start = i + 1
+			}
+		}
+	}
+	buf.WriteString(value[start:])
+	buf.WriteByte('"')
+}
+
+// writeCodexJSONLeaf 用关闭 HTML 转义的编码器输出标量与数组。
+func writeCodexJSONLeaf(buf *bytes.Buffer, value any) error {
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return err
+	}
+	out := encoded.Bytes()
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	buf.Write(out)
+	return nil
+}
+
+func writeCodexJSONObject(buf *bytes.Buffer, object map[string]any, kind string) error {
+	shape := codexJSONShapes[kind]
+	keys := orderedCodexJSONKeys(object, shape.order)
+	buf.WriteByte('{')
+	for i, key := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		writeCodexJSONString(buf, key)
+		buf.WriteByte(':')
+		child, ok := object[key].(map[string]any)
+		if !ok {
+			if err := writeCodexJSONLeaf(buf, object[key]); err != nil {
+				return err
+			}
+			continue
+		}
+		childKind := shape.fields[key]
+		if childKind == "" {
+			childKind = shape.values
+		}
+		if err := writeCodexJSONObject(buf, child, childKind); err != nil {
+			return err
+		}
+	}
+	buf.WriteByte('}')
+	return nil
+}
+
+// escapeCodexNonASCII 复刻官方 to_ascii_json_string 的非 ASCII 转义
+// （codex-rs/utils/string/src/json.rs:12-38）：只把非 ASCII 码点写成小写 \uXXXX，
+// ASCII（含 & < > 与 U+007F）原样保留。官方仅在字符串片段上做该转义，
+// 而合法 JSON 里的高位字节只可能出现在字符串内，故字节级后处理等价。
+func escapeCodexNonASCII(raw []byte) []byte {
 	for i, b := range raw {
 		if b < 0x7f {
 			continue
@@ -45,9 +221,20 @@ func marshalCodexTurnMetadata(metadata map[string]any) ([]byte, error) {
 				appendEscape(low)
 			}
 		}
-		return out, nil
+		return out
 	}
-	return raw, nil
+	return raw
+}
+
+func marshalCodexTurnMetadata(metadata map[string]any) ([]byte, error) {
+	if metadata == nil {
+		return []byte("{}"), nil
+	}
+	var buf bytes.Buffer
+	if err := writeCodexJSONObject(&buf, metadata, ""); err != nil {
+		return nil, err
+	}
+	return escapeCodexNonASCII(buf.Bytes()), nil
 }
 
 // Keep business metadata integers lossless when rewriting only identity fields.
@@ -271,7 +458,7 @@ func ensureCodexClientMetadataDefaults(cm map[string]any, headers http.Header, b
 		sessionID = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
 	}
 	if sessionID == "" {
-		sessionID = deriveStableUUIDv4(fmt.Sprintf("sub2api:codex-session:v1:%d", account.ID))
+		sessionID = deriveStableCodexUUIDv7(fmt.Sprintf("sub2api:codex-session:v1:%d", account.ID), deriveCodexStableTimestampMs(fmt.Sprintf("session:%d", account.ID)))
 	}
 	threadID := from(metadata["thread_id"], cm["thread_id"])
 	if threadID == "" && headers != nil {
@@ -286,7 +473,9 @@ func ensureCodexClientMetadataDefaults(cm map[string]any, headers http.Header, b
 		turnID = strings.TrimSpace(headers.Get("turn-id"))
 	}
 	if turnID == "" {
-		turnID = deriveStableUUIDv4("sub2api:codex-turn:v1:" + sessionID + ":" + hex.EncodeToString(bodyDigest[:]))
+		// 官方 turn_id 是每回合新生成的 Uuid::now_v7()（core/src/turn_metadata.rs:134），
+		// 时间戳位取当前时刻，与 v7 语义自洽。
+		turnID = deriveStableCodexUUIDv7("sub2api:codex-turn:v1:"+sessionID+":"+hex.EncodeToString(bodyDigest[:]), time.Now().UnixMilli())
 	}
 	windowID := from(metadata["window_id"], cm["x-codex-window-id"], cm["window_id"])
 	if windowID == "" && headers != nil {
@@ -294,6 +483,28 @@ func ensureCodexClientMetadataDefaults(cm map[string]any, headers http.Header, b
 	}
 	if windowID == "" {
 		windowID = threadID + ":0"
+	}
+	// window_number / context_window_id 是官方 turn metadata 的两个独立字段：
+	// window_number 是当前自动压缩窗口序号（u64，新会话从 0 起，
+	// core/src/state/auto_compact_window.rs:49-66），context_window_id 是独立的
+	// Uuid::now_v7()（core/src/session/mod.rs:4484）。代理只转发不压缩，窗口序号
+	// 恒为 0；context_window_id 从 thread 派生 v7，保持"每窗口一个 UUID"的形状。
+	windowNumber := int64(0)
+	if raw, ok := metadata["window_number"]; ok {
+		switch value := raw.(type) {
+		case json.Number:
+			if parsed, err := value.Int64(); err == nil && parsed >= 0 {
+				windowNumber = parsed
+			}
+		case float64:
+			if value >= 0 {
+				windowNumber = int64(value)
+			}
+		}
+	}
+	contextWindowID := from(metadata["context_window_id"])
+	if contextWindowID == "" {
+		contextWindowID = deriveStableCodexUUIDv7("sub2api:codex-context-window:v1:"+threadID+":"+strconv.FormatInt(windowNumber, 10), deriveCodexStableTimestampMs(threadID))
 	}
 	requestKind := from(metadata["request_kind"])
 	if isCompact {
@@ -313,6 +524,14 @@ func ensureCodexClientMetadataDefaults(cm map[string]any, headers http.Header, b
 	set(metadata, "turn_id", turnID)
 	set(metadata, "window_id", windowID)
 	set(metadata, "request_kind", requestKind)
+	if _, exists := metadata["window_number"]; !exists {
+		metadata["window_number"] = windowNumber
+		changed = true
+	}
+	if _, exists := metadata["context_window_id"]; !exists {
+		metadata["context_window_id"] = contextWindowID
+		changed = true
+	}
 	if _, exists := metadata["turn_started_at_unix_ms"]; !exists {
 		metadata["turn_started_at_unix_ms"] = time.Now().UnixMilli()
 		changed = true

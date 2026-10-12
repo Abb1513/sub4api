@@ -771,6 +771,16 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	if err != nil {
 		return nil, err
 	}
+	// 终态线序收口：与 Forward() 使用同一官方 /responses 线序，删除官方在该传输上
+	// 从不发送、由代理各环节按习惯补齐的头（见 codexHTTPNonOfficialHeaders 与
+	// openai_gateway_forward.go 中同一收口注释）。legacy /responses/compact 与
+	// messages 桥是不同上游契约，不参与收口。
+	if account.UsesOpenAICodexProtocol() &&
+		!isOpenAICompatMessagesBridgeContext(c) && !isOpenAICompatMessagesBridgeBody(body) &&
+		!legacyCompactRequest {
+		projectCodexOutboundHeaders(req.Header, false)
+	}
+
 	if err := applyMappedGPT55LiteCompatibility(req, account, body); err != nil {
 		return nil, err
 	}

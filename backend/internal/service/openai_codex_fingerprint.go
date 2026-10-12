@@ -212,6 +212,40 @@ func deriveStableUUIDv4(seed string) string {
 	b := h[:16]
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 1
+	return formatCodexUUID(b)
+}
+
+// codexStableUUIDv7BaseMs 是确定性 v7 时间戳的锚点（2026-06-01T00:00:00Z）。
+// 官方 thread_id/session_id/window_id 都是 Uuid::now_v7()（codex-rs
+// protocol/src/thread_id.rs:30、core/src/state/auto_compact_window.rs:13），
+// 高 48 位是创建时刻的毫秒时间戳。收敛 ID 必须跨重启稳定，不能用当前时间，
+// 故锚定在最近的过去再由种子哈希散列进锚点后 200 天——对观察者而言这看起来
+// 就是「几个月前创建的一个会话/窗口」，与 v7 语义自洽。
+const codexStableUUIDv7BaseMs = 1780272000000 // 2026-06-01T00:00:00Z
+const codexStableUUIDv7SpanMs = 200 * 24 * 60 * 60 * 1000
+
+// deriveStableCodexUUIDv7 从种子确定性派生一个 UUIDv7 格式的字符串，
+// 时间戳位取 anchorMs（调用方保证是合理的创建时刻）。
+func deriveStableCodexUUIDv7(seed string, anchorMs int64) string {
+	h := sha256.Sum256([]byte(seed))
+	ms := uint64(anchorMs) + uint64(binary.BigEndian.Uint16(h[0:2]))*codexStableUUIDv7SpanMs/65536
+	b := make([]byte, 16)
+	binary.BigEndian.PutUint64(b[0:8], ms<<16)
+	copy(b[6:], h[6:8])
+	b[6] = (b[6] & 0x0f) | 0x70 // version 7
+	copy(b[8:], h[8:16])
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 1
+	return formatCodexUUID(b)
+}
+
+// deriveCodexStableTimestampMs 由种子确定一个稳定的毫秒时间戳，
+// 供 session/thread/window 这类跨重启恒定的 v7 ID 使用。
+func deriveCodexStableTimestampMs(seed string) int64 {
+	h := sha256.Sum256([]byte("sub2api:codex-v7-ts:v1:" + seed))
+	return codexStableUUIDv7BaseMs + int64(binary.BigEndian.Uint16(h[0:2]))*codexStableUUIDv7SpanMs/65536
+}
+
+func formatCodexUUID(b []byte) string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		binary.BigEndian.Uint32(b[0:4]),
 		binary.BigEndian.Uint16(b[4:6]),
@@ -236,21 +270,24 @@ func resolveConvergedInstallationID(account *Account, seed string) string {
 }
 
 // resolveConvergedSessionID 返回账号级恒定的 session_id。
+// 官方 session_id 是 SessionId::from(thread_id)（core/src/session/session.rs:929-934），
+// 而 thread_id 由 Uuid::now_v7() 生成（protocol/src/thread_id.rs:30），故此处也用 v7。
 func resolveConvergedSessionID(seed string) string {
 	if seed == "" {
 		return ""
 	}
-	return deriveStableUUIDv4("sub2api:codex-session-id:v2:" + seed)
+	return deriveStableCodexUUIDv7("sub2api:codex-session-id:v2:"+seed, deriveCodexStableTimestampMs(seed))
 }
 
 // resolveConvergedThreadID 按客户端原始 session-id 确定性派生 thread_id。
 // 每个真实 Codex 会话（不同客户端启动实例）获得一个独立线程，
 // 模拟正常用户 spawn 子代理或开多窗口的模式。
+// 官方 thread_id 由 Uuid::now_v7() 生成（protocol/src/thread_id.rs:30），故用 v7。
 func resolveConvergedThreadID(seed, clientSessionID string) string {
 	if seed == "" || clientSessionID == "" {
 		return ""
 	}
-	return deriveStableUUIDv4("sub2api:codex-thread-id:v2:" + seed + ":" + clientSessionID)
+	return deriveStableCodexUUIDv7("sub2api:codex-thread-id:v2:"+seed+":"+clientSessionID, deriveCodexStableTimestampMs(seed+":"+clientSessionID))
 }
 
 // codexFingerprintIDs is shared by body/header projection within one attempt.

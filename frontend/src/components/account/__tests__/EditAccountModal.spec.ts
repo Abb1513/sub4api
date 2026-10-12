@@ -816,6 +816,35 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_long_context_billing_enabled).toBe(false)
   })
 
+  it('loads and submits the self-hosted upstream toggles without dropping other extra keys', async () => {
+    const account = buildAccount()
+    account.extra = {
+      cancel_upstream_on_client_disconnect: true,
+      unmanaged_operator_marker: 'keep-me'
+    }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    const cancelToggle = wrapper.get('[data-testid="openai-cancel-upstream-on-disconnect-toggle"]')
+    const keepaliveToggle = wrapper.get('[data-testid="openai-responses-nonstream-keepalive-toggle"]')
+    expect(cancelToggle.attributes('aria-checked')).toBe('true')
+    expect(keepaliveToggle.attributes('aria-checked')).toBe('false')
+
+    await cancelToggle.trigger('click')
+    await keepaliveToggle.trigger('click')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    // Disabled toggles are omitted rather than persisted as false.
+    expect(extra).not.toHaveProperty('cancel_upstream_on_client_disconnect')
+    expect(extra?.responses_nonstream_keepalive).toBe(true)
+    expect(extra?.unmanaged_operator_marker).toBe('keep-me')
+  })
+
   it('loads and clears the OAuth-only Codex namespace flatten toggle', async () => {
     const account = buildAccount()
     account.type = 'oauth'

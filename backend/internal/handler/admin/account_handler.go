@@ -69,8 +69,7 @@ type AccountHandler struct {
 	ollamaCloudUsage        *service.OllamaCloudUsageService
 	codexTicketSettings     *service.SettingService
 	codexTicketGateway      *service.OpenAIGatewayService
-	codexTicketRouter       http.Handler
-	codexTicketAPIKeys      *service.APIKeyService
+	codexDiagnostic         codexDiagnosticProbe
 	cfg                     *config.Config
 	opencodeGoUsage         *service.OpenCodeGoUsageService
 }
@@ -94,6 +93,7 @@ func (h *AccountHandler) SetCodexTicketSettings(settings *service.SettingService
 }
 func (h *AccountHandler) SetCodexTicketGateway(gateway *service.OpenAIGatewayService) {
 	h.codexTicketGateway = gateway
+	h.codexDiagnostic = gateway
 }
 
 // NewAccountHandler creates a new admin account handler

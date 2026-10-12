@@ -871,6 +871,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	} else if metadataChanged {
 		firstClientMessage = metadataBody
 	}
+	// 归一化按旧习惯重写 session_id / x-codex-installation-id 头，握手前重新收口。
+	if account.UsesOpenAICodexProtocol() {
+		projectCodexOutboundHeaders(headers, true)
+	}
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()

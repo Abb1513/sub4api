@@ -86,3 +86,70 @@ func TestCodexTurnMetadataRewritePreservesHeaderSafeJSON(t *testing.T) {
 		}
 	}
 }
+
+// 官方 turn metadata 由 serde struct 按声明顺序序列化（codex-rs
+// core/src/responses_metadata.rs:544-601），未知键走 flatten(BTreeMap) 字典序。
+// Go map 的 json.Marshal 恒为字母序——上游可逐字节比对，必须复刻官方顺序。
+func TestCodexTurnMetadataMarshalUsesOfficialFieldOrder(t *testing.T) {
+	raw, err := marshalCodexTurnMetadata(map[string]any{
+		"turn_id":         "t-1",
+		"window_id":       "w-1",
+		"installation_id": "i-1",
+		"session_id":      "s-1",
+		"thread_id":       "th-1",
+		"request_kind":    "turn",
+		"zzz_extra":       "extra-key-sorted-last",
+		"aaa_extra":       "another-extra",
+	})
+	require.NoError(t, err)
+	// 官方顺序：installation_id, session_id, thread_id, …, turn_id, window_id, …, request_kind
+	want := `{"installation_id":"i-1","session_id":"s-1","thread_id":"th-1","turn_id":"t-1","window_id":"w-1","request_kind":"turn","aaa_extra":"another-extra","zzz_extra":"extra-key-sorted-last"}`
+	require.Equal(t, want, string(raw))
+}
+
+// 官方 AsciiJsonFormatter 不转义 & < >（serde_json 默认也不转）；Go json.Marshal
+// 会把它们转成 & < >。带 query 的 git URL（workspaces.*.associated_remote_urls）
+// 一旦经过代理重排就会与官方字节不一致，这是可判别的字节级差异。
+func TestCodexTurnMetadataMarshalDoesNotEscapeHTMLEntities(t *testing.T) {
+	raw, err := marshalCodexTurnMetadata(map[string]any{
+		"turn_trigger": `a&b<c>d`,
+		"workspaces": map[string]any{
+			"/repo": map[string]any{
+				"associated_remote_urls": map[string]any{
+					"origin": "https://host/repo?a=1&b=2",
+				},
+				"latest_git_commit_hash": "abc123",
+				"has_changes":            true,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), `\u0026`, "不得出现 Go 的 & 转义")
+	require.NotContains(t, string(raw), `\u003c`, "不得出现 Go 的 < 转义")
+	require.NotContains(t, string(raw), `\u003e`, "不得出现 Go 的 > 转义")
+	require.Contains(t, string(raw), `a&b<c>d`)
+	require.Contains(t, string(raw), `https://host/repo?a=1&b=2`)
+	// 非 ASCII 仍按官方行为转义为 \uXXXX（ASCII-only header 载体）。
+	nonASCII, err := marshalCodexTurnMetadata(map[string]any{"agent_name": "中"})
+	require.NoError(t, err)
+	require.Contains(t, string(nonASCII), `\u4e2d`)
+}
+
+// 官方 workspaces 是 BTreeMap，其 value 为 struct TurnMetadataWorkspace
+// （associated_remote_urls, latest_git_commit_hash, has_changes 声明顺序，
+// codex-rs core/src/responses_metadata.rs:186-194），子对象也需按声明序。
+func TestCodexTurnMetadataNestedObjectUsesDeclarationOrder(t *testing.T) {
+	raw, err := marshalCodexTurnMetadata(map[string]any{
+		"workspaces": map[string]any{
+			"/repo": map[string]any{
+				"has_changes":            true,
+				"latest_git_commit_hash": "abc123",
+				"associated_remote_urls": map[string]any{"origin": "https://x"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t,
+		`{"workspaces":{"/repo":{"associated_remote_urls":{"origin":"https://x"},"latest_git_commit_hash":"abc123","has_changes":true}}}`,
+		string(raw))
+}

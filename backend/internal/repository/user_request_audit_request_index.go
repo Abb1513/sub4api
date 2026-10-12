@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,12 +13,9 @@ import (
 
 // List retains the repository's request-level contract for statistics. The
 // service's public conversation listing calls ListConversations separately.
+// Payload reads happen after the association maps have been snapshotted, so a
+// statistics query never holds the capture lock across disk I/O.
 func (r *FileUserRequestAuditRepository) List(ctx context.Context, f service.UserRequestAuditFilter) ([]*service.UserRequestAudit, int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
-		return nil, 0, err
-	}
 	if f.Legacy && r.legacy != nil {
 		return r.legacy.List(ctx, f)
 	}
@@ -26,14 +24,23 @@ func (r *FileUserRequestAuditRepository) List(ctx context.Context, f service.Use
 	rows := make([]*service.UserRequestAudit, 0)
 	var total int64
 	if r.legacy == nil {
+		if err := r.ensureIndex(ctx); err != nil {
+			return nil, 0, err
+		}
 		noContent := f
 		noContent.Q = ""
+		r.mu.Lock()
+		if r.index == nil {
+			r.mu.Unlock()
+			return nil, 0, errors.New("audit archive index is unavailable")
+		}
 		for _, entry := range r.index {
 			if auditMatchesFilter(&entry.row, noContent) {
 				row := entry.row
 				rows = append(rows, &row)
 			}
 		}
+		r.mu.Unlock()
 		sort.Slice(rows, func(i, j int) bool { return auditRowBefore(rows[j], rows[i]) })
 		total = int64(len(rows))
 	} else {
@@ -71,21 +78,35 @@ func (r *FileUserRequestAuditRepository) List(ctx context.Context, f service.Use
 		}
 	}
 	if content {
+		if err := r.ensureIndex(ctx); err != nil {
+			return nil, 0, err
+		}
+		r.mu.Lock()
+		targets := make(map[int64]int64, len(rows))
+		for _, row := range rows {
+			entry, ok := r.index[row.ID]
+			if !ok {
+				r.mu.Unlock()
+				return nil, 0, fmt.Errorf("audit request %d disappeared", row.ID)
+			}
+			targets[row.ID] = entry.conversationID
+		}
+		r.mu.Unlock()
 		filtered := rows[:0]
 		loaded := make(map[int64]*auditDiskConversation)
 		for _, row := range rows {
 			if err := ctx.Err(); err != nil {
 				return nil, 0, err
 			}
-			entry := r.index[row.ID]
-			doc := loaded[entry.conversationID]
+			conversationID := targets[row.ID]
+			doc := loaded[conversationID]
 			if doc == nil {
 				var err error
-				doc, err = readAuditConversation(r.conversationPath(entry.conversationID))
+				doc, err = readAuditConversation(r.conversationPath(conversationID))
 				if err != nil {
 					return nil, 0, err
 				}
-				loaded[entry.conversationID] = doc
+				loaded[conversationID] = doc
 			}
 			for _, full := range doc.Requests {
 				if full.ID == row.ID && auditMatchesFilter(full, f) {

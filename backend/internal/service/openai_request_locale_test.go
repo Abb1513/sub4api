@@ -134,8 +134,8 @@ func TestNormalizeOpenAIRequestLocaleAndDebugLog(t *testing.T) {
 	}
 	require.Equal(t, secondExpected, gjson.GetBytes(out, "input.0.content.1.text").String())
 	require.Equal(t, gjson.GetBytes(body, "input.0.internal_chat_message_metadata_passthrough").Raw, gjson.GetBytes(out, "input.0.internal_chat_message_metadata_passthrough").Raw)
-	require.Equal(t, "US", gjson.GetBytes(out, "tools.0.user_location.country").String())
-	require.Equal(t, "New York", gjson.GetBytes(out, "tools.0.user_location.city").String())
+	require.Equal(t, "SG", gjson.GetBytes(out, "tools.0.user_location.country").String())
+	require.Equal(t, "Singapore", gjson.GetBytes(out, "tools.0.user_location.city").String())
 	require.Equal(t, "Asia/Singapore", gjson.GetBytes(out, "tools.0.user_location.timezone").String())
 	require.Len(t, observed.All(), 1)
 	fields, err := json.Marshal(observed.All()[0].ContextMap())
@@ -143,7 +143,7 @@ func TestNormalizeOpenAIRequestLocaleAndDebugLog(t *testing.T) {
 	require.Contains(t, string(fields), `"timezone_replaced":true`)
 	require.Contains(t, string(fields), `"environment_fields_inserted":true`)
 	require.Contains(t, string(fields), `"matched_count":3`)
-	require.Contains(t, string(fields), `"replaced_count":3`)
+	require.Contains(t, string(fields), `"replaced_count":5`)
 	require.Contains(t, string(fields), `"inserted_count":1`)
 	require.Contains(t, string(fields), `"web_search_timezone_before":["America/New_York"]`)
 	require.Contains(t, string(fields), `"timezone_before":["Asia/Shanghai","Asia/Singapore","Asia/Shanghai"]`)
@@ -281,7 +281,10 @@ func TestForwardOpenAIRequestLocaleUsesFormalPath(t *testing.T) {
 			result, err := svc.Forward(context.Background(), client, account, body)
 			require.NoError(t, err)
 			require.NotNil(t, result)
-			require.Equal(t, language, upstream.lastReq.Header.Get("Accept-Language"))
+			// 本地化功能的主职责是正文时区归一；Accept-Language 是代理注入的
+			// 可判别特征（官方 codex-rs 从不发送），在 Codex OAuth 出站线上
+			// 由线序收口删除，无论入站是否携带。
+			require.Empty(t, upstream.lastReq.Header.Get("Accept-Language"))
 			for _, part := range gjson.GetBytes(upstream.lastBody, "input.0.content").Array() {
 				require.Equal(t, strings.Replace(environment, "Asia/Shanghai", "Asia/Singapore", 1), part.Get("text").String())
 			}

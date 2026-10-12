@@ -24,7 +24,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return s.forwardWithoutHostedWebSearch(ctx, c, account, next)
 		}, mergeOpenAIWebSearchResult, executeResponsesWebSearch)
 	}
-	return s.forwardWithoutHostedWebSearch(ctx, c, account, body)
+	next, err := normalizeResponsesWebSearchHistory(c, body)
+	if err != nil {
+		writeResponsesWebSearchRequestError(c, err)
+		return nil, err
+	}
+	return s.forwardWithoutHostedWebSearch(ctx, c, account, next)
 }
 
 func (s *OpenAIGatewayService) forwardWithoutHostedWebSearch(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
@@ -1083,6 +1088,9 @@ func (s *OpenAIGatewayService) forwardWithoutHostedWebSearch(ctx context.Context
 	for {
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		if account.IsCancelUpstreamOnClientDisconnectEnabled() {
+			upstreamCtx = ctx
+		}
 		var headerGuard *openAIFirstOutputHeaderGuard
 		if firstOutputTimeout > 0 {
 			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
@@ -1496,8 +1504,11 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	} else if ticket != nil {
 		req = req.WithContext(context.WithValue(req.Context(), codexTicketRequestContextKey{}, ticket))
 	}
-	if account.UsesOpenAICodexProtocol() {
-		compatMessagesBridge := isOpenAICompatMessagesBridgeContext(c) || isOpenAICompatMessagesBridgeBody(body)
+	codexLane := account.UsesOpenAICodexProtocol()
+	// compat messages bridge 走的是另一套上游契约（Anthropic 风格桥接），
+	// 官方 Codex 线序收口不适用于它，必须整体豁免。
+	compatMessagesBridge := codexLane && (isOpenAICompatMessagesBridgeContext(c) || isOpenAICompatMessagesBridgeBody(body))
+	if codexLane {
 		// 清除客户端透传的 session 头，后续用隔离后的值重新设置，防止跨用户会话碰撞。
 		clientConversationID := strings.TrimSpace(req.Header.Get("conversation_id"))
 		req.Header.Del("conversation_id")
@@ -1580,6 +1591,17 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	body, err = applyCodexRequestMetadata(req, body, account, legacyCompactRequest)
 	if err != nil {
 		return nil, err
+	}
+	// 终态线序收口：必须在账号 namespace、指纹收敛、client_metadata 投影与账号级
+	// 覆写全部完成之后执行。上述每一步都按代理习惯补齐过 version / OpenAI-Beta /
+	// session_id / conversation_id / x-codex-installation-id 等头，官方业务请求里
+	// 这些名字一个都不存在（见 codexHTTPNonOfficialHeaders 的源码依据），因此只有
+	// 放在最后一步才能真正削平，放在任何更早位置都会被重新写回。
+	//
+	// legacy /responses/compact 是 unary JSON 老端点，其上游契约按 session_id 头
+	// 归并会话（与官方 /responses 线序不同源），因此不在收口范围内。
+	if codexLane && !compatMessagesBridge && !legacyCompactRequest {
+		projectCodexOutboundHeaders(req.Header, false)
 	}
 	if err := applyMappedGPT55LiteCompatibility(req, account, body); err != nil {
 		return nil, err

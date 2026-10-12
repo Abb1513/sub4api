@@ -148,6 +148,37 @@ func modelTraceKnownGPTModel(model string) bool {
 	return false
 }
 
+// modelTraceExtraDiagnosticModels 是允许检测、但指纹库还没有收录分类的模型。
+// 库补上对应类之后，ModelTraceDiagnosticModels 会自动回到精确匹配。
+var modelTraceExtraDiagnosticModels = []string{"gpt-6.1-sol"}
+
+// modelTraceDiagnosticReferenceClass 是库缺类时的同系列参考类，只用于把
+// "命中参考类"降级成 uncertain，绝不会把命中其它类当成正常。
+var modelTraceDiagnosticReferenceClass = map[string]string{
+	"gpt-6.1-sol": "gpt-6-sol",
+}
+
+// ModelTraceDiagnosticModels 返回降智检测的可选模型：库内 GPT 类加上已上线
+// 但缺少指纹类的模型。打票仍只用库内类——票据要靠指纹验真，缺类会验不过。
+func ModelTraceDiagnosticModels() ([]string, error) {
+	models, err := ModelTraceGPTModels()
+	if err != nil {
+		return nil, err
+	}
+	known := make(map[string]bool, len(models))
+	for _, model := range models {
+		known[model] = true
+	}
+	for _, extra := range modelTraceExtraDiagnosticModels {
+		if known[extra] {
+			continue
+		}
+		known[extra] = true
+		models = append(models, extra)
+	}
+	return models, nil
+}
+
 func codexTicketEligibleModel(model string) bool {
 	version := strings.TrimPrefix(model, "gpt-")
 	if version == model {

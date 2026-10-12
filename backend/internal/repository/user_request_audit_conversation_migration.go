@@ -22,22 +22,29 @@ type userRequestAuditFileLine struct {
 	*service.UserRequestAudit
 }
 
-func (r *FileUserRequestAuditRepository) importLegacyLocked(ctx context.Context, latest map[int64]*service.UserRequestAudit) error {
+// importLegacy runs during the initial index build. Callers hold ioMu and must
+// not hold mu; every map/state mutation takes mu explicitly. It reports whether
+// it changed anything: with no legacy archives it stays completely read-only,
+// so a deployment that never captured a request gets no archive files at all.
+func (r *FileUserRequestAuditRepository) importLegacy(ctx context.Context, latest map[int64]*service.UserRequestAudit) (bool, error) {
 	files, err := filepath.Glob(filepath.Join(r.root, "*.ndjson"))
 	if err != nil {
-		return err
+		return false, err
+	}
+	if len(files) == 0 {
+		return false, nil
 	}
 	for _, path := range files {
 		f, err := os.Open(path)
 		if err != nil {
-			return err
+			return false, err
 		}
 		reader := bufio.NewReader(f)
 		lineNumber := 0
 		for {
 			if err = ctx.Err(); err != nil {
 				f.Close()
-				return err
+				return false, err
 			}
 			line, readErr := reader.ReadBytes('\n')
 			lineNumber++
@@ -45,12 +52,12 @@ func (r *FileUserRequestAuditRepository) importLegacyLocked(ctx context.Context,
 				var record userRequestAuditFileLine
 				if err = json.Unmarshal(line, &record); err != nil {
 					f.Close()
-					return fmt.Errorf("legacy audit %s line %d: %w", filepath.Base(path), lineNumber, err)
+					return false, fmt.Errorf("legacy audit %s line %d: %w", filepath.Base(path), lineNumber, err)
 				}
 				row := record.UserRequestAudit
 				if row == nil || row.ID <= 0 {
 					f.Close()
-					return fmt.Errorf("invalid legacy audit row %s:%d", filepath.Base(path), lineNumber)
+					return false, fmt.Errorf("invalid legacy audit row %s:%d", filepath.Base(path), lineNumber)
 				}
 				row.LogicalKey = record.LogicalKey
 				if old := latest[row.ID]; old == nil || !old.UpdatedAt.After(row.UpdatedAt) {
@@ -62,11 +69,11 @@ func (r *FileUserRequestAuditRepository) importLegacyLocked(ctx context.Context,
 			}
 			if readErr != nil {
 				f.Close()
-				return readErr
+				return false, readErr
 			}
 		}
 		if err = f.Close(); err != nil {
-			return err
+			return false, err
 		}
 	}
 	// Older archives could replace a logical request with a different numeric ID.
@@ -90,47 +97,46 @@ func (r *FileUserRequestAuditRepository) importLegacyLocked(ctx context.Context,
 	for _, row := range latest {
 		rows = append(rows, row)
 	}
-	if len(files) > 0 {
-		if err = r.replaceAllDocumentsLocked(ctx, rows); err != nil {
-			return err
-		}
+	if err = r.replaceAllDocuments(ctx, rows); err != nil {
+		return false, err
+	}
+	if err = r.reconcileSQL(ctx); err != nil {
+		return false, err
 	}
 	// Index publication and every verified document precede moving any original.
-	if len(files) > 0 {
-		if err = r.reconcileSQLLocked(ctx); err != nil {
-			return err
+	backup := r.root + "-migration-backup"
+	if err = os.MkdirAll(backup, 0o750); err != nil {
+		return false, err
+	}
+	for _, path := range files {
+		destination := filepath.Join(backup, filepath.Base(path))
+		if _, e := os.Stat(destination); e == nil {
+			return false, fmt.Errorf("legacy backup already exists: %s", filepath.Base(path))
+		} else if !os.IsNotExist(e) {
+			return false, e
+		}
+		if err = os.Rename(path, destination); err != nil {
+			return false, err
 		}
 	}
-	if len(files) > 0 {
-		backup := r.root + "-migration-backup"
-		if err = os.MkdirAll(backup, 0o750); err != nil {
-			return err
-		}
-		for _, path := range files {
-			destination := filepath.Join(backup, filepath.Base(path))
-			if _, e := os.Stat(destination); e == nil {
-				return fmt.Errorf("legacy backup already exists: %s", filepath.Base(path))
-			} else if !os.IsNotExist(e) {
-				return e
-			}
-			if err = os.Rename(path, destination); err != nil {
-				return err
-			}
-		}
-		if err = auditSyncDirectory(backup); err != nil {
-			return err
-		}
-		if err = auditSyncDirectory(r.root); err != nil {
-			return err
-		}
-		if err = auditSyncDirectory(filepath.Dir(r.root)); err != nil {
-			return err
-		}
+	if err = auditSyncDirectory(backup); err != nil {
+		return false, err
 	}
+	if err = auditSyncDirectory(r.root); err != nil {
+		return false, err
+	}
+	if err = auditSyncDirectory(filepath.Dir(r.root)); err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.state.Migrated = true
-	return r.saveStateLocked()
+	return true, r.saveStateLocked()
 }
-func (r *FileUserRequestAuditRepository) replaceAllDocumentsLocked(ctx context.Context, rows []*service.UserRequestAudit) error {
+
+// replaceAllDocuments rebuilds every conversation document from the supplied
+// rows. Callers hold ioMu; the expensive encode/publish runs without mu.
+func (r *FileUserRequestAuditRepository) replaceAllDocuments(ctx context.Context, rows []*service.UserRequestAudit) error {
 	groups := groupAuditConversations(rows)
 	docs := make([]*auditDiskConversation, 0, len(groups))
 	keep := make(map[int64]bool, len(groups))
@@ -145,7 +151,8 @@ func (r *FileUserRequestAuditRepository) replaceAllDocumentsLocked(ctx context.C
 	}
 	obsolete := make([]int64, 0)
 	for _, path := range files {
-		id, err := strconv.ParseInt(filepath.Base(path)[:len(filepath.Base(path))-len(".json")], 10, 64)
+		base := filepath.Base(path)
+		id, err := strconv.ParseInt(base[:len(base)-len(".json")], 10, 64)
 		if err != nil {
 			return err
 		}
@@ -153,7 +160,7 @@ func (r *FileUserRequestAuditRepository) replaceAllDocumentsLocked(ctx context.C
 			obsolete = append(obsolete, id)
 		}
 	}
-	if err = r.commitDocumentsLocked(ctx, docs, obsolete); err != nil {
+	if err = r.commitDocuments(ctx, docs, obsolete); err != nil {
 		return err
 	}
 	for _, doc := range docs {
@@ -173,9 +180,9 @@ func (r *FileUserRequestAuditRepository) replaceAllDocumentsLocked(ctx context.C
 			return fmt.Errorf("audit conversation %d verification mismatch", doc.ID)
 		}
 	}
-	r.index = make(map[int64]auditArchiveEntry)
-	r.documents = make(map[int64]auditDocumentMeta)
-	r.logicalIndex = make(map[string]int64)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resetMapsLocked()
 	for _, doc := range docs {
 		r.indexDocumentLocked(doc)
 	}

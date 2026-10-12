@@ -217,6 +217,34 @@ func prepareResponsesWebSearch(body []byte) (*responsesWebSearchPlan, error) {
 	return plan, nil
 }
 
+// The gateway owns these declarations even when tool_choice forbids a new
+// search. Do not send disabled native search schemas to a function-only model.
+func removeDisabledResponsesSearchTools(body []byte) ([]byte, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, err
+	}
+	var tools []json.RawMessage
+	if raw := root["tools"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &tools); err != nil {
+			return nil, err
+		}
+	}
+	filtered := make([]json.RawMessage, 0, len(tools))
+	for _, raw := range tools {
+		var declaration map[string]json.RawMessage
+		if json.Unmarshal(raw, &declaration) == nil && responsesSearchBuiltin(responsesSearchString(declaration["type"])) {
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	if len(filtered) == len(tools) {
+		return body, nil
+	}
+	root["tools"] = rawResponsesSearchJSON(filtered)
+	return json.Marshal(root)
+}
+
 func responsesSearchBuiltin(kind string) bool {
 	return kind == "web_search" || kind == "web_search_preview"
 }

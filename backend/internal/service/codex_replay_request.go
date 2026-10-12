@@ -1,7 +1,6 @@
 package service
 
 import (
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -10,12 +9,13 @@ import (
 
 type codexReplayIdentity struct {
 	installationID, sessionID, windowID, turnID string
+	contextWindowID                             string
 	startedAt                                   time.Time
 }
 
 func newCodexReplayIdentity(installationID, sessionID, windowID string, now time.Time) (codexReplayIdentity, error) {
 	identity := codexReplayIdentity{installationID: installationID, sessionID: sessionID, windowID: windowID, startedAt: now}
-	for _, value := range []*string{&identity.sessionID, &identity.windowID, &identity.turnID} {
+	for _, value := range []*string{&identity.sessionID, &identity.windowID, &identity.turnID, &identity.contextWindowID} {
 		if *value == "" {
 			id, err := uuid.NewV7()
 			if err != nil {
@@ -30,11 +30,20 @@ func newCodexReplayIdentity(installationID, sessionID, windowID string, now time
 // buildCodexReplayRequest is shared with the hypothesis runner. It has no
 // filesystem, account, network or global client-identity side effects.
 func buildCodexReplayRequest(replay *CodexHypothesisReplay, model, system string, identity codexReplayIdentity, render func(string) string) (map[string]any, http.Header) {
-	metadata, _ := json.Marshal(map[string]any{
+	// 官方 Codex CLI 每次 turn 都带 window_number 与 context_window_id
+	// （codex-rs core/src/session/session.rs:736-758）。探针/假设回放作为健康检查
+	// 必须从一开始就产出完整 blob，否则出站改写链补齐字段后会与初始 blob 不一致。
+	// 用 marshalCodexTurnMetadata（官方字段序 + ASCII 转义）而非 json.Marshal，
+	// 保证 body 内嵌 blob 与 header blob 字节一致，且与官方线序相同。
+	metadata, err := marshalCodexTurnMetadata(map[string]any{
 		"installation_id": identity.installationID, "session_id": identity.sessionID,
 		"thread_id": identity.sessionID, "turn_id": identity.turnID, "window_id": identity.windowID,
+		"window_number": 0, "context_window_id": identity.contextWindowID,
 		"turn_started_at_unix_ms": identity.startedAt.UnixMilli(), "request_kind": "turn",
 	})
+	if err != nil {
+		metadata = []byte("{}")
+	}
 	input := make([]any, 0, len(replay.Messages)+1)
 	for _, message := range replay.Messages {
 		parts := make([]any, 0, len(message.Parts))

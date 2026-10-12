@@ -31,23 +31,7 @@
       <div v-if="diagnosticStage === 'setup'" class="grid min-h-full md:grid-cols-[250px_minmax(0,1fr)]">
         <aside class="border-b border-gray-200 bg-gray-50 px-5 pb-2 pt-4 dark:border-dark-700 dark:bg-dark-900/40 md:border-b-0 md:border-r md:px-6 md:py-6">
           <h3 class="mb-6 hidden text-sm font-semibold text-gray-900 dark:text-white md:block">{{ text('settings') }}</h3>
-          <label for="diagnostic-billing-key" class="mb-2 block text-sm font-medium text-gray-700 dark:text-dark-200">{{ text('key') }}</label>
-          <Select
-            id="diagnostic-billing-key"
-            v-model="selectedKey"
-            :options="keyOptions"
-            searchable
-            :loading="keysLoading"
-            :disabled="keysLoading || diagnosing"
-            :aria-label="text('key')"
-          />
-          <p v-if="keysLoading" role="status" class="mt-2 text-xs text-gray-500 dark:text-dark-400">{{ text('loadingKeys') }}</p>
-          <div v-else-if="keysError" role="alert" class="mt-3 text-sm text-red-700 dark:text-red-300">
-            <p>{{ text('keysError') }}: {{ keysError }}</p>
-            <button type="button" class="mt-2 min-h-9 text-sm font-medium underline underline-offset-4" @click="loadKeys">{{ text('retry') }}</button>
-          </div>
-          <p v-else-if="!keys.length" class="mt-3 text-sm text-amber-700 dark:text-amber-300">{{ text('noKey') }}</p>
-          <p class="mt-3 hidden text-xs leading-6 text-gray-500 dark:text-dark-400 md:block">{{ text('keyHint') }}</p>
+          <p class="mb-4 text-xs leading-6 text-gray-500 dark:text-dark-400">{{ text('nativeHint') }}</p>
           <details class="mt-2 text-xs text-gray-500 dark:text-dark-400 md:mt-6 md:border-t md:border-gray-200 md:pt-2 dark:md:border-dark-700">
             <summary class="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 text-gray-700 dark:text-dark-200">{{ text('info') }}<Icon name="chevronDown" size="sm" /></summary>
             <p class="mb-3 leading-6">{{ text('templateHint') }}</p>
@@ -78,7 +62,6 @@
             <span class="shrink-0 rounded-md px-2 py-1 text-xs font-medium" :class="diagnosticRun.state === 'cancelled' ? statusTone('stopped') : statusTone('normal')">{{ text(diagnosing ? 'running' : diagnosticRun.state === 'cancelled' ? 'cancelled' : 'finished') }}</span>
           </div>
           <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-dark-400">
-            <span>{{ text('billingKey') }}: <span data-test="diagnostic-key">{{ diagnosticRun.keyName }} · #{{ diagnosticRun.keyID }}</span></span>
             <span>{{ text('runContext', { count: diagnosticTotal }) }}</span>
           </div>
           <div class="mt-5 flex items-center justify-between gap-3 text-xs">
@@ -112,7 +95,7 @@
                 <div><dt class="text-gray-500 dark:text-dark-400">{{ text('probability') }}</dt><dd class="mt-1 text-gray-800 dark:text-dark-200">{{ entry.result.probability == null ? '—' : (entry.result.probability * 100).toFixed(1) + '%' }}</dd></div>
               </template>
               <div v-if="entry.result.reason" class="sm:col-span-2"><dt class="text-gray-500 dark:text-dark-400">{{ text('reason') }}</dt><dd class="mt-1 whitespace-pre-wrap break-words text-gray-800 [overflow-wrap:anywhere] dark:text-dark-200">{{ entry.result.reason === 'template_invalid' ? text('templateInvalid') : entry.result.reason }}</dd></div>
-              <div v-if="entry.result.gateway_error_code || entry.result.http_status" class="sm:col-span-2"><dt class="text-gray-500 dark:text-dark-400">{{ text('gateway') }}</dt><dd class="mt-1 break-all text-gray-800 dark:text-dark-200">{{ [entry.result.gateway_error_code, entry.result.http_status ? 'HTTP ' + entry.result.http_status : ''].filter(Boolean).join(' · ') }}</dd></div>
+              <div v-if="entry.result.http_status" class="sm:col-span-2"><dt class="text-gray-500 dark:text-dark-400">{{ text('httpStatus') }}</dt><dd class="mt-1 break-all text-gray-800 dark:text-dark-200">HTTP {{ entry.result.http_status }}</dd></div>
               <div class="sm:col-span-2"><dt class="text-gray-500 dark:text-dark-400">{{ text('fingerprint') }}</dt><dd class="mt-1 break-all font-mono text-gray-800 dark:text-dark-200">{{ diagnosticRun.fingerprintCommit || '—' }}</dd></div>
             </dl>
           </article>
@@ -142,7 +125,6 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import * as tickets from '@/api/admin/codexTickets'
 import BaseDialog from '@/components/common/BaseDialog.vue'
-import Select from '@/components/common/Select.vue'
 import Icon from '@/components/icons/Icon.vue'
 import CodexDiagnosticModelPicker from './CodexDiagnosticModelPicker.vue'
 import { extractApiErrorMessage } from '@/utils/apiError'
@@ -155,16 +137,12 @@ const text = (key: string, values: Record<string, string | number> = {}) => t(`a
 type DiagnosticStatus = tickets.TicketDiagnostic['status'] | 'pending' | 'running' | 'stopped' | 'not_run'
 type DiagnosticStage = 'setup' | 'results'
 interface DiagnosticEntry { model: string; status: DiagnosticStatus; result?: tickets.TicketDiagnostic; expanded: boolean }
-interface DiagnosticRun { accountID: number; keyID: number; keyName: string; fingerprintCommit: string; entries: DiagnosticEntry[]; state: 'running' | 'finished' | 'cancelled' }
+interface DiagnosticRun { accountID: number; fingerprintCommit: string; entries: DiagnosticEntry[]; state: 'running' | 'finished' | 'cancelled' }
 const summaryStatuses = ['normal', 'degraded', 'uncertain', 'failed'] as const
-const keys = ref<Awaited<ReturnType<typeof tickets.ownKeys>>>([])
-const keysLoading = ref(false)
-const keysError = ref('')
 const models = ref<string[]>([])
 const modelsLoading = ref(false)
 const modelsError = ref('')
 const fingerprintCommit = ref('')
-const selectedKey = ref<number | null>(null)
 const selectedModels = ref<string[]>([])
 const diagnosticStage = ref<DiagnosticStage>('setup')
 const diagnosticRun = ref<DiagnosticRun | null>(null)
@@ -173,7 +151,6 @@ const setupHeading = ref<HTMLElement | null>(null)
 const resultsHeading = ref<HTMLElement | null>(null)
 const controller = ref<AbortController | null>(null)
 let accountSessionSerial = 0
-let keysSerial = 0
 let modelsSerial = 0
 let diagnosticSerial = 0
 const closing = ref(false)
@@ -181,29 +158,11 @@ const diagnosing = computed(() => diagnosticRun.value?.state === 'running')
 const results = computed(() => diagnosticRun.value?.entries.flatMap(entry => entry.result ? [entry.result] : []) ?? [])
 const diagnosticTotal = computed(() => diagnosticRun.value?.entries.length ?? 0)
 const currentDiagnostic = computed(() => diagnosticRun.value?.entries.find(entry => entry.status === 'running')?.model ?? '')
-const keyOptions = computed(() => [
-  { value: null, label: text('chooseKey') }, ...keys.value.map(key => ({ value: key.id, label: `${key.name} · #${key.id}` }))
-])
 const canStart = computed(() => props.show && !!props.account && !closing.value && !diagnosing.value &&
-  !keysLoading.value && !modelsLoading.value && !keysError.value && !modelsError.value &&
-  keys.value.some(key => key.id === selectedKey.value) && selectedModels.value.length > 0 &&
+  !modelsLoading.value && !modelsError.value &&
+  selectedModels.value.length > 0 &&
   selectedModels.value.every(model => models.value.includes(model)))
 function isCurrentSession(session: number) { return session === accountSessionSerial && props.show && !!props.account && !closing.value }
-async function loadKeys() {
-  if (!props.show || !props.account || diagnosing.value || closing.value) return
-  const session = accountSessionSerial
-  const serial = ++keysSerial
-  const isCurrent = () => isCurrentSession(session) && serial === keysSerial
-  keysLoading.value = true
-  keysError.value = ''
-  try {
-    const available = await tickets.ownKeys()
-    if (!isCurrent()) return
-    keys.value = available.filter(key => key.status === 'active' && (key.quota === 0 || key.quota_used < key.quota) && (!key.expires_at || new Date(key.expires_at) > new Date()))
-    if (!keys.value.some(key => key.id === selectedKey.value)) selectedKey.value = null
-  } catch (cause) { if (isCurrent()) keysError.value = extractApiErrorMessage(cause, text('error')) }
-  finally { if (isCurrent()) keysLoading.value = false }
-}
 async function loadModels(refresh = false) {
   if (!props.show || !props.account || diagnosing.value || closing.value) return
   const session = accountSessionSerial
@@ -245,13 +204,12 @@ function cancelDiagnostic() {
   emit('completed', run.accountID)
 }
 async function runDiagnostic() {
-  if (!canStart.value || !props.account || selectedKey.value == null) return
+  if (!canStart.value || !props.account) return
   const accountID = props.account.id
-  const keyID = selectedKey.value
   const session = accountSessionSerial
   const serial = ++diagnosticSerial
   diagnosticRun.value = {
-    accountID, keyID, keyName: keys.value.find(key => key.id === keyID)?.name ?? text('key'), fingerprintCommit: fingerprintCommit.value,
+    accountID, fingerprintCommit: fingerprintCommit.value,
     entries: [...selectedModels.value].map(model => ({ model, status: 'pending', expanded: false })), state: 'running'
   }
   const run = diagnosticRun.value
@@ -264,7 +222,7 @@ async function runDiagnostic() {
       const requestController = new AbortController()
       controller.value = requestController
       try {
-        const data = await tickets.diagnose(accountID, keyID, [entry.model], requestController.signal)
+        const data = await tickets.diagnose(accountID, [entry.model], requestController.signal)
         if (!isCurrent()) break
         const result = data.items?.find(item => item.model === entry.model)
         if (result) { entry.result = result; entry.status = result.status }
@@ -311,21 +269,16 @@ function handleKeydown(event: KeyboardEvent) {
 watch(() => [props.show, props.account?.id], () => {
   cancelDiagnostic()
   ++accountSessionSerial
-  ++keysSerial
   ++modelsSerial
   closing.value = false
   diagnosticRun.value = null
   diagnosticStage.value = 'setup'
-  selectedKey.value = null
   selectedModels.value = []
-  keys.value = []
   models.value = []
-  keysError.value = ''
   modelsError.value = ''
-  keysLoading.value = false
   modelsLoading.value = false
   fingerprintCommit.value = ''
-  if (props.show && props.account) { void loadKeys(); void loadModels() }
+  if (props.show && props.account) void loadModels()
 }, { immediate: true })
 onMounted(() => document.addEventListener('keydown', handleKeydown))
 onUnmounted(() => { cancelDiagnostic(); ++accountSessionSerial; document.removeEventListener('keydown', handleKeydown) })

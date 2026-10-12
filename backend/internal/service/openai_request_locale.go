@@ -153,6 +153,29 @@ func openAIRequestLocation(name string) *time.Location {
 	return location
 }
 
+// openAIRequestPersona 描述一个时区对应的地理位置掩护。官方 web_search 的
+// user_location 带 country/region/city/timezone 四个字段（codex-rs
+// protocol/src/config_types.rs:482-491），只改 timezone 会让客户端真实位置
+// 与伪装时区自相矛盾。未登记的时区返回 nil，只改 timezone（不臆造错误国家）。
+type openAIRequestPersona struct {
+	location map[string]string
+}
+
+var openAIRequestPersonas = map[string]openAIRequestPersona{
+	"Asia/Singapore": {location: map[string]string{
+		"country": "SG",
+		"region":  "Central Region",
+		"city":    "Singapore",
+	}},
+}
+
+func openAIRequestPersonaForTimezone(timezone string) *openAIRequestPersona {
+	if persona, ok := openAIRequestPersonas[timezone]; ok {
+		return &persona
+	}
+	return nil
+}
+
 func normalizeOpenAIRequestLocale(ctx context.Context, account *Account, body []byte, transport string) []byte {
 	if account == nil || !account.IsOpenAI() {
 		return body
@@ -223,6 +246,7 @@ func normalizeOpenAIRequestLocale(ctx context.Context, account *Account, body []
 	webSearchBefore := make([]*string, 0)
 	webSearchAfter := make([]*string, 0)
 	tools := gjson.GetBytes(body, "tools")
+	persona := openAIRequestPersonaForTimezone(timezone)
 	if tools.IsArray() {
 		for index, tool := range tools.Array() {
 			kind := tool.Get("type").String()
@@ -242,6 +266,19 @@ func normalizeOpenAIRequestLocale(ctx context.Context, account *Account, body []
 						body = updated
 						current = timezone
 						replaced++
+					}
+				}
+				// 官方 user_location 还带 country/region/city（protocol/src/config_types.rs:482-491）。
+				// 只改 timezone 会让客户端真实国家/城市原样外泄，与伪装的时区自相矛盾。
+				if persona != nil {
+					for field, personaValue := range persona.location {
+						key := "tools." + strconv.Itoa(index) + ".user_location." + field
+						if fieldValue := tool.Get("user_location." + field); fieldValue.Type == gjson.String && fieldValue.String() != personaValue {
+							if updated, err := sjson.SetBytes(body, key, personaValue); err == nil {
+								body = updated
+								replaced++
+							}
+						}
 					}
 				}
 				webSearchBefore = append(webSearchBefore, &loggedPrevious)

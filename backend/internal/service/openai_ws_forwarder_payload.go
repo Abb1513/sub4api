@@ -166,6 +166,16 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithTicket(
 		headers.Set(openAIWSTurnMetadataHeader, metadata)
 	}
 	applyCodexAccountIdentityHeaders(headers, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+	// 官方握手只发连字符 session-id / thread-id（headers.rs:5-11）。客户端没带
+	// session-id 时，上面按 prompt_cache_key 派生的隔离值只落在了官方不发的
+	// session_id 上；线序收口删除该头后会同时丢掉多用户隔离。这里把同一份隔离
+	// 值复制到官方字段（不做二次 namespace 变换，避免与帧内 client_metadata
+	// 的单次作用域不一致），再交给后面的收口删除非官方名。
+	if account != nil && account.UsesOpenAICodexProtocol() && strings.TrimSpace(headers.Get("session-id")) == "" {
+		if isolated := strings.TrimSpace(headers.Get("session_id")); isolated != "" {
+			headers.Set("session-id", isolated)
+		}
+	}
 	applyStagedCodexFingerprintHeaders(c, account, headers)
 
 	if account != nil && account.UsesOpenAICodexProtocol() {
@@ -214,6 +224,22 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithTicket(
 		strings.TrimSpace(headers.Get(openAICodexRoutingHintHeader)) != "",
 		"soft_routing_hint",
 	)
+
+	// WS 握手线序收口：官方握手集 = build_responses_headers + originator +
+	// x-client-request-id + session-id/thread-id + 兼容头 + routing hint +
+	// OpenAI-Beta（core/src/client.rs:1304-1330）。session_id、conversation_id、
+	// x-codex-installation-id、version、accept-language 五个名字官方握手从不携带，
+	// 上面为了兼容旧行为都补过，这里统一削平；OpenAI-Beta 与 x-client-request-id
+	// 是官方 WS 专有头，保留。
+	//
+	// 注意：这只是本函数输出的第一道收口。三条 WS 通道（v2 forwarder、
+	// v2 passthrough adapter、ingress）在拿到头之后还会调用
+	// normalizeCodexRequestMetadata*，按旧习惯把 session_id /
+	// x-codex-installation-id 写回来（legacy compact 依赖它们，源头不能删），
+	// 所以那些通道在归一化之后必须再执行一次同一收口——终态线序以最后一步为准。
+	if account != nil && account.UsesOpenAICodexProtocol() {
+		projectCodexOutboundHeaders(headers, true)
+	}
 
 	return headers, sessionResolution, ticket, nil
 }

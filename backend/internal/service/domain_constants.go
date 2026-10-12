@@ -736,6 +736,9 @@ const (
 	// SettingKeyOpenAIAllowClaudeCodeCodexPlugin 已废弃：历史全局开关只作为升级迁移输入读取。
 	// 迁移后等价规则写入 SettingKeyCodexCLIOnlyWhitelist，不再参与运行时判定。
 	SettingKeyOpenAIAllowClaudeCodeCodexPlugin = "openai_allow_claude_code_codex_plugin"
+	// SettingKeyCodexAutoDegradationCheck 自动降智检测运行器配置（JSON）：
+	// {"enabled","interval_minutes","block_minutes","models"}。默认关闭。
+	SettingKeyCodexAutoDegradationCheck = "codex_auto_degradation_check"
 
 	// 余额不足提醒
 	SettingKeyBalanceLowNotifyEnabled     = "balance_low_notify_enabled"      // 全局开关

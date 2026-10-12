@@ -3,82 +3,15 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
 )
 
-func (r *FileUserRequestAuditRepository) syncSQLDocumentsLocked(ctx context.Context, docs []*auditDiskConversation, removed []int64, replace bool) error {
-	if r.legacy == nil {
-		return nil
-	}
-	tx, err := r.legacy.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if replace {
-		if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_conversations"); err != nil {
-			return err
-		}
-	}
-	for _, id := range removed {
-		if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_conversations WHERE id=$1", id); err != nil {
-			return err
-		}
-	}
-	for _, doc := range docs {
-		meta := r.documents[doc.ID]
-		summary, err := json.Marshal(meta.summary)
-		if err != nil {
-			return err
-		}
-		relative := "conversations/" + strconv.FormatInt(doc.ID, 10) + ".json"
-		_, err = tx.ExecContext(ctx, `INSERT INTO user_request_audit_conversations(id,user_id,api_key_id,created_at,updated_at,expires_at,request_count,relative_path,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(id) DO UPDATE SET user_id=EXCLUDED.user_id,api_key_id=EXCLUDED.api_key_id,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at,expires_at=EXCLUDED.expires_at,request_count=EXCLUDED.request_count,relative_path=EXCLUDED.relative_path,summary=EXCLUDED.summary`, doc.ID, meta.summary.UserID, meta.summary.APIKeyID, meta.summary.CreatedAt, meta.summary.UpdatedAt, meta.expires, meta.summary.RequestCount, relative, string(summary))
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_request_index WHERE conversation_id=$1", doc.ID); err != nil {
-			return err
-		}
-		for _, row := range doc.Requests {
-			metadata := auditMetadata(row)
-			body, err := json.Marshal(metadata)
-			if err != nil {
-				return err
-			}
-			_, err = tx.ExecContext(ctx, `INSERT INTO user_request_audit_request_index(id,conversation_id,logical_key,created_at,metadata) VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT(id) DO UPDATE SET conversation_id=EXCLUDED.conversation_id,logical_key=EXCLUDED.logical_key,created_at=EXCLUDED.created_at,metadata=EXCLUDED.metadata`, row.ID, doc.ID, row.LogicalKey, row.CreatedAt, string(body))
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
-}
-func (r *FileUserRequestAuditRepository) reconcileSQLLocked(ctx context.Context) error {
-	if r.legacy == nil {
-		return nil
-	}
-	docs := make([]*auditDiskConversation, 0, len(r.documents))
-	for id := range r.documents {
-		docs = append(docs, &auditDiskConversation{UserRequestAuditConversation: &service.UserRequestAuditConversation{ID: id}})
-	}
-	positions := make(map[int64]int, len(docs))
-	for i, doc := range docs {
-		positions[doc.ID] = i
-	}
-	for _, entry := range r.index {
-		row := entry.row
-		doc := docs[positions[entry.conversationID]]
-		doc.Requests = append(doc.Requests, &row)
-	}
-	return r.syncSQLDocumentsLocked(ctx, docs, nil, true)
-}
 func auditSQLFilter(f service.UserRequestAuditFilter) (string, []any) {
 	return auditSQLConditions(f, false)
 }
@@ -137,39 +70,56 @@ func auditPage(f service.UserRequestAuditFilter) (int, int) {
 	}
 	return page, size
 }
-func (r *FileUserRequestAuditRepository) candidateSummariesLocked(ctx context.Context, f service.UserRequestAuditFilter, paged bool) ([]*service.UserRequestAudit, int64, error) {
+
+// candidateSummaries lists conversation summaries. With SQL present it is a
+// plain indexed query and takes no repository lock at all; without SQL (tests
+// and single-file deployments) it folds the association maps under mu only.
+func (r *FileUserRequestAuditRepository) candidateSummaries(ctx context.Context, f service.UserRequestAuditFilter, paged bool) ([]*service.UserRequestAudit, int64, error) {
 	if r.legacy == nil {
-		out := make([]*service.UserRequestAudit, 0)
-		matched := make(map[int64]bool)
-		noContent := f
-		noContent.Q = ""
-		for _, entry := range r.index {
-			if auditMatchesFilter(&entry.row, noContent) {
-				matched[entry.conversationID] = true
-			}
-		}
-		for id := range matched {
-			row := r.documents[id].summary
-			out = append(out, &row)
-		}
-		sort.Slice(out, func(i, j int) bool {
-			if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
-				return out[i].ID > out[j].ID
-			}
-			return out[i].UpdatedAt.After(out[j].UpdatedAt)
-		})
-		total := int64(len(out))
-		if paged {
-			page, size := auditPage(f)
-			if page-1 > len(out)/size {
-				return []*service.UserRequestAudit{}, total, nil
-			}
-			start := (page - 1) * size
-			end := min(start+size, len(out))
-			out = out[start:end]
-		}
-		return out, total, nil
+		return r.candidateSummariesFromMaps(f, paged)
 	}
+	return r.candidateSummariesFromSQL(ctx, f, paged)
+}
+
+func (r *FileUserRequestAuditRepository) candidateSummariesFromMaps(f service.UserRequestAuditFilter, paged bool) ([]*service.UserRequestAudit, int64, error) {
+	out := make([]*service.UserRequestAudit, 0)
+	noContent := f
+	noContent.Q = ""
+	r.mu.Lock()
+	if r.index == nil {
+		r.mu.Unlock()
+		return nil, 0, errors.New("audit archive index is unavailable")
+	}
+	matched := make(map[int64]bool)
+	for _, entry := range r.index {
+		if auditMatchesFilter(&entry.row, noContent) {
+			matched[entry.conversationID] = true
+		}
+	}
+	for id := range matched {
+		row := r.documents[id].summary
+		out = append(out, &row)
+	}
+	r.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	total := int64(len(out))
+	if paged {
+		page, size := auditPage(f)
+		if page-1 > len(out)/size {
+			return []*service.UserRequestAudit{}, total, nil
+		}
+		start := (page - 1) * size
+		out = out[start:min(start+size, len(out))]
+	}
+	return out, total, nil
+}
+
+func (r *FileUserRequestAuditRepository) candidateSummariesFromSQL(ctx context.Context, f service.UserRequestAuditFilter, paged bool) ([]*service.UserRequestAudit, int64, error) {
 	where, args := auditSQLFilter(f)
 	var total int64
 	if err := r.legacy.db.QueryRowContext(ctx, "SELECT count(*) FROM user_request_audit_conversations c WHERE "+where, args...).Scan(&total); err != nil {
@@ -200,17 +150,23 @@ func (r *FileUserRequestAuditRepository) candidateSummariesLocked(ctx context.Co
 	}
 	return out, total, rows.Err()
 }
+
+// ListConversations returns associated-conversation summaries, one row per
+// conversation. With SQL present this is a plain indexed query that never waits
+// for the association maps, so an archive rewrite cannot stall the list.
+// Content search is the only path that touches payloads, and it reads them
+// with no lock held.
 func (r *FileUserRequestAuditRepository) ListConversations(ctx context.Context, f service.UserRequestAuditFilter) ([]*service.UserRequestAudit, int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
-		return nil, 0, err
-	}
 	if f.Legacy && r.legacy != nil {
 		return r.legacy.List(ctx, f)
 	}
+	if r.legacy == nil && !r.indexReady() {
+		if err := r.ensureIndex(ctx); err != nil {
+			return nil, 0, err
+		}
+	}
 	contentSearch := strings.TrimSpace(f.Q) != ""
-	rows, total, err := r.candidateSummariesLocked(ctx, f, !contentSearch)
+	rows, total, err := r.candidateSummaries(ctx, f, !contentSearch)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -246,11 +202,79 @@ func (r *FileUserRequestAuditRepository) ListConversations(ctx context.Context, 
 	return rows, total, nil
 }
 
-type auditConversationExportFile struct {
-	file    *os.File
-	summary *service.UserRequestAudit
+// ResolveConversationIDs maps request or conversation ids to conversation ids,
+// waiting only for the association index.
+func (r *FileUserRequestAuditRepository) ResolveConversationIDs(ctx context.Context, ids []int64) ([]int64, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if err := r.ensureIndex(ctx); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.index == nil {
+		return nil, errors.New("audit archive index is unavailable")
+	}
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		entry, ok := r.index[id]
+		if !ok {
+			return nil, fmt.Errorf("selected audit conversation %d no longer exists", id)
+		}
+		if !seen[entry.conversationID] {
+			seen[entry.conversationID] = true
+			out = append(out, entry.conversationID)
+		}
+	}
+	return out, nil
 }
 
+// ConversationSummaries returns stored summaries for explicit conversation ids
+// in deterministic order. No payload is decoded.
+func (r *FileUserRequestAuditRepository) ConversationSummaries(ctx context.Context, ids []int64) ([]*service.UserRequestAudit, error) {
+	if err := r.ensureIndex(ctx); err != nil {
+		return nil, err
+	}
+	out := make([]*service.UserRequestAudit, 0, len(ids))
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.index == nil {
+		return nil, errors.New("audit archive index is unavailable")
+	}
+	for _, id := range ids {
+		meta, ok := r.documents[id]
+		if !ok {
+			return nil, fmt.Errorf("audit conversation %d no longer exists", id)
+		}
+		summary := meta.summary
+		out = append(out, &summary)
+	}
+	return out, nil
+}
+
+// ForEachConversation decodes one conversation payload at a time and hands it to
+// visit. Only the path lookup is lock-protected, so an export never keeps the
+// archive - or captures - waiting on slow disk or a slow consumer.
+func (r *FileUserRequestAuditRepository) ForEachConversation(ctx context.Context, ids []int64, visit func(*auditDiskConversation) error) error {
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		doc, err := r.loadAuditDocument(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err = visit(doc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ExportConversations writes whole conversations, ignoring per-request filters
+// except for the optional content match, which keeps the entire conversation.
 func (r *FileUserRequestAuditRepository) ExportConversations(ctx context.Context, f service.UserRequestAuditFilter, ids []int64, w io.Writer, format string) (int, error) {
 	if format != "json" && format != "jsonl" {
 		return 0, fmt.Errorf("unsupported audit export format %q", format)
@@ -258,52 +282,33 @@ func (r *FileUserRequestAuditRepository) ExportConversations(ctx context.Context
 	if f.Legacy && r.legacy != nil {
 		return r.exportLegacyAuditConversations(ctx, f, ids, w, format)
 	}
-	// Pin each atomically replaced file under the capture mutex. Slow consumers
-	// decode pinned versions after releasing the mutex; capture remains available.
-	var snapshot []auditConversationExportFile
-	defer func() {
-		for _, entry := range snapshot {
-			if entry.file != nil {
-				_ = entry.file.Close()
-			}
-		}
-	}()
-	err := func() error {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		if err := r.ensureIndexLocked(ctx); err != nil {
-			return err
-		}
-		selected := make(map[int64]bool, len(ids))
-		for _, id := range ids {
-			entry, ok := r.index[id]
-			if !ok {
-				return fmt.Errorf("selected audit conversation %d no longer exists", id)
-			}
-			selected[entry.conversationID] = true
-		}
-		summaries, _, err := r.candidateSummariesLocked(ctx, f, false)
+	candidates := ids
+	if len(candidates) == 0 {
+		summaries, _, err := r.candidateSummaries(ctx, f, false)
 		if err != nil {
-			return err
+			return 0, err
 		}
+		candidates = make([]int64, 0, len(summaries))
 		for _, summary := range summaries {
-			if len(ids) > 0 && !selected[summary.ID] {
-				continue
-			}
-			if err = ctx.Err(); err != nil {
-				return err
-			}
-			file, e := openAuditSnapshot(r.conversationPath(summary.ID))
-			if e != nil {
-				return e
-			}
-			snapshot = append(snapshot, auditConversationExportFile{file: file, summary: summary})
+			candidates = append(candidates, summary.ID)
 		}
-		return nil
-	}()
+	} else {
+		resolved, err := r.ResolveConversationIDs(ctx, ids)
+		if err != nil {
+			return 0, err
+		}
+		candidates = resolved
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i] > candidates[j] })
+	}
+	summaryList, err := r.ConversationSummaries(ctx, candidates)
 	if err != nil {
 		return 0, err
 	}
+	summaries := make(map[int64]*service.UserRequestAudit, len(summaryList))
+	for _, summary := range summaryList {
+		summaries[summary.ID] = summary
+	}
+	content := strings.TrimSpace(f.Q) != ""
 	if format == "json" {
 		if _, err = io.WriteString(w, "[\n"); err != nil {
 			return 0, err
@@ -311,48 +316,49 @@ func (r *FileUserRequestAuditRepository) ExportConversations(ctx context.Context
 	}
 	count := 0
 	enc := json.NewEncoder(auditExportContextWriter{ctx: ctx, writer: w})
-	for i := range snapshot {
-		entry := &snapshot[i]
-		if err = ctx.Err(); err != nil {
-			return count, err
-		}
-		var doc auditDiskConversation
-		if err = json.NewDecoder(entry.file).Decode(&doc); err != nil {
-			return count, err
-		}
-		if err = entry.file.Close(); err != nil {
-			return count, err
-		}
-		entry.file = nil
-		if strings.TrimSpace(f.Q) != "" {
+	err = r.ForEachConversation(ctx, candidates, func(doc *auditDiskConversation) error {
+		if content {
 			found := false
 			for _, row := range doc.Requests {
 				found = found || auditMatchesFilter(row, f)
 			}
 			if !found {
-				continue
+				return nil
 			}
 		}
-		entry.summary.ChatML = auditMessagesTranscript(doc.Messages)
+		summary, ok := summaries[doc.ID]
+		if !ok {
+			return fmt.Errorf("audit conversation %d lost its summary", doc.ID)
+		}
+		exported := *summary
+		exported.ChatML = auditMessagesTranscript(doc.Messages)
+		if err := r.labelUsers(ctx, []*service.UserRequestAudit{&exported}); err != nil {
+			return err
+		}
 		if format == "json" && count > 0 {
-			if _, err = io.WriteString(w, ",\n"); err != nil {
-				return count, err
+			if _, err := io.WriteString(w, ",\n"); err != nil {
+				return err
 			}
 		}
-		if err = enc.Encode(struct {
+		if err := enc.Encode(struct {
 			*service.UserRequestAudit
 			Requests []*service.UserRequestAudit       `json:"requests"`
 			Messages []service.UserRequestAuditMessage `json:"messages"`
-		}{entry.summary, doc.Requests, doc.Messages}); err != nil {
-			return count, err
+		}{&exported, doc.Requests, doc.Messages}); err != nil {
+			return err
 		}
 		count++
+		return nil
+	})
+	if err != nil {
+		return count, err
 	}
 	if format == "json" {
 		_, err = io.WriteString(w, "]\n")
 	}
 	return count, err
 }
+
 
 type auditExportContextWriter struct {
 	ctx    context.Context
@@ -365,3 +371,4 @@ func (w auditExportContextWriter) Write(p []byte) (int, error) {
 	}
 	return w.writer.Write(p)
 }
+

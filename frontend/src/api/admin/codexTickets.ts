@@ -1,5 +1,5 @@
 import { apiClient } from '../client'
-import type { Account, ApiKey } from '@/types'
+import type { Account } from '@/types'
 
 export type TicketStatus = NonNullable<Account['codex_turn_tickets']>[number] & {
   captured_at?: string
@@ -51,14 +51,12 @@ export interface TicketInvalidation extends TicketEvent {
 
 export interface TicketDiagnostic {
   model: string
-  gateway_error_code?: string
   status: 'normal' | 'degraded' | 'uncertain' | 'failed'
   reason?: string
   predicted_model?: string
   probability?: number
   parsed_number_count?: number
   http_status?: number
-  harvest?: TicketEvent
 }
 
 const base = (id: number) => `/admin/accounts/${id}`
@@ -88,18 +86,9 @@ export async function harvest(id: number, model: string): Promise<{ outcome: str
   return data
 }
 
-export async function diagnose(id: number, apiKeyID: number, models: string[], signal?: AbortSignal): Promise<{ items: TicketDiagnostic[]; canceled: boolean }> {
-  const { data } = await apiClient.post(`${base(id)}/codex-ticket-diagnostic`, { api_key_id: apiKeyID, models }, { timeout: Math.max(120000, models.length * 180000), signal })
+export async function diagnose(id: number, models: string[], signal?: AbortSignal): Promise<{ items: TicketDiagnostic[]; canceled: boolean }> {
+  const { data } = await apiClient.post(`${base(id)}/codex-ticket-diagnostic`, { models }, { timeout: Math.max(120000, models.length * 180000), signal })
   return data
-}
-
-export async function ownKeys(): Promise<ApiKey[]> {
-  const keys: ApiKey[] = []
-  for (let page = 1; ; page++) {
-    const { data } = await apiClient.get<{ items: ApiKey[]; total: number }>('/keys', { params: { page, page_size: 100, status: 'active' } })
-    keys.push(...data.items)
-    if (keys.length >= data.total || !data.items.length) return keys
-  }
 }
 
 export async function cadence(): Promise<{ retry_min_seconds: number; retry_max_seconds: number; refresh_seconds: number }> {

@@ -114,14 +114,24 @@ func (s *UserRequestAuditService) exportDiskAllowed() bool {
 	return status.DiskTotalBytes > 0 && status.DiskFreeBytes >= userRequestAuditMinimumFreeBytes
 }
 
+// guardedAuditExportWriter stops a long export when the disk fills up. The
+// check is time-boxed: StorageStatus globs and stats the whole archive, so
+// testing it on every 32 KiB write would dominate export cost.
 type guardedAuditExportWriter struct {
-	service *UserRequestAuditService
-	writer  io.Writer
+	service  *UserRequestAuditService
+	writer   io.Writer
+	lastGate time.Time
 }
 
-func (w guardedAuditExportWriter) Write(p []byte) (int, error) {
-	if w.service == nil || !w.service.exportDiskAllowed() {
+func (w *guardedAuditExportWriter) Write(p []byte) (int, error) {
+	if w.service == nil {
 		return 0, ErrUserRequestAuditExportUnavailable
+	}
+	if time.Since(w.lastGate) >= time.Minute {
+		w.lastGate = time.Now()
+		if !w.service.exportDiskAllowed() {
+			return 0, ErrUserRequestAuditExportUnavailable
+		}
 	}
 	return w.writer.Write(p)
 }
@@ -267,12 +277,17 @@ func (s *UserRequestAuditService) runOneExport(workerCtx context.Context, task a
 		s.failExport(task.jobID, err)
 		return
 	}
+	exporter, ok := s.repo.(userRequestAuditConversationExporter)
+	if !ok {
+		s.failExport(task.jobID, ErrUserRequestAuditExportUnavailable)
+		return
+	}
 	gz := gzip.NewWriter(f)
-	guarded := guardedAuditExportWriter{service: s, writer: gz}
+	guarded := &guardedAuditExportWriter{service: s, writer: gz, lastGate: time.Now()}
 	ctx, cancel := context.WithTimeout(workerCtx, userRequestAuditExportTimeout)
 	defer cancel()
 	s.setExportJob(task.jobID, func(job *UserRequestAuditExportJob) { job.Filename = filename })
-	rows, err := s.repo.(userRequestAuditConversationExporter).ExportConversations(ctx, task.filter, task.conversationIDs, guarded, task.format)
+	rows, err := exporter.ExportConversations(ctx, task.filter, task.conversationIDs, guarded, task.format)
 	closeErr := gz.Close()
 	fileErr := f.Close()
 	if err == nil {

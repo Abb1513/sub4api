@@ -157,6 +157,19 @@ GPT-6.1 Sol (`gpt-6.1-sol`) is included in the OpenAI catalog, model whitelist, 
 
 GPT-6.1 Sol is reasoning-only: explicit `none`, `minimal` or disabled thinking is rejected rather than silently upgraded. Supported API efforts are `low`, `medium`, `high`, `xhigh`, and `max`. Its pinned [official Codex descriptor](https://github.com/openai/codex/blob/b1e72963c3b71a9265a551e54beff078384efed9/codex-rs/models-manager/models.json) defaults to `low` and advertises Responses Lite/code mode for official ChatGPT OAuth; API-key catalogs keep plain Responses. The Codex `model is not supported when using Codex with a ChatGPT account` message does not prove a plan restriction: check the effective version, not just account type or the bundled descriptor's minimum version. With the same account and Lite/low request, `0.158.0` returned this 400 and `0.159.3` completed successfully. Manual version overrides take precedence over the synchronized value; when automatic synchronization is disabled, an old synchronized value remains in effect until an explicit version is set. Reference: [cc-switch #7797](https://github.com/farion1231/cc-switch/issues/7797).
 
+### 上游过载冷却与降智检测
+
+- OpenAI 容量降载（`server_is_overloaded`、"Our servers are currently overloaded" 等）不再走请求级早退：账号配置的 `temp_unschedulable_rules` 照常命中并写入模型级冷却（例如 503 + overloaded → 30 分钟），同账号有界重试与切号流程保持不变。规则按真实上游状态码匹配，HTTP 200 + 流内降载（SSE `error` / `response.failed`）不会命中 503 规则；`RequestScopedTransient` 仍只约束通用临时摘号，不约束用户自定义规则。
+- 降智检测是"号原生"：`RunCodexNativeDiagnostic`（`internal/service/codex_ticket_diagnostic.go`）用目标账号自身的 access token 直接打 ModelTrace 探测，管理员不再选择计费 Key，探测也不再回环进公开网关。打票代理池存在时与打票共用出口，未配置代理时直连。失败按 `credentials` / `proxy_unavailable` / `http_status` / `timeout` / `response_incomplete` / `template_invalid` 等原因返回，状态一律 `failed`，不参与降智判定。
+- `gpt-6.1-sol` 可参与检测，但指纹库暂无该分类：命中同系列参考类 `gpt-6-sol` 判「不确定」，命中其它 GPT 类判「疑似降智」，精确命中才判「正常」；库补上分类后自动回到精确匹配。
+- 自动降智检测（设置键 `codex_auto_degradation_check`）默认关闭。开启后按 `interval_minutes` 顺序探测到期的 OpenAI OAuth / Setup Token 活跃账号（单轮最多 8 个、每发 120 秒、双重 leader lock），状态写入 `accounts.extra` 的 `codex_degradation_check`：降智时用带 `source=auto_degradation_check` 标记的 reason 写临时停调并把复查时间对齐到封锁到期，仍降智则续期；`normal`/`uncertain` 且当前封锁带该标记时调用 `RateLimitService.ClearTempUnschedulable` 解封（会同时清掉该账号的模型级限流与 Redis 临时停调缓存）；`failed` 既不加封也不解封，其它来源的封锁永远保留。候选查询刻意不按 temp_unschedulable 过滤，否则被封锁的账号永远不会被复查。
+
+定向回归（在 `backend` 目录）：
+
+```bash
+go test -tags=unit ./internal/service ./internal/handler/admin ./internal/repository -run 'Codex|Diagnostic|CapacityShed|TempUnsched' -count=1
+```
+
 ### Responses 服务端 Web Search
 
 这是中转站托管的工具，不是客户端函数工具。开启后，客户端不必注册搜索工具，
@@ -177,8 +190,11 @@ GPT-6.1 Sol is reasoning-only: explicit `none`, `minimal` or disabled thinking i
 
 执行与兼容边界：
 
-- 全局关闭、账号关闭、渠道未开启时不接管，不移除或改写客户端原来的搜索工具。
-  原生上游搜索仍由原转发链路处理。显式 `tool_choice: "none"` 不启用托管搜索。
+- 全局关闭、账号关闭、渠道未开启时不接管新的搜索，不移除或改写客户端原来的搜索工具。
+  原生上游搜索仍由原转发链路处理。显式 `tool_choice: "none"` 不启用新的托管搜索。
+  已由本网关签发的历史 `ws_sub4api_` 项仍先按用户/API Key/分组还原原始函数调用与真实结果，再决定新搜索是否允许；不能因 `none`、排除搜索的 `allowed_tools` 或搜索开关关闭而把公共 `web_search_call` 原样送给仅支持函数的上游。
+  托管搜索启用但本轮禁止新搜索时，仅从本轮工具声明移除网关拥有的 `web_search/web_search_preview`，保留客户端函数和 tool_choice。过期或跨作用域引用返回 400，不丢弃证据、不重搜计费、不进入上游重试。
+  客户端省略搜索项 `id` 或发送空字符串时，仅按去掉 `id` 后完整公共项的规范 JSON 指纹，在同一用户/API Key/分组内恢复唯一未过期结果；不按查询或 URL 模糊匹配。内容变化、歧义、缺失、过期和跨作用域引用明确返回 400，保留原始搜索片段，不重新搜索。缓存仍为进程内：重启前的历史不能自动恢复，须重搜或显式补回完整证据。
 - 启用时网关向上游模型提供内部搜索函数；由模型生成查询，Brave/Tavily 返回真实结果，
   再回填模型继续生成。客户端函数工具可以共存，仍由客户端执行。
 - 对外返回标准 `web_search_call`、来源 URL 和回答；不暴露内部搜索函数或要求客户端执行它。

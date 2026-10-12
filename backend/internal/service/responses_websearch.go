@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,12 +74,13 @@ func IsHostedResponsesWebSearchProviderError(err error) bool {
 // never arbitrary conversation history. Callers are isolated by authenticated
 // user, API key and group, including when upstream accounts change.
 type responsesWebSearchReplayEntry struct {
-	call    json.RawMessage
-	result  json.RawMessage
-	pending []json.RawMessage
-	alias   string // streamed public response id -> id of its last model round
-	expires time.Time
-	bytes   int
+	call        json.RawMessage
+	result      json.RawMessage
+	pending     []json.RawMessage
+	alias       string // streamed public response id -> id of its last model round
+	fingerprint [sha256.Size]byte
+	expires     time.Time
+	bytes       int
 }
 
 var responsesWebSearchReplay = struct {
@@ -104,7 +106,7 @@ func putResponsesWebSearchReplay(scope, id string, entry responsesWebSearchRepla
 		return
 	}
 	entry.expires = time.Now().Add(responsesWebSearchReplayTTL)
-	entry.bytes = len(entry.call) + len(entry.result) + len(entry.alias)
+	entry.bytes = len(entry.call) + len(entry.result) + len(entry.alias) + len(entry.fingerprint)
 	for _, result := range entry.pending {
 		entry.bytes += len(result)
 	}
@@ -152,6 +154,50 @@ func getResponsesWebSearchReplay(scope, id string) (responsesWebSearchReplayEntr
 	return entry, ok
 }
 
+// Some Responses clients omit output item IDs when replaying provider payloads.
+// Match the complete public payload, not a query or source URL, and only within
+// the authenticated caller's scope. Multiple searches with identical public
+// payloads can have different snippets, so ambiguous matches must fail closed.
+func responsesWebSearchFingerprint(item json.RawMessage) ([sha256.Size]byte, error) {
+	var public map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(item))
+	decoder.UseNumber()
+	if err := decoder.Decode(&public); err != nil || public == nil {
+		return [sha256.Size]byte{}, errors.New("invalid web search history item")
+	}
+	delete(public, "id")
+	canonical, err := json.Marshal(public)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return sha256.Sum256(canonical), nil
+}
+
+func getResponsesWebSearchReplayWithoutID(scope string, item json.RawMessage) (responsesWebSearchReplayEntry, error) {
+	fingerprint, err := responsesWebSearchFingerprint(item)
+	if err != nil {
+		return responsesWebSearchReplayEntry{}, err
+	}
+	responsesWebSearchReplay.Lock()
+	defer responsesWebSearchReplay.Unlock()
+	var match responsesWebSearchReplayEntry
+	found := false
+	now := time.Now()
+	for key, entry := range responsesWebSearchReplay.entries {
+		if scope == "" || !strings.HasPrefix(key, scope+responsesWebSearchIDPrefix) || !now.Before(entry.expires) || entry.fingerprint != fingerprint {
+			continue
+		}
+		if found {
+			return responsesWebSearchReplayEntry{}, errors.New("gateway web search history without an id is ambiguous; resend the original search item id or the complete search evidence as messages")
+		}
+		match, found = entry, true
+	}
+	if !found {
+		return responsesWebSearchReplayEntry{}, errors.New("gateway web search history without an id is unavailable or expired for this API key; resend the original search item id or the complete search evidence as messages")
+	}
+	return match, nil
+}
+
 func responsesWebSearchEnabled(ctx context.Context, c *gin.Context, account *Account, settings *SettingService, channels *ChannelService) bool {
 	if c == nil || c.Request == nil || c.Request.Method != http.MethodPost || !strings.HasSuffix(strings.TrimRight(c.Request.URL.Path, "/"), "/responses") {
 		return false
@@ -178,7 +224,12 @@ func responsesWebSearchEnabled(ctx context.Context, c *gin.Context, account *Acc
 // upstream transport, preserving authentication, routing and usage observation.
 func (s *GatewayService) ForwardResponsesWithWebSearch(ctx context.Context, c *gin.Context, account *Account, body []byte, forward func([]byte) (*ForwardResult, error)) (*ForwardResult, error) {
 	if !responsesWebSearchEnabled(ctx, c, account, s.settingService, s.channelService) {
-		return forward(body)
+		next, err := normalizeResponsesWebSearchHistory(c, body)
+		if err != nil {
+			writeResponsesWebSearchRequestError(c, err)
+			return nil, err
+		}
+		return forward(next)
 	}
 	return forwardHostedResponsesWebSearch(ctx, c, account, body, forward, mergeClaudeWebSearchResult, executeResponsesWebSearch)
 }
@@ -236,13 +287,35 @@ func mergeOpenAIWebSearchResult(total, next *OpenAIForwardResult) *OpenAIForward
 }
 
 func forwardHostedResponsesWebSearch[T any](ctx context.Context, c *gin.Context, account *Account, body []byte, forward func([]byte) (*T, error), merge func(*T, *T) *T, search func(context.Context, *Account, string, *responsesWebSearchPlan) (*websearch.SearchResponse, error)) (*T, error) {
+	// Disabling future searches never disables replay of already-paid evidence.
+	var replayErr error
+	body, replayErr = normalizeResponsesWebSearchHistory(c, body)
+	if replayErr != nil {
+		writeResponsesWebSearchRequestError(c, replayErr)
+		return nil, replayErr
+	}
+	// Hosted mode targets function-tool upstreams. Foreign native search IDs
+	// cannot be resolved by this gateway and must not leak through as native
+	// items or be replaced by invented evidence.
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if item.Get("type").String() == "web_search_call" {
+			err := errors.New("native web search history cannot be replayed by this gateway; resend the complete search evidence as messages")
+			writeResponsesWebSearchRequestError(c, err)
+			return nil, err
+		}
+	}
 	plan, err := prepareResponsesWebSearch(body)
 	if err != nil {
 		writeResponsesWebSearchRequestError(c, err)
 		return nil, err
 	}
 	if plan == nil {
-		return forward(body)
+		next, err := removeDisabledResponsesSearchTools(body)
+		if err != nil {
+			writeResponsesWebSearchRequestError(c, err)
+			return nil, err
+		}
+		return forward(next)
 	}
 	start := time.Now()
 	var request map[string]json.RawMessage
@@ -255,28 +328,6 @@ func forwardHostedResponsesWebSearch[T any](ctx context.Context, c *gin.Context,
 	if err != nil {
 		writeResponsesWebSearchRequestError(c, err)
 		return nil, err
-	}
-	previousID := gjson.GetBytes(plan.Body, "previous_response_id").String()
-	if alias, ok := getResponsesWebSearchReplay(scope, "alias:"+previousID); ok && alias.alias != "" {
-		// A streamed multi-round answer is published under its first round id;
-		// the conversation continues from the round that holds the full context.
-		previousID = alias.alias
-		request["previous_response_id"] = rawResponsesSearchJSON(previousID)
-	}
-	if pending, ok := getResponsesWebSearchReplay(scope, "pending:"+previousID); ok {
-		for _, result := range pending.pending {
-			callID := gjson.GetBytes(result, "call_id").String()
-			present := false
-			for _, item := range input {
-				if gjson.GetBytes(item, "type").String() == "function_call_output" && gjson.GetBytes(item, "call_id").String() == callID {
-					present = true
-					break
-				}
-			}
-			if !present {
-				input = append(input, result)
-			}
-		}
 	}
 
 	originalWriter := c.Writer
@@ -533,7 +584,11 @@ func forwardHostedResponsesWebSearch[T any](ctx context.Context, c *gin.Context,
 			sources = append(sources, results.Results...)
 			toolResult := rawResponsesSearchJSON(map[string]any{"type": "function_call_output", "call_id": gjson.GetBytes(item, "call_id").String(), "output": string(rawResponsesSearchJSON(map[string]any{"query": query, "results": results.Results}))})
 			toolResults = append(toolResults, toolResult)
-			putResponsesWebSearchReplay(scope, searchID, responsesWebSearchReplayEntry{call: item, result: toolResult})
+			fingerprint, err := responsesWebSearchFingerprint(rawResponsesSearchJSON(publicCall))
+			if err != nil {
+				return finish(err)
+			}
+			putResponsesWebSearchReplay(scope, searchID, responsesWebSearchReplayEntry{call: item, result: toolResult, fingerprint: fingerprint})
 		}
 		if len(toolResults) > 0 {
 			responseID := gjson.GetBytes(response["id"], "@this").String()
@@ -562,6 +617,59 @@ func rawResponsesSearchJSON(value any) json.RawMessage {
 	return encoded
 }
 
+// Replay gateway-owned history before deciding whether a NEW search may run.
+// ID-less client payloads require an exact, unique scoped match; unrelated
+// native/provider IDs and unchanged request bytes remain untouched.
+func normalizeResponsesWebSearchHistory(c *gin.Context, body []byte) ([]byte, error) {
+	if c == nil || c.Request == nil || c.Request.Method != http.MethodPost || !strings.HasSuffix(strings.TrimRight(c.Request.URL.Path, "/"), "/responses") {
+		return body, nil
+	}
+	scope := responsesWebSearchScope(c)
+	previousID := gjson.GetBytes(body, "previous_response_id").String()
+	alias, hasAlias := getResponsesWebSearchReplay(scope, "alias:"+previousID)
+	if hasAlias && alias.alias != "" {
+		previousID = alias.alias
+	}
+	pending, hasPending := getResponsesWebSearchReplay(scope, "pending:"+previousID)
+	ownedHistory := false
+	gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() == "web_search_call" && (item.Get("id").String() == "" || strings.HasPrefix(item.Get("id").String(), responsesWebSearchIDPrefix)) {
+			ownedHistory = true
+			return false
+		}
+		return true
+	})
+	if !ownedHistory && !hasAlias && !hasPending {
+		return body, nil
+	}
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil || request == nil {
+		return nil, errors.New("invalid Responses request JSON")
+	}
+	input, err := responsesWebSearchInput(request["input"], scope)
+	if err != nil {
+		return nil, err
+	}
+	if hasAlias && alias.alias != "" {
+		request["previous_response_id"] = rawResponsesSearchJSON(previousID)
+	}
+	for _, result := range pending.pending {
+		callID := gjson.GetBytes(result, "call_id").String()
+		present := false
+		for _, item := range input {
+			if gjson.GetBytes(item, "type").String() == "function_call_output" && gjson.GetBytes(item, "call_id").String() == callID {
+				present = true
+				break
+			}
+		}
+		if !present {
+			input = append(input, result)
+		}
+	}
+	request["input"] = rawResponsesSearchJSON(input)
+	return json.Marshal(request)
+}
+
 func responsesWebSearchInput(raw json.RawMessage, scope string) ([]json.RawMessage, error) {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return []json.RawMessage{}, nil
@@ -576,8 +684,19 @@ func responsesWebSearchInput(raw json.RawMessage, scope string) ([]json.RawMessa
 	}
 	var normalized []json.RawMessage
 	for _, item := range input {
-		id := gjson.GetBytes(item, "id").String()
-		if gjson.GetBytes(item, "type").String() == "web_search_call" && strings.HasPrefix(id, responsesWebSearchIDPrefix) {
+		idValue := gjson.GetBytes(item, "id")
+		id := idValue.String()
+		kind := gjson.GetBytes(item, "type").String()
+		if kind == "web_search_call" && idValue.Exists() && idValue.Type != gjson.String {
+			return nil, errors.New("web search history id must be a string when present")
+		}
+		if kind == "web_search_call" && id == "" {
+			entry, err := getResponsesWebSearchReplayWithoutID(scope, item)
+			if err != nil {
+				return nil, err
+			}
+			normalized = append(normalized, entry.call, entry.result)
+		} else if kind == "web_search_call" && strings.HasPrefix(id, responsesWebSearchIDPrefix) {
 			entry, ok := getResponsesWebSearchReplay(scope, id)
 			if !ok {
 				return nil, errors.New("gateway web search history is expired or belongs to another API key; resend the conversation as messages")

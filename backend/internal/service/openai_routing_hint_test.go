@@ -123,7 +123,7 @@ func TestOpenAIOAuthHTTPBuildersSendRoutingHintFromFinalBody(t *testing.T) {
 	}
 }
 
-func TestOpenAIHTTPPassthroughStripsOnlyOAuthLegacyResponsesBeta(t *testing.T) {
+func TestOpenAIHTTPPassthroughProjectsOfficialBetaLine(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc := &OpenAIGatewayService{cfg: &config.Config{
 		Security: config.SecurityConfig{
@@ -165,17 +165,20 @@ func TestOpenAIHTTPPassthroughStripsOnlyOAuthLegacyResponsesBeta(t *testing.T) {
 		},
 	}
 
-	t.Run("oauth legacy only is removed including raw lowercase key", func(t *testing.T) {
+	// Codex OAuth 的 HTTP 业务线官方集合由 build_responses_headers 产生，
+	// OpenAI-Beta 只在 WS 握手出现（client.rs:1314-1330）；因此不论入站声明
+	// 了什么（含原样小写键），/responses 出站线上该头必须整体缺席。
+	t.Run("oauth beta never reaches the HTTP business lane", func(t *testing.T) {
 		headers := build(t, oauth, []string{"responses=experimental"}, true)
 		require.Empty(t, headers.Values("OpenAI-Beta"))
 	})
 
-	t.Run("oauth mixed beta preserves independent tokens", func(t *testing.T) {
+	t.Run("oauth mixed beta still absent on HTTP", func(t *testing.T) {
 		headers := build(t, oauth, []string{
 			"responses=experimental, future_feature=v1",
 			"another_feature=v2, RESPONSES=EXPERIMENTAL",
 		}, false)
-		require.Equal(t, []string{"future_feature=v1", "another_feature=v2"}, headers.Values("OpenAI-Beta"))
+		require.Empty(t, headers.Values("OpenAI-Beta"))
 	})
 
 	t.Run("api key explicit beta remains caller controlled", func(t *testing.T) {

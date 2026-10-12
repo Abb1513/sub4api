@@ -826,6 +826,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		firstPayload.payloadRaw = metadataBody
 		firstPayload.payloadBytes = len(metadataBody)
 	}
+	// 归一化按旧习惯重写 session_id / x-codex-installation-id 头，握手前重新收口。
+	if account.UsesOpenAICodexProtocol() {
+		projectCodexOutboundHeaders(wsHeaders, true)
+	}
 	baseAcquireReq := openAIWSAcquireRequest{
 		Account:          account,
 		WSURL:            wsURL,

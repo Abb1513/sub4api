@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,17 +46,32 @@ type auditArchiveState struct {
 	ObsoleteIDs []int64 `json:"obsolete_document_ids,omitempty"`
 }
 
-// Payloads are authoritative atomic JSON documents. SQL contains only metadata
-// and relative paths; the in-memory maps support capture association, not polling.
+// Payloads stay authoritative atomic JSON documents; SQL carries only metadata
+// and relative paths, and the in-memory maps support capture association.
+//
+// Locking contract for this file family:
+//
+//	mu    guards r.index, r.documents, r.logicalIndex, r.staleDocs and r.state.
+//	      Sections are map/state operations only - never file or SQL I/O.
+//	ioMu  serializes archive mutations (index build, publication, clear,
+//	      expiry). Read paths never take ioMu.
+//
+// A writer therefore cannot block a list request or a conversation read. A
+// failed publication degrades only the documents it touched: they stay marked
+// stale and are re-derived from their own files. It never drops the whole
+// index, because a full rescan inside the bounded writer deadline used to fail
+// again and starve every later request behind the shared lock.
 type FileUserRequestAuditRepository struct {
 	root         string
 	legacy       *UserRequestAuditRepository
 	mu           sync.Mutex
+	ioMu         sync.Mutex
 	lastCleanup  time.Time
 	state        auditArchiveState
 	index        map[int64]auditArchiveEntry
 	documents    map[int64]auditDocumentMeta
 	logicalIndex map[string]int64
+	staleDocs    map[int64]bool
 	diskUsage    func(context.Context, string) (int64, int64, error)
 }
 
@@ -69,7 +86,7 @@ func NewFileUserRequestAuditRepository(db *sql.DB) *FileUserRequestAuditReposito
 	}
 	// The Ent provider completes SQL migrations before exposing this DB. Any
 	// recovery error remains fail-closed and is retried by the first operation.
-	_ = r.ensureIndexLocked(context.Background())
+	_ = r.ensureIndex(context.Background())
 	return r
 }
 
@@ -117,9 +134,20 @@ func auditSyncDirectory(path string) error {
 	defer dir.Close()
 	return dir.Sync()
 }
+
+// saveStateLocked persists the journal. Callers hold mu. The journal holds ID
+// lists only, never payload bytes.
 func (r *FileUserRequestAuditRepository) saveStateLocked() error {
 	return auditAtomicJSON(r.statePath(), r.state)
 }
+
+// saveState persists the journal, taking mu.
+func (r *FileUserRequestAuditRepository) saveState() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.saveStateLocked()
+}
+
 func readAuditConversation(path string) (*auditDiskConversation, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -155,6 +183,9 @@ func auditMetadata(row *service.UserRequestAudit) service.UserRequestAudit {
 	result.UserLabel = ""
 	return result
 }
+
+// indexDocumentLocked installs one document into the association maps. Callers
+// hold mu.
 func (r *FileUserRequestAuditRepository) indexDocumentLocked(doc *auditDiskConversation) {
 	rows := doc.Requests
 	summary := auditConversationSummary(auditConversation{rows: rows, representative: rows[0], latest: rows[len(rows)-1]})
@@ -174,46 +205,152 @@ func (r *FileUserRequestAuditRepository) indexDocumentLocked(doc *auditDiskConve
 		}
 	}
 	r.documents[doc.ID] = auditDocumentMeta{summary: *summary, path: r.conversationPath(doc.ID), expires: expires}
+	delete(r.staleDocs, doc.ID)
 }
-func (r *FileUserRequestAuditRepository) ensureIndexLocked(ctx context.Context) (err error) {
-	if r.index != nil {
+
+// forgetDocumentLocked drops one document and its request associations. Callers
+// hold mu.
+func (r *FileUserRequestAuditRepository) forgetDocumentLocked(id int64) {
+	for rowID, entry := range r.index {
+		if entry.conversationID != id {
+			continue
+		}
+		if entry.row.LogicalKey != "" && r.logicalIndex[entry.row.LogicalKey] == rowID {
+			delete(r.logicalIndex, entry.row.LogicalKey)
+		}
+		delete(r.index, rowID)
+	}
+	delete(r.documents, id)
+	delete(r.staleDocs, id)
+}
+
+// resetMapsLocked publishes empty association maps. Callers hold mu.
+func (r *FileUserRequestAuditRepository) resetMapsLocked() {
+	r.index = make(map[int64]auditArchiveEntry)
+	r.documents = make(map[int64]auditDocumentMeta)
+	r.logicalIndex = make(map[string]int64)
+	r.staleDocs = make(map[int64]bool)
+}
+
+// indexReady reports whether the association maps are published.
+func (r *FileUserRequestAuditRepository) indexReady() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.index != nil
+}
+
+// ensureIndex prepares the association maps. The archive scan runs without mu,
+// so a first request never blocks other readers, and it is idempotent.
+func (r *FileUserRequestAuditRepository) ensureIndex(ctx context.Context) error {
+	r.mu.Lock()
+	built := r.index != nil
+	r.mu.Unlock()
+	if built {
 		return ctx.Err()
 	}
+	r.ioMu.Lock()
+	defer r.ioMu.Unlock()
+	return r.buildIndex(ctx)
+}
+
+// invalidateDocuments marks documents whose on-disk state could not be read or
+// published. Only those are re-derived later; the rest of the index keeps
+// serving reads and future captures.
+func (r *FileUserRequestAuditRepository) invalidateDocuments(ids ...int64) {
+	if len(ids) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.staleDocs == nil {
+		r.staleDocs = make(map[int64]bool, len(ids))
+	}
+	for _, id := range ids {
+		r.staleDocs[id] = true
+	}
+}
+
+// repairStaleDocuments re-reads only documents a failed publication touched, so
+// recovery cost is proportional to the failure rather than archive size.
+func (r *FileUserRequestAuditRepository) repairStaleDocuments(ctx context.Context) error {
+	for {
+		r.mu.Lock()
+		var id int64
+		for candidate := range r.staleDocs {
+			id = candidate
+			break
+		}
+		if id == 0 {
+			r.mu.Unlock()
+			return ctx.Err()
+		}
+		r.mu.Unlock()
+		doc, err := r.loadAuditDocument(ctx, id)
+		r.mu.Lock()
+		if err != nil {
+			// The document vanished or is unreadable. Forget it so capture stops
+			// retrying a broken file; the durable journal still records the loss.
+			delete(r.staleDocs, id)
+			r.forgetDocumentLocked(id)
+		} else {
+			r.forgetDocumentLocked(id)
+			r.indexDocumentLocked(doc)
+		}
+		r.mu.Unlock()
+	}
+}
+
+// buildIndex performs the full archive scan. Callers hold ioMu. Bootstrap is
+// all-or-nothing: an unreadable archive leaves no published index, so reads
+// keep failing closed instead of silently serving half-imported evidence.
+func (r *FileUserRequestAuditRepository) buildIndex(ctx context.Context) (err error) {
+	r.mu.Lock()
+	if r.index != nil {
+		r.mu.Unlock()
+		return ctx.Err()
+	}
+	r.mu.Unlock()
 	defer func() {
 		if err != nil {
+			r.mu.Lock()
+			r.resetMapsLocked()
 			r.index = nil
 			r.documents = nil
 			r.logicalIndex = nil
+			r.staleDocs = nil
+			r.mu.Unlock()
 		}
 	}()
-	if err = os.MkdirAll(filepath.Join(r.root, "conversations"), 0o750); err != nil {
-		return err
-	}
+
+	var state auditArchiveState
 	if b, e := os.ReadFile(r.statePath()); e == nil {
-		if err = json.Unmarshal(b, &r.state); err != nil {
+		if err = json.Unmarshal(b, &state); err != nil {
 			return err
 		}
 	} else if !os.IsNotExist(e) {
 		return e
 	}
-	if err = r.finishWritesLocked(ctx); err != nil {
+	r.mu.Lock()
+	r.state = state
+	r.resetMapsLocked()
+	r.mu.Unlock()
+
+	if err = r.finishWrites(ctx); err != nil {
 		return err
 	}
 	if err = os.RemoveAll(filepath.Join(r.root, "pending")); err != nil {
 		return err
 	}
-	if err = r.finishDeletesLocked(ctx); err != nil {
+	if err = r.finishDeletes(ctx); err != nil {
 		return err
 	}
-	r.index = make(map[int64]auditArchiveEntry)
-	r.documents = make(map[int64]auditDocumentMeta)
-	r.logicalIndex = make(map[string]int64)
+
 	files, err := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
 	if err != nil {
 		return err
 	}
 	// Overlapping files can only be left by an interrupted consolidation. Fold
-	// latest rows, then rewrite the proven groups before publishing the index.
+	// the latest rows, then rewrite the proven groups before publishing.
 	latest := make(map[int64]*service.UserRequestAudit)
 	overlap := false
 	for _, path := range files {
@@ -236,10 +373,17 @@ func (r *FileUserRequestAuditRepository) ensureIndexLocked(ctx context.Context) 
 			}
 			latest[row.ID] = row
 		}
+		r.mu.Lock()
 		r.indexDocumentLocked(doc)
+		r.mu.Unlock()
 	}
+	// Bootstrap must stay read-only unless it actually repaired something:
+	// creating the archive root for a deployment that never captured anything
+	// would be a write driven purely by someone opening the page.
+	persisted := false
 	if !r.state.Migrated {
-		if err = r.importLegacyLocked(ctx, latest); err != nil {
+		persisted, err = r.importLegacy(ctx, latest)
+		if err != nil {
 			return err
 		}
 	} else if overlap {
@@ -247,15 +391,35 @@ func (r *FileUserRequestAuditRepository) ensureIndexLocked(ctx context.Context) 
 		for _, row := range latest {
 			rows = append(rows, row)
 		}
-		if err = r.replaceAllDocumentsLocked(ctx, rows); err != nil {
+		if err = r.replaceAllDocuments(ctx, rows); err != nil {
+			return err
+		}
+		persisted = true
+	}
+	r.mu.Lock()
+	reconcile := r.legacy != nil
+	r.mu.Unlock()
+	if reconcile {
+		if err = r.reconcileSQL(ctx); err != nil {
 			return err
 		}
 	}
-	if err = r.reconcileSQLLocked(ctx); err != nil {
-		return err
+	if !persisted {
+		return ctx.Err()
 	}
-	return r.saveStateLocked()
+	return r.saveState()
 }
+
+// loadAuditDocument reads one conversation payload without any repository lock.
+// Publications replace files by atomic rename, so this always observes either
+// the previous or the new complete document.
+func (r *FileUserRequestAuditRepository) loadAuditDocument(ctx context.Context, id int64) (*auditDiskConversation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return readAuditConversation(r.conversationPath(id))
+}
+
 func (r *FileUserRequestAuditRepository) makeDocument(rows []*service.UserRequestAudit, id int64) *auditDiskConversation {
 	sort.Slice(rows, func(i, j int) bool { return auditRowBefore(rows[i], rows[j]) })
 	keys := make(map[string]string, len(rows))
@@ -264,33 +428,57 @@ func (r *FileUserRequestAuditRepository) makeDocument(rows []*service.UserReques
 	}
 	return &auditDiskConversation{Version: 1, UserRequestAuditConversation: &service.UserRequestAuditConversation{ID: id, UserLabel: "#" + strconv.FormatInt(rows[0].UserID, 10), RequestCount: len(rows), Messages: service.BuildUserRequestAuditTranscript(rows), Requests: rows}, LogicalKeys: keys}
 }
-func (r *FileUserRequestAuditRepository) persistRowLocked(ctx context.Context, row *service.UserRequestAudit) (err error) {
-	defer func() {
-		if err != nil {
-			r.index = nil
-		}
-	}()
-	metas := make([]*service.UserRequestAudit, 0, len(r.index)+1)
-	proofs := make(map[int64]service.UserRequestAuditContinuityProof, len(r.index)+1)
+
+// persistRow publishes only the conversations a single row can affect. It never
+// regroups the whole archive and never holds mu across payload encoding.
+func (r *FileUserRequestAuditRepository) persistRow(ctx context.Context, row *service.UserRequestAudit) error {
+	r.ioMu.Lock()
+	defer r.ioMu.Unlock()
+	if err := r.repairStaleDocuments(ctx); err != nil {
+		return err
+	}
+	if err := r.ensureIndex(ctx); err != nil {
+		return err
+	}
+
+	// Only the owner/API-key scope this row can merge with takes part in
+	// regrouping. That scope is one caller's captures, not the whole archive.
+	userID, apiKeyID := row.UserID, row.APIKeyID
+	metas := make([]*service.UserRequestAudit, 0, 16)
+	proofs := make(map[int64]service.UserRequestAuditContinuityProof, 16)
+	r.mu.Lock()
+	if r.index == nil {
+		r.mu.Unlock()
+		return errors.New("audit archive index is unavailable")
+	}
 	for id, entry := range r.index {
-		if id == row.ID {
+		if id == row.ID || entry.row.UserID != userID || entry.row.APIKeyID != apiKeyID {
 			continue
 		}
-		copy := entry.row
-		metas = append(metas, &copy)
+		if r.staleDocs[entry.conversationID] {
+			stale := entry.conversationID
+			r.mu.Unlock()
+			return fmt.Errorf("audit archive is recovering conversation %d", stale)
+		}
+		metadata := entry.row
+		metas = append(metas, &metadata)
 		proofs[id] = entry.proof
 	}
-	meta := auditMetadata(row)
-	metas = append(metas, &meta)
+	r.mu.Unlock()
+
+	summary := auditMetadata(row)
+	metas = append(metas, &summary)
 	proofs[row.ID] = service.UserRequestAuditProof(row)
 	groups := groupAuditConversationsWithProof(metas, proofs)
+
 	loaded := make(map[int64]*auditDiskConversation)
 	changed := make([]*auditDiskConversation, 0)
-	keep := make(map[int64]bool)
+	keep := make(map[int64]bool, len(groups))
 	for _, group := range groups {
 		id := group.representative.ID
 		keep[id] = true
 		needs := false
+		r.mu.Lock()
 		for _, m := range group.rows {
 			old, ok := r.index[m.ID]
 			needs = needs || m.ID == row.ID || !ok || old.conversationID != id
@@ -298,6 +486,7 @@ func (r *FileUserRequestAuditRepository) persistRowLocked(ctx context.Context, r
 		if existing, ok := r.documents[id]; !ok || existing.summary.RequestCount != len(group.rows) {
 			needs = true
 		}
+		r.mu.Unlock()
 		if !needs {
 			continue
 		}
@@ -307,15 +496,18 @@ func (r *FileUserRequestAuditRepository) persistRowLocked(ctx context.Context, r
 				full = append(full, row)
 				continue
 			}
-			entry := r.index[m.ID]
-			doc := loaded[entry.conversationID]
+			r.mu.Lock()
+			conversationID := r.index[m.ID].conversationID
+			r.mu.Unlock()
+			doc := loaded[conversationID]
 			if doc == nil {
 				var e error
-				doc, e = readAuditConversation(r.conversationPath(entry.conversationID))
+				doc, e = r.loadAuditDocument(ctx, conversationID)
 				if e != nil {
+					r.invalidateDocuments(conversationID)
 					return e
 				}
-				loaded[entry.conversationID] = doc
+				loaded[conversationID] = doc
 			}
 			found := false
 			for _, prior := range doc.Requests {
@@ -326,36 +518,50 @@ func (r *FileUserRequestAuditRepository) persistRowLocked(ctx context.Context, r
 				}
 			}
 			if !found {
+				r.invalidateDocuments(conversationID)
 				return fmt.Errorf("audit request %d missing from file", m.ID)
 			}
 		}
 		changed = append(changed, r.makeDocument(full, id))
 	}
+
+	// Retire only documents inside this scope that the recompute dropped; other
+	// documents keep their identity regardless of what this row did.
 	obsolete := make([]int64, 0)
-	for id := range r.documents {
-		if !keep[id] {
-			obsolete = append(obsolete, id)
+	r.mu.Lock()
+	for id, meta := range r.documents {
+		if keep[id] || meta.summary.UserID != userID || meta.summary.APIKeyID != apiKeyID {
+			continue
 		}
+		obsolete = append(obsolete, id)
 	}
-	if err = r.commitDocumentsLocked(ctx, changed, obsolete); err != nil {
+	r.mu.Unlock()
+
+	if err := r.commitDocuments(ctx, changed, obsolete); err != nil {
 		return err
 	}
-	for _, id := range obsolete {
-		delete(r.documents, id)
+	if err := r.syncSQLDocuments(ctx, changed, obsolete, false); err != nil {
+		// Files are authoritative. A metadata-projection failure must never lose
+		// a capture; the next full index build reconciles SQL again.
+		slog.Warn("user_request_audit.sql_sync_failed", "error", err)
 	}
-	for _, doc := range changed {
-		r.indexDocumentLocked(doc)
-	}
-	return r.syncSQLDocumentsLocked(ctx, changed, obsolete, false)
+	return nil
 }
+
 func (r *FileUserRequestAuditRepository) Create(ctx context.Context, row *service.UserRequestAudit) error {
 	if row == nil {
 		return nil
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
+	if err := r.ensureIndex(ctx); err != nil {
 		return err
+	}
+	if err := r.repairStaleDocuments(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.index == nil {
+		r.mu.Unlock()
+		return errors.New("audit archive index is unavailable")
 	}
 	now := time.Now().UTC()
 	if row.CreatedAt.IsZero() {
@@ -375,6 +581,7 @@ func (r *FileUserRequestAuditRepository) Create(ctx context.Context, row *servic
 		r.state.NextID = row.ID
 	}
 	if err := r.saveStateLocked(); err != nil {
+		r.mu.Unlock()
 		return err
 	}
 	if row.ConversationKey == "" {
@@ -386,34 +593,40 @@ func (r *FileUserRequestAuditRepository) Create(ctx context.Context, row *servic
 			row.ConversationKey = "request:" + strconv.FormatInt(row.ID, 10)
 		}
 	}
-	return r.persistRowLocked(ctx, row)
+	r.mu.Unlock()
+	return r.persistRow(ctx, row)
 }
+
 func (r *FileUserRequestAuditRepository) Complete(ctx context.Context, c *service.UserRequestAuditCompletion) error {
 	if c == nil {
 		return nil
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
+	if err := r.ensureIndex(ctx); err != nil {
 		return err
 	}
-	id, ok := r.logicalIndex[c.LogicalKey]
+	if err := r.repairStaleDocuments(ctx); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	entry, ok := r.index[r.logicalIndex[c.LogicalKey]]
+	r.mu.Unlock()
 	if !ok {
 		return sql.ErrNoRows
 	}
-	entry := r.index[id]
-	doc, err := readAuditConversation(r.conversationPath(entry.conversationID))
+	doc, err := r.loadAuditDocument(ctx, entry.conversationID)
 	if err != nil {
+		r.invalidateDocuments(entry.conversationID)
 		return err
 	}
 	var row *service.UserRequestAudit
 	for _, candidate := range doc.Requests {
-		if candidate.ID == id {
+		if candidate.ID == entry.row.ID {
 			row = candidate
 			break
 		}
 	}
 	if row == nil {
+		r.invalidateDocuments(entry.conversationID)
 		return sql.ErrNoRows
 	}
 	row.UpdatedAt = time.Now().UTC()
@@ -450,19 +663,33 @@ func (r *FileUserRequestAuditRepository) Complete(ctx context.Context, c *servic
 			row.Metadata[key] = value
 		}
 	}
-	return r.persistRowLocked(ctx, row)
+	return r.persistRow(ctx, row)
 }
-func (r *FileUserRequestAuditRepository) GetConversation(ctx context.Context, id int64) (*service.UserRequestAuditConversation, error) {
+
+// resolveConversationFile resolves the payload path for a request or
+// conversation id, waiting only for the index and never for a payload rewrite.
+func (r *FileUserRequestAuditRepository) resolveConversationFile(ctx context.Context, id int64) (string, int64, error) {
+	if err := r.ensureIndex(ctx); err != nil {
+		return "", 0, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
-		return nil, err
-	}
 	entry, ok := r.index[id]
 	if !ok {
-		return nil, sql.ErrNoRows
+		return "", 0, sql.ErrNoRows
 	}
-	doc, err := readAuditConversation(r.conversationPath(entry.conversationID))
+	if r.staleDocs[entry.conversationID] {
+		return "", 0, fmt.Errorf("audit conversation %d is being recovered", entry.conversationID)
+	}
+	return r.conversationPath(entry.conversationID), entry.conversationID, nil
+}
+
+func (r *FileUserRequestAuditRepository) GetConversation(ctx context.Context, id int64) (*service.UserRequestAuditConversation, error) {
+	path, _, err := r.resolveConversationFile(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := readAuditConversation(path)
 	if err != nil {
 		return nil, err
 	}
@@ -472,105 +699,71 @@ func (r *FileUserRequestAuditRepository) GetConversation(ctx context.Context, id
 	doc.UserLabel = doc.Requests[0].UserLabel
 	return doc.UserRequestAuditConversation, nil
 }
+
 func (r *FileUserRequestAuditRepository) GetByID(ctx context.Context, id int64) (*service.UserRequestAudit, error) {
-	conversation, err := r.GetConversation(ctx, id)
+	path, _, err := r.resolveConversationFile(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	for _, row := range conversation.Requests {
+	doc, err := readAuditConversation(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range doc.Requests {
 		if row.ID == id {
 			normalizeConversationKey(row)
-			row.ChatML = auditMessagesTranscript(conversation.Messages)
-			row.RequestCount = conversation.RequestCount
+			row.ChatML = auditMessagesTranscript(doc.Messages)
+			row.RequestCount = doc.RequestCount
+			if err = r.labelUsers(ctx, []*service.UserRequestAudit{row}); err != nil {
+				return nil, err
+			}
 			return row, nil
 		}
 	}
 	return nil, sql.ErrNoRows
 }
-func (r *FileUserRequestAuditRepository) finishDeletesLocked(ctx context.Context) error {
-	ids := r.state.DeleteIDs
-	if r.state.Clear {
-		files, err := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
-		if err != nil {
-			return err
-		}
-		for _, path := range files {
-			if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
-	} else {
-		for _, id := range ids {
-			if err := os.Remove(r.conversationPath(id)); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
-	}
-	if r.state.Clear {
-		if err := os.RemoveAll(r.root + "-migration-backup"); err != nil {
-			return err
-		}
-		if err := auditSyncDirectory(filepath.Dir(r.root)); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(filepath.Join(r.root, "pending")); err != nil {
-			return err
-		}
-	}
-	if r.state.Clear || len(ids) > 0 {
-		if err := auditSyncDirectory(filepath.Join(r.root, "conversations")); err != nil {
-			return err
-		}
-	}
-	if r.legacy != nil && (r.state.Clear || len(ids) > 0) {
-		if r.state.Clear {
-			if _, err := r.legacy.db.ExecContext(ctx, "DELETE FROM user_request_audit_conversations"); err != nil {
-				return err
-			}
-		} else {
-			for _, id := range ids {
-				if _, err := r.legacy.db.ExecContext(ctx, "DELETE FROM user_request_audit_conversations WHERE id=$1", id); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	if r.state.Clear || len(ids) > 0 {
-		r.state.Clear = false
-		r.state.DeleteIDs = nil
-		return r.saveStateLocked()
-	}
-	return nil
-}
+
 func (r *FileUserRequestAuditRepository) Clear(ctx context.Context) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
+	r.ioMu.Lock()
+	defer r.ioMu.Unlock()
+	if err := r.ensureIndex(ctx); err != nil {
 		return 0, err
 	}
+	r.mu.Lock()
 	count := int64(len(r.index))
 	r.state.Migrated = true
 	r.state.Clear = true
-	r.index = nil
-	r.documents = nil
-	r.logicalIndex = nil
+	r.state.PendingIDs = nil
+	r.state.ObsoleteIDs = nil
+	r.resetMapsLocked()
+	// Empty maps stay published so readers keep serving (empty) results during
+	// the file sweep instead of triggering another archive scan.
 	if err := r.saveStateLocked(); err != nil {
+		r.mu.Unlock()
 		return 0, err
 	}
-	if err := r.finishDeletesLocked(ctx); err != nil {
+	r.mu.Unlock()
+	if err := r.finishDeletes(ctx); err != nil {
 		return 0, err
+	}
+	if r.legacy != nil {
+		if err := r.syncSQLDocuments(ctx, nil, nil, true); err != nil {
+			return 0, err
+		}
 	}
 	return count, nil
 }
+
 func (r *FileUserRequestAuditRepository) DeleteExpired(ctx context.Context, before time.Time, batchSize int) (int64, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureIndexLocked(ctx); err != nil {
+	r.ioMu.Lock()
+	defer r.ioMu.Unlock()
+	if err := r.ensureIndex(ctx); err != nil {
 		return 0, err
 	}
 	if batchSize <= 0 {
 		batchSize = 500
 	}
+	r.mu.Lock()
 	var count int64
 	for id, doc := range r.documents {
 		if doc.expires.Before(before) && len(r.state.DeleteIDs) < batchSize {
@@ -579,18 +772,27 @@ func (r *FileUserRequestAuditRepository) DeleteExpired(ctx context.Context, befo
 		}
 	}
 	if len(r.state.DeleteIDs) == 0 {
+		r.mu.Unlock()
 		return 0, nil
 	}
-	r.index = nil
+	expired := append([]int64(nil), r.state.DeleteIDs...)
 	if err := r.saveStateLocked(); err != nil {
+		r.mu.Unlock()
 		return 0, err
 	}
-	if err := r.finishDeletesLocked(ctx); err != nil {
+	for _, id := range expired {
+		r.forgetDocumentLocked(id)
+	}
+	r.mu.Unlock()
+	if err := r.finishDeletes(ctx); err != nil {
 		return 0, err
 	}
+	r.mu.Lock()
 	r.lastCleanup = time.Now().UTC()
+	r.mu.Unlock()
 	return count, nil
 }
+
 func normalizeConversationKey(row *service.UserRequestAudit) {
 	if row != nil && row.ResponseID != "" && (strings.HasPrefix(row.ConversationKey, "fallback:") || strings.HasPrefix(row.ConversationKey, "request:")) {
 		row.ConversationKey = "response:" + row.ResponseID
@@ -619,13 +821,49 @@ func (r *FileUserRequestAuditRepository) UserRequestAuditRoot() string {
 	return r.root
 }
 
+// Archive settings (retention and cleanup cadence) live next to the archive so
+// they survive restarts independently of the SQL deployment. Group capture
+// selection is deliberately not stored here; it is a settings-table allowlist.
+type userRequestAuditFileConfig struct {
+	RetentionDays        int `json:"retention_days"`
+	CleanupIntervalHours int `json:"cleanup_interval_hours"`
+}
+
+func (r *FileUserRequestAuditRepository) configPath() string {
+	return filepath.Join(r.root, "config.json")
+}
+
+func (r *FileUserRequestAuditRepository) readConfig() (service.UserRequestAuditConfig, bool) {
+	body, err := os.ReadFile(r.configPath())
+	if err != nil {
+		return service.UserRequestAuditConfig{}, false
+	}
+	var stored userRequestAuditFileConfig
+	if err = json.Unmarshal(body, &stored); err != nil {
+		return service.UserRequestAuditConfig{}, false
+	}
+	return service.UserRequestAuditConfig{RetentionDays: stored.RetentionDays, CleanupIntervalHours: stored.CleanupIntervalHours}, true
+}
+
+func (r *FileUserRequestAuditRepository) GetAuditConfig() service.UserRequestAuditConfig {
+	cfg, ok := r.readConfig()
+	if !ok {
+		return service.UserRequestAuditConfig{}
+	}
+	return cfg
+}
+
+func (r *FileUserRequestAuditRepository) SetAuditConfig(cfg service.UserRequestAuditConfig) error {
+	return auditAtomicJSON(r.configPath(), userRequestAuditFileConfig{RetentionDays: cfg.RetentionDays, CleanupIntervalHours: cfg.CleanupIntervalHours})
+}
+
 var _ service.UserRequestAuditRepository = (*FileUserRequestAuditRepository)(nil)
 
+// StorageStatus reads disk usage and file sizes without any repository lock, so
+// a status poll never waits for capture work.
 func (r *FileUserRequestAuditRepository) StorageStatus() service.UserRequestAuditStorageStatus {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := service.UserRequestAuditStorageStatus{LastCleanup: r.lastCleanup}
-	out.DiskTotalBytes, out.DiskFreeBytes, out.PauseReason = r.diskStatusLocked(context.Background())
+	out := service.UserRequestAuditStorageStatus{}
+	out.DiskTotalBytes, out.DiskFreeBytes, out.PauseReason = r.diskStatus(context.Background())
 	out.RecordingPaused = out.PauseReason != ""
 	files, _ := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
 	out.FileCount = len(files)
@@ -642,32 +880,14 @@ func (r *FileUserRequestAuditRepository) StorageStatus() service.UserRequestAudi
 			out.Oldest = st.ModTime()
 		}
 	}
+	r.mu.Lock()
+	out.LastCleanup = r.lastCleanup
+	r.mu.Unlock()
 	return out
 }
-func (r *FileUserRequestAuditRepository) configPath() string {
-	return filepath.Join(r.root, "config.json")
-}
-func (r *FileUserRequestAuditRepository) readConfig() (service.UserRequestAuditConfig, bool) {
-	var cfg service.UserRequestAuditConfig
-	b, err := os.ReadFile(r.configPath())
-	if err != nil || json.Unmarshal(b, &cfg) != nil {
-		return cfg, false
-	}
-	return cfg, true
-}
-func (r *FileUserRequestAuditRepository) GetAuditConfig() service.UserRequestAuditConfig {
-	if cfg, ok := r.readConfig(); ok {
-		return cfg
-	}
-	return service.UserRequestAuditConfig{CleanupIntervalHours: service.UserRequestAuditDefaultCleanupIntervalHours}
-}
-func (r *FileUserRequestAuditRepository) SetAuditConfig(cfg service.UserRequestAuditConfig) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return auditAtomicJSON(r.configPath(), cfg)
-}
 
-func (r *FileUserRequestAuditRepository) diskStatusLocked(ctx context.Context) (int64, int64, string) {
+// diskStatus returns total bytes, free bytes and a pause reason.
+func (r *FileUserRequestAuditRepository) diskStatus(ctx context.Context) (int64, int64, string) {
 	path, err := filepath.Abs(r.root)
 	if err != nil {
 		return 0, 0, "disk space unavailable"
@@ -700,8 +920,10 @@ func (r *FileUserRequestAuditRepository) diskStatusLocked(ctx context.Context) (
 	}
 	return total, free, ""
 }
-func (r *FileUserRequestAuditRepository) checkDiskLocked(ctx context.Context) error {
-	_, _, reason := r.diskStatusLocked(ctx)
+
+// checkDisk gates every publication. It takes no repository lock.
+func (r *FileUserRequestAuditRepository) checkDisk(ctx context.Context) error {
+	_, _, reason := r.diskStatus(ctx)
 	if reason != "" {
 		return fmt.Errorf("audit recording paused: %s", reason)
 	}

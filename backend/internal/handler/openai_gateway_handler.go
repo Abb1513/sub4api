@@ -176,6 +176,9 @@ type grokMediaEligibilityProber interface {
 
 const maxOpenAIFirstOutputTimeoutSwitches = 1
 
+// openAIResponsesNonstreamKeepaliveInterval 远小于 Cloudflare 的 100 秒首字节超时。
+const openAIResponsesNonstreamKeepaliveInterval = 20 * time.Second
+
 func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bool {
 	return result.SucceededForScheduling()
 }
@@ -626,6 +629,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	if userReleaseFunc != nil {
 		defer userReleaseFunc()
 	}
+	stopJSONKeepalive := func() {}
+	jsonKeepaliveStarted := false
+	defer func() { stopJSONKeepalive() }()
 
 	// 2. Re-check billing eligibility after wait
 	if err := h.billingCacheService.CheckBillingEligibility(c.Request.Context(), apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
@@ -809,6 +815,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 		// Forward request
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
+		// 慢速自建上游的非流式响应：等待期间写 JSON 前导空白，避免 Cloudflare
+		// 100 秒首字节超时（客户端放弃后只会重发同一个长请求）。
+		if !reqStream && !jsonKeepaliveStarted && account.IsResponsesNonstreamKeepaliveEnabled() {
+			stopJSONKeepalive = service.StartOpenAIImagesJSONKeepalive(c, openAIResponsesNonstreamKeepaliveInterval)
+			jsonKeepaliveStarted = true
+		}
 		forwardStart := time.Now()
 		// 用扣除非语义心跳字节的口径快照：心跳注释不构成语义响应，
 		// 不能因心跳字节变化而放弃 failover 换号（#3887）。

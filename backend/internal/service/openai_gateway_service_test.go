@@ -175,8 +175,9 @@ func TestOpenAIGatewayService_ForwardAsAnthropic_CapacityShedReturnsRequestScope
 	require.True(t, failoverErr.ShouldRetryNextAccount())
 	require.True(t, failoverErr.RetryableOnSameAccount)
 	require.True(t, failoverErr.RequestScopedTransient)
-	require.Zero(t, repo.modelRateLimitAccountID, "request-scoped capacity shedding must not change account health")
-	require.Empty(t, repo.modelRateLimitKey)
+	// 容量降载不再早退：命中账号配置的 temp_unschedulable 规则后必须写模型级冷却。
+	require.Equal(t, int64(5099), repo.modelRateLimitAccountID, "configured temp-unschedulable rule must fire for capacity shed")
+	require.Equal(t, "gpt-5.4", repo.modelRateLimitKey)
 	require.False(t, IsResponseCommitted(c))
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Empty(t, rec.Body.String())
@@ -3250,7 +3251,7 @@ func TestOpenAIBuildUpstreamRequestOAuthMessagesBridgeUsesSessionOnly(t *testing
 	require.Empty(t, req.Header.Get("originator"))
 }
 
-func TestOpenAIBuildUpstreamRequestOAuthResponsesPreservesCallerBeta(t *testing.T) {
+func TestOpenAIBuildUpstreamRequestOAuthResponsesProjectsOfficialBetaLine(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	makeRequest := func(betaValues ...string) *gin.Context {
 		rec := httptest.NewRecorder()
@@ -3265,18 +3266,21 @@ func TestOpenAIBuildUpstreamRequestOAuthResponsesPreservesCallerBeta(t *testing.
 	oauth := &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"chatgpt_account_id": "chatgpt-acc"}}
 	apiKey := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{"api_key": "test-api-key"}}
 
-	t.Run("preserves caller multi-agent beta", func(t *testing.T) {
+	// 官方 HTTP 业务头集合由 build_responses_headers 产生，OpenAI-Beta 只在
+	// WS 握手写（client.rs:1314-1330）；Codex OAuth 的 /responses 出站线上，
+	// 无论入站声明了什么 beta token，收口后该头必须整体缺席。
+	t.Run("caller multi-agent beta is projected off the HTTP lane", func(t *testing.T) {
 		c := makeRequest("responses_multi_agent=v1")
 		req, err := svc.buildUpstreamRequest(c.Request.Context(), c, oauth, []byte(`{"model":"gpt-5.5","input":"hello"}`), "token", true, "", false)
 		require.NoError(t, err)
-		require.Equal(t, "responses_multi_agent=v1", req.Header.Get("OpenAI-Beta"))
+		require.Empty(t, req.Header.Values("OpenAI-Beta"))
 	})
 
-	t.Run("preserves mixed beta tokens and removes legacy token", func(t *testing.T) {
+	t.Run("mixed caller beta is projected off the HTTP lane", func(t *testing.T) {
 		c := makeRequest("responses_multi_agent=v1, responses=experimental", "future_feature=v2")
 		req, err := svc.buildUpstreamRequest(c.Request.Context(), c, oauth, []byte(`{"model":"gpt-5.5","input":"hello"}`), "token", true, "", false)
 		require.NoError(t, err)
-		require.Equal(t, []string{"responses_multi_agent=v1", "future_feature=v2"}, req.Header.Values("OpenAI-Beta"))
+		require.Empty(t, req.Header.Values("OpenAI-Beta"))
 	})
 
 	t.Run("absent beta remains absent", func(t *testing.T) {

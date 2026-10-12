@@ -500,6 +500,18 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 		return nil, infraerrors.BadRequest("INVALID_CODEX_HARVEST_PROXY", err.Error())
 	}
 	updates[SettingKeyOpenAICodexTicketHarvestProxyURL] = strings.TrimSpace(settings.OpenAICodexTicketHarvestProxyURL)
+	// 自动降智检测：nil = 请求未携带该配置，跳过写入以保留既有值（与
+	// DefaultPlatformQuotas 的整体替换语义一致）；非 nil 时先整体校验再落库。
+	if settings.CodexAutoDegradationCheck != nil {
+		if err := ValidateCodexAutoDegradationCheckSettings(settings.CodexAutoDegradationCheck); err != nil {
+			return nil, err
+		}
+		blob, err := json.Marshal(settings.CodexAutoDegradationCheck)
+		if err != nil {
+			return nil, fmt.Errorf("marshal codex auto degradation check settings: %w", err)
+		}
+		updates[SettingKeyCodexAutoDegradationCheck] = string(blob)
+	}
 	// SettingKeyOpenAICodexClientVersionSynced 由自动同步任务独占写入，此处不得覆盖，
 	// 否则面板保存会把同步结果清空。
 	updates[SettingKeyClaudeCodeClientVersion] = NormalizeClaudeCodeClientVersion(settings.ClaudeCodeClientVersion)

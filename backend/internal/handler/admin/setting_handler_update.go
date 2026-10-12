@@ -264,6 +264,9 @@ type UpdateSettingsRequest struct {
 	OpenAICodexTicketHarvestProxyURL       string  `json:"openai_codex_ticket_harvest_proxy_url"`
 	OpenAICodexTicketPromptTemplate        *string `json:"openai_codex_ticket_prompt_template"`
 
+	// 自动降智检测运行器配置（nil = 不修改，非 nil = 整体校验后替换）。
+	CodexAutoDegradationCheck *service.CodexAutoDegradationCheckSettings `json:"codex_auto_degradation_check"`
+
 	// codex_cli_only 加固（global-only）
 	MinCodexVersion                      string `json:"min_codex_version"`
 	MaxCodexVersion                      string `json:"max_codex_version"`
@@ -1534,6 +1537,9 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		DefaultPlatformQuotas:       req.DefaultPlatformQuotas,
 		AccountSchedulingThresholds: req.AccountSchedulingThresholds,
 
+		// 自动降智检测（nil = 本次请求未携带，buildSystemSettingsUpdates 跳过写入）
+		CodexAutoDegradationCheck: req.CodexAutoDegradationCheck,
+
 		RegistrationEnabled:                 req.RegistrationEnabled,
 		EmailVerifyEnabled:                  req.EmailVerifyEnabled,
 		RegistrationEmailSuffixWhitelist:    req.RegistrationEmailSuffixWhitelist,
@@ -2399,6 +2405,7 @@ func (h *SettingHandler) UpdateSettings(c *gin.Context) {
 		OpenAICodexTicketHarvestProxyConfigured:                strings.TrimSpace(updatedSettings.OpenAICodexTicketHarvestProxyURL) != "",
 		OpenAICodexTicketPromptTemplate:                        service.EffectiveCodexProbeTemplate(updatedSettings.OpenAICodexTicketPromptTemplate),
 		OpenAICodexTicketPromptTemplateDefault:                 service.DefaultCodexProbeTemplate(),
+		CodexAutoDegradationCheck:                              updatedSettings.CodexAutoDegradationCheck,
 		MinCodexVersion:                                        updatedSettings.MinCodexVersion,
 		MaxCodexVersion:                                        updatedSettings.MaxCodexVersion,
 		CodexCLIOnlyBlacklist:                                  updatedSettings.CodexCLIOnlyBlacklist,

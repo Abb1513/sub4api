@@ -3876,6 +3876,108 @@ func (r *accountRepository) ListDueUpstreamBillingProbeAccounts(ctx context.Cont
 	return out, nil
 }
 
+// ListDueCodexAutoDegradationCheckAccounts 返回已到期（或首次运行、从未检查
+// 过）的自动降智检测候选账号，按 next_check_at 升序（未设置优先）限制 limit。
+//
+// 候选口径 = 诊断面板的账号口径：OpenAI 平台、oauth/setup-token、active。
+// 刻意不按 temp_unschedulable 过滤——被封锁（无论谁写的）的账号必须继续
+// 入选，否则封锁账号永远不会被复查。时间戳解析与
+// ListDueUpstreamBillingProbeAccounts 相同：Go 侧 RFC3339Nano 可能有 9 位
+// 微秒以上精度，jsonpath datetime() 只认 6 位，先截断再解析，否则所有
+// 时间都会被判为非法、排序退化为按 id。
+func (r *accountRepository) ListDueCodexAutoDegradationCheckAccounts(ctx context.Context, now time.Time, limit int) ([]service.Account, error) {
+	if limit <= 0 {
+		return []service.Account{}, nil
+	}
+	if r.sql == nil {
+		return nil, errors.New("account repository SQL executor not configured")
+	}
+
+	rows, err := r.sql.QueryContext(ctx, `
+	WITH candidates AS (
+		SELECT
+			id,
+			extra #>> '{codex_degradation_check,next_check_at}' AS next_check_at
+		FROM accounts
+		WHERE deleted_at IS NULL
+			AND status = 'active'
+			AND platform = 'openai'
+			AND type IN ('oauth', 'setup-token')
+	), parsed AS MATERIALIZED (
+		SELECT
+			id,
+			next_check_at,
+			next_check_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$' AS rfc3339_shape,
+			jsonb_path_query_first_tz(
+				jsonb_build_object(
+					'value',
+					replace(regexp_replace(regexp_replace(
+						next_check_at,
+						'(\.[0-9]{6})[0-9]+(Z|[+-][0-9]{2}:[0-9]{2})$',
+						'\1\2'
+					), 'Z$', '+00:00'), 'T', ' ')
+				),
+				'$.value.datetime()',
+				'{}'::jsonb,
+				true
+			) #>> '{}' AS parsed_next_check_at
+		FROM candidates
+	), normalized AS (
+		SELECT
+			id,
+			next_check_at,
+			parsed_next_check_at,
+			rfc3339_shape AND parsed_next_check_at IS NOT NULL AS valid_next_check_at
+		FROM parsed
+	)
+	SELECT id
+	FROM normalized
+	WHERE next_check_at IS NULL
+		OR NOT valid_next_check_at
+		OR CASE WHEN valid_next_check_at THEN parsed_next_check_at::timestamptz <= $1 ELSE FALSE END
+	ORDER BY
+		CASE
+			WHEN next_check_at IS NULL OR NOT valid_next_check_at
+			THEN 0
+			ELSE 1
+		END ASC,
+		CASE WHEN valid_next_check_at THEN parsed_next_check_at::timestamptz END ASC NULLS FIRST,
+		id ASC
+	LIMIT $2
+	`, now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make([]int64, 0, limit)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return []service.Account{}, nil
+	}
+
+	accounts, err := r.GetByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]service.Account, 0, len(accounts))
+	for _, account := range accounts {
+		if account != nil {
+			out = append(out, *account)
+		}
+	}
+	return out, nil
+}
+
 // nowUTC is a SQL expression to generate a UTC RFC3339 timestamp string.
 const nowUTC = `to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`
 

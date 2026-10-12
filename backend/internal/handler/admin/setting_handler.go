@@ -313,6 +313,7 @@ func (h *SettingHandler) GetSettings(c *gin.Context) {
 		OpenAICodexTicketHarvestProxyConfigured:                strings.TrimSpace(settings.OpenAICodexTicketHarvestProxyURL) != "",
 		OpenAICodexTicketPromptTemplate:                        service.EffectiveCodexProbeTemplate(settings.OpenAICodexTicketPromptTemplate),
 		OpenAICodexTicketPromptTemplateDefault:                 service.DefaultCodexProbeTemplate(),
+		CodexAutoDegradationCheck:                              settings.CodexAutoDegradationCheck,
 		MinCodexVersion:                                        settings.MinCodexVersion,
 		MaxCodexVersion:                                        settings.MaxCodexVersion,
 		CodexCLIOnlyBlacklist:                                  settings.CodexCLIOnlyBlacklist,

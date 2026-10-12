@@ -488,6 +488,11 @@ func diffSettings(before *service.SystemSettings, after *service.SystemSettings,
 	if before.OpenAICodexTicketEnabled != after.OpenAICodexTicketEnabled {
 		changed = append(changed, "openai_codex_ticket_enabled")
 	}
+	// 自动降智检测：after 为 nil 表示本次请求未携带该配置（不修改），不计变更。
+	if req.CodexAutoDegradationCheck != nil &&
+		!equalCodexAutoDegradationCheckSettings(before.CodexAutoDegradationCheck, after.CodexAutoDegradationCheck) {
+		changed = append(changed, service.SettingKeyCodexAutoDegradationCheck)
+	}
 	if before.OpenAICodexTicketHarvestProxyURL != after.OpenAICodexTicketHarvestProxyURL {
 		changed = append(changed, "openai_codex_ticket_harvest_proxy_url")
 	}
@@ -884,4 +889,18 @@ func stringSetting(value *string, fallback string) string {
 		return fallback
 	}
 	return *value
+}
+
+// equalCodexAutoDegradationCheckSettings 比较自动降智检测配置；
+// 模型列表按顺序整体比较（顺序即管理员选择的一部分）。
+func equalCodexAutoDegradationCheckSettings(before, after *service.CodexAutoDegradationCheckSettings) bool {
+	if before == nil || after == nil {
+		return before == after
+	}
+	if before.Enabled != after.Enabled ||
+		before.IntervalMinutes != after.IntervalMinutes ||
+		before.BlockMinutes != after.BlockMinutes {
+		return false
+	}
+	return equalStringSlice(before.Models, after.Models)
 }

@@ -2,15 +2,14 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick, ref } from 'vue'
 import CodexDiagnosticModal from '../CodexDiagnosticModal.vue'
-import Select from '@/components/common/Select.vue'
 import zhAccounts from '@/i18n/locales/zh/admin/accounts'
 import type { Account } from '@/types'
 
-const { events, fingerprint, ownKeys, invalidation, diagnose, getById, harvest } = vi.hoisted(() => ({
-  events: vi.fn(), fingerprint: vi.fn(), ownKeys: vi.fn(), invalidation: vi.fn(), diagnose: vi.fn(), getById: vi.fn(), harvest: vi.fn()
+const { events, fingerprint, invalidation, diagnose, getById, harvest } = vi.hoisted(() => ({
+  events: vi.fn(), fingerprint: vi.fn(), invalidation: vi.fn(), diagnose: vi.fn(), getById: vi.fn(), harvest: vi.fn()
 }))
 vi.mock('@/api/admin/codexTickets', () => ({
-  events, fingerprint, ownKeys, invalidation, diagnose, harvest, refreshFingerprint: vi.fn()
+  events, fingerprint, invalidation, diagnose, harvest, refreshFingerprint: vi.fn()
 }))
 vi.mock('@/api/admin', () => ({ adminAPI: { accounts: { getById } } }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ locale: ref('zh-CN'), t: (key: string, values: Record<string, string | number> = {}) => {
@@ -29,24 +28,21 @@ function mountModal(value: Account = account) {
     attachTo: document.body,
     global: {
       stubs: {
-        Teleport: true, Select: true, DateRangePicker: true, CodexDiagnosticModelPicker: true, Icon: true
+        Teleport: true, DateRangePicker: true, CodexDiagnosticModelPicker: true, Icon: true
       }
     }
   })
 }
 
 type DiagnosticView = {
-  selectedKey: number | null
   selectedModels: string[]
   runDiagnostic: () => Promise<void>
   cancelDiagnostic: () => void
   showDiagnosticStage: (stage: 'setup' | 'results') => Promise<void>
-  loadKeys: () => Promise<void>
   loadModels: (refresh?: boolean) => Promise<void>
 }
 function configure(wrapper: ReturnType<typeof mountModal>, models = ['gpt-5.6-sol', 'gpt-5.5']) {
   const view = wrapper.vm as unknown as DiagnosticView
-  view.selectedKey = 4
   view.selectedModels = models
   return view
 }
@@ -62,7 +58,6 @@ describe('Codex diagnostic modal', () => {
     vi.resetAllMocks()
     fingerprint.mockResolvedValue({ commit: 'abc123', models: ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-4o'] })
     getById.mockResolvedValue(account)
-    ownKeys.mockResolvedValue([{ id: 4, name: 'Billing Key', status: 'active', quota: 0, quota_used: 0 }, { id: 9, name: 'Other Key', status: 'active', quota: 0, quota_used: 0 }])
 
   })
 
@@ -82,7 +77,7 @@ describe('Codex diagnostic modal', () => {
     expect(start.attributes('disabled')).toBeUndefined()
     await start.trigger('click')
     await flushPromises()
-    expect(diagnose).toHaveBeenCalledWith(19, 4, ['gpt-5.6-sol'], expect.any(AbortSignal))
+    expect(diagnose).toHaveBeenCalledWith(19, ['gpt-5.6-sol'], expect.any(AbortSignal))
     expect(harvest).not.toHaveBeenCalled()
     expect(events).not.toHaveBeenCalled()
     expect(getById).not.toHaveBeenCalled()
@@ -97,23 +92,22 @@ describe('Codex diagnostic modal', () => {
     diagnose.mockImplementationOnce(() => new Promise(resolve => { finishFirst = resolve }))
       .mockResolvedValueOnce({ items: [{ model: 'gpt-5.5', status: 'normal' }] })
     const view = wrapper.vm as unknown as {
-      selectedKey: number | null; selectedModels: string[]; runDiagnostic: () => Promise<void>
+      selectedModels: string[]; runDiagnostic: () => Promise<void>
     }
-    view.selectedKey = 4
     view.selectedModels = ['gpt-5.6-sol', 'gpt-5.5']
     const running = view.runDiagnostic()
     expect(diagnose).toHaveBeenCalledTimes(1)
-    expect(diagnose).toHaveBeenCalledWith(19, 4, ['gpt-5.6-sol'], expect.any(AbortSignal))
+    expect(diagnose).toHaveBeenCalledWith(19, ['gpt-5.6-sol'], expect.any(AbortSignal))
     finishFirst({ items: [{ model: 'gpt-5.6-sol', status: 'normal' }] })
     await running
     await flushPromises()
     expect(diagnose).toHaveBeenCalledTimes(2)
-    expect(diagnose).toHaveBeenLastCalledWith(19, 4, ['gpt-5.5'], expect.any(AbortSignal))
+    expect(diagnose).toHaveBeenLastCalledWith(19, ['gpt-5.5'], expect.any(AbortSignal))
     expect(wrapper.text()).toContain('2 / 2')
     wrapper.unmount()
   })
 
-  it('shows the whole queue before the first response, focuses results and freezes the billing key', async () => {
+  it('shows the whole queue before the first response and focuses results', async () => {
     const first = deferred()
     diagnose.mockImplementationOnce(() => first.promise)
       .mockResolvedValueOnce({ items: [{ model: 'gpt-5.5', status: 'normal' }] })
@@ -130,13 +124,11 @@ describe('Codex diagnostic modal', () => {
     expect(wrapper.find('[role="progressbar"]').attributes('aria-valuenow')).toBe('0')
     expect(document.activeElement?.textContent).toBe('检测进行中')
     expect(diagnose).toHaveBeenCalledTimes(1)
-    view.selectedKey = 9
     view.selectedModels = ['gpt-4o']
     first.resolve({ items: [{ model: 'gpt-5.6-sol', status: 'normal' }] })
     await running
     await flushPromises()
-    expect(diagnose).toHaveBeenLastCalledWith(19, 4, ['gpt-5.5'], expect.any(AbortSignal))
-    expect(wrapper.get('[data-test="diagnostic-key"]').text()).toBe('Billing Key · #4')
+    expect(diagnose).toHaveBeenLastCalledWith(19, ['gpt-5.5'], expect.any(AbortSignal))
     expect(wrapper.findAll('article[data-model]')).toHaveLength(2)
     wrapper.unmount()
   })
@@ -188,7 +180,7 @@ describe('Codex diagnostic modal', () => {
     expect(diagnose).toHaveBeenCalledTimes(2)
     view.cancelDiagnostic()
     await nextTick()
-    expect(diagnose.mock.calls[1][3].aborted).toBe(true)
+    expect(diagnose.mock.calls[1][2].aborted).toBe(true)
     expect(wrapper.get('[data-model="gpt-5.6-sol"]').attributes('data-status')).toBe('normal')
     expect(wrapper.get('[data-model="gpt-5.5"]').attributes('data-status')).toBe('stopped')
     expect(wrapper.get('[data-model="gpt-5.4"]').attributes('data-status')).toBe('not_run')
@@ -232,12 +224,12 @@ describe('Codex diagnostic modal', () => {
     newRequest.resolve({ items: [{ model: 'gpt-5.5', status: 'normal' }] })
     await newRun
     expect(diagnose).toHaveBeenCalledTimes(2)
-    expect(diagnose).toHaveBeenLastCalledWith(change === 'account' ? 20 : 19, 4, ['gpt-5.5'], expect.any(AbortSignal))
+    expect(diagnose).toHaveBeenLastCalledWith(change === 'account' ? 20 : 19, ['gpt-5.5'], expect.any(AbortSignal))
     wrapper.unmount()
   })
 
-  it('returns to retest with previous choices and results without starting another billable request', async () => {
-    diagnose.mockImplementation((_accountID: number, _keyID: number, requested: string[]) => Promise.resolve({ items: [{ model: requested[0], status: 'normal' }] }))
+  it('returns to retest with previous choices and results without starting another request', async () => {
+    diagnose.mockImplementation((_accountID: number, requested: string[]) => Promise.resolve({ items: [{ model: requested[0], status: 'normal' }] }))
     const wrapper = mountModal()
     await flushPromises()
     const view = configure(wrapper, ['gpt-5.6-sol'])
@@ -247,29 +239,49 @@ describe('Codex diagnostic modal', () => {
     const retest = wrapper.get('[data-action="retest"]')
     expect(retest.text()).toBe('返回重测')
     await retest.trigger('click')
-    expect(view.selectedKey).toBe(4)
     expect(view.selectedModels).toEqual(['gpt-5.6-sol'])
     expect(diagnose).toHaveBeenCalledTimes(1)
-    view.selectedKey = 9
     view.selectedModels = ['gpt-5.5']
     await view.showDiagnosticStage('results')
-    expect(wrapper.get('[data-test="diagnostic-key"]').text()).toBe('Billing Key · #4')
     expect(diagnose).toHaveBeenCalledTimes(1)
     await view.showDiagnosticStage('setup')
     await view.runDiagnostic()
     await flushPromises()
     expect(diagnose).toHaveBeenCalledTimes(2)
-    expect(diagnose).toHaveBeenLastCalledWith(19, 9, ['gpt-5.5'], expect.any(AbortSignal))
+    expect(diagnose).toHaveBeenLastCalledWith(19, ['gpt-5.5'], expect.any(AbortSignal))
     expect(wrapper.find('[data-model="gpt-5.6-sol"]').exists()).toBe(false)
     wrapper.unmount()
   })
-  it('uses the shared searchable Select and excludes ticket and request-policy UI', async () => {
+
+  it('starts without a billing key as soon as models are chosen', async () => {
     const wrapper = mountModal()
     await flushPromises()
-    expect(wrapper.findComponent(Select).props('searchable')).toBe(true)
-    expect(wrapper.findComponent(Select).props('options')).toEqual(expect.arrayContaining([{ value: 4, label: 'Billing Key · #4' }]))
-    expect(wrapper.find('select').exists()).toBe(false)
-    expect(wrapper.find('nav').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('Billing Key')
+    expect(wrapper.text()).toContain('使用当前账号自带凭据发起检测，无需计费 Key。')
+    expect(wrapper.get('[data-action="start"]').attributes('disabled')).toBeDefined()
+    const view = configure(wrapper, ['gpt-5.6-sol'])
+    await nextTick()
+    expect(wrapper.get('[data-action="start"]').attributes('disabled')).toBeUndefined()
+    diagnose.mockResolvedValue({ items: [{ model: 'gpt-5.6-sol', status: 'normal' }] })
+    await view.runDiagnostic()
+    expect(diagnose).toHaveBeenCalledWith(19, ['gpt-5.6-sol'], expect.any(AbortSignal))
+    expect(wrapper.find('[data-model="gpt-5.6-sol"]').attributes('data-status')).toBe('normal')
+    expect(wrapper.text()).not.toContain('Billing Key')
+    wrapper.unmount()
+  })
+
+  it('renders probe failure reason with HTTP status and excludes ticket and request-policy UI', async () => {
+    diagnose.mockResolvedValueOnce({ items: [{ model: 'gpt-5.6-sol', status: 'failed', reason: 'upstream_unavailable', http_status: 502 }] })
+    const wrapper = mountModal()
+    await flushPromises()
+    await configure(wrapper, ['gpt-5.6-sol']).runDiagnostic()
+    await flushPromises()
+    const failed = wrapper.get('[data-model="gpt-5.6-sol"]')
+    expect(failed.attributes('data-status')).toBe('failed')
+    await failed.get('button[aria-expanded]').trigger('click')
+    const expanded = wrapper.get('[data-model="gpt-5.6-sol"]')
+    expect(expanded.text()).toContain('upstream_unavailable')
+    expect(expanded.text()).toContain('HTTP 502')
     expect(wrapper.text()).not.toContain('请求策略')
     expect(wrapper.text()).not.toContain('票据中心')
     expect(wrapper.text()).not.toContain('当前票据')
@@ -278,7 +290,7 @@ describe('Codex diagnostic modal', () => {
     wrapper.unmount()
   })
 
-  it('retries a failed model load independently of successful API keys', async () => {
+  it('retries a failed model load independently', async () => {
     fingerprint.mockRejectedValueOnce(new Error('model list unavailable'))
     const wrapper = mountModal()
     await flushPromises()
@@ -288,42 +300,24 @@ describe('Codex diagnostic modal', () => {
     await flushPromises()
     expect(wrapper.find('[role="alert"]').exists()).toBe(false)
     expect(fingerprint).toHaveBeenCalledTimes(2)
-    expect(ownKeys).toHaveBeenCalledTimes(1)
-    wrapper.unmount()
-  })
-
-  it('retries a failed key load and disables submission without an eligible key', async () => {
-    ownKeys.mockRejectedValueOnce(new Error('keys unavailable')).mockResolvedValueOnce([])
-    const wrapper = mountModal()
-    await flushPromises()
-    expect(wrapper.get('[role="alert"]').text()).toContain('keys unavailable')
-    await wrapper.get('[role="alert"] button').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('没有可用的本人 API Key')
-    expect(wrapper.get('[data-action="start"]').attributes('disabled')).toBeDefined()
-    expect(fingerprint).toHaveBeenCalledTimes(1)
     expect(diagnose).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 
-  it('ignores old key and model loads after changing accounts', async () => {
-    const oldKeys = deferred()
+  it('ignores an old model load after changing accounts', async () => {
     const oldModels = deferred()
-    ownKeys.mockImplementationOnce(() => oldKeys.promise)
     fingerprint.mockImplementationOnce(() => oldModels.promise)
     const wrapper = mountModal()
     await wrapper.setProps({ account: { ...account, id: 20 } })
     await flushPromises()
-    oldKeys.reject(new Error('stale key failure'))
     oldModels.resolve({ commit: 'stale', models: ['stale-model'] })
     await flushPromises()
     expect(wrapper.text()).not.toContain('stale')
-    expect(wrapper.findComponent(Select).props('options')).toEqual(expect.arrayContaining([{ value: 4, label: 'Billing Key · #4' }]))
     expect(wrapper.get('[data-action="start"]').attributes('disabled')).toBeDefined()
     const view = configure(wrapper, ['gpt-5.5'])
     diagnose.mockResolvedValue({ items: [{ model: 'gpt-5.5', status: 'normal' }] })
     await view.runDiagnostic()
-    expect(diagnose).toHaveBeenCalledWith(20, 4, ['gpt-5.5'], expect.any(AbortSignal))
+    expect(diagnose).toHaveBeenCalledWith(20, ['gpt-5.5'], expect.any(AbortSignal))
     wrapper.unmount()
   })
 
@@ -338,7 +332,7 @@ describe('Codex diagnostic modal', () => {
     expect(diagnose).toHaveBeenCalledTimes(1)
     await wrapper.get('button[aria-label="关闭降智检测"]').trigger('click')
     expect(wrapper.emitted('close')).toHaveLength(1)
-    expect(diagnose.mock.calls[0][3].aborted).toBe(true)
+    expect(diagnose.mock.calls[0][2].aborted).toBe(true)
     pending.resolve({ items: [{ model: 'gpt-5.6-sol', status: 'normal' }] })
     await running
     expect(diagnose).toHaveBeenCalledTimes(1)

@@ -3,6 +3,7 @@ package repository
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
+	_ "modernc.org/sqlite"
 )
 
 func auditConversationTestRepository(t *testing.T) *FileUserRequestAuditRepository {
@@ -177,6 +179,82 @@ func TestAuditArchiveDiskGuardAndRecovery(t *testing.T) {
 	after, _ := os.ReadFile(r.conversationPath(row.ID))
 	if !bytes.Equal(before, after) {
 		t.Fatal("paused completion changed evidence")
+	}
+}
+
+// A deployment that never captured a request must stay completely read-only:
+// opening the audit page, rebooting, and re-globbing for legacy archives may
+// not create the archive root, so the disk guard and "no data" state stay true.
+func TestAuditArchiveBootstrapStaysReadOnlyUntilFirstCapture(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DATA_DIR", dir)
+	root := filepath.Join(dir, "user-request-audit")
+	ctx := context.Background()
+
+	r := NewFileUserRequestAuditRepository(nil)
+	r.diskUsage = func(context.Context, string) (int64, int64, error) {
+		return 16 * userRequestAuditMinFreeBytes, 8 * userRequestAuditMinFreeBytes, nil
+	}
+	if _, total, err := r.ListConversations(ctx, service.UserRequestAuditFilter{}); err != nil || total != 0 {
+		t.Fatalf("empty list %d %v", total, err)
+	}
+	if _, _, err := r.List(ctx, service.UserRequestAuditFilter{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ensureIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.ReadDir(root); !os.IsNotExist(err) {
+		t.Fatalf("read-only bootstrap created archive root: %v", err)
+	}
+
+	if err := r.Create(ctx, &service.UserRequestAudit{LogicalKey: "first", RequestChatML: "evidence"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(conversationFiles(t, r)) != 1 {
+		t.Fatal("first capture did not persist")
+	}
+	reopened := NewFileUserRequestAuditRepository(nil)
+	reopened.diskUsage = r.diskUsage
+	if _, total, err := reopened.ListConversations(ctx, service.UserRequestAuditFilter{}); err != nil || total != 1 {
+		t.Fatalf("reopened %d %v", total, err)
+	}
+}
+
+// The audit list must name the account, not just a number: username first, then
+// email, and the numeric fallback only when the users table has neither.
+func TestAuditConversationUserLabelPrefersAccountIdentity(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:audit_user_label?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err = db.Exec(`CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT, email TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO users(id,username,email) VALUES(7,'','who@example.com'),(8,'alice','a@b.c'),(9,'','')`); err != nil {
+		t.Fatal(err)
+	}
+	r := &FileUserRequestAuditRepository{legacy: &UserRequestAuditRepository{db: db}}
+	rows := []*service.UserRequestAudit{
+		{UserID: 7, LogicalKey: "email"},
+		{UserID: 8, LogicalKey: "username"},
+		{UserID: 9, LogicalKey: "anonymous"},
+		{UserID: 404, LogicalKey: "missing"},
+	}
+	if err := r.labelUsers(context.Background(), rows); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"who@example.com (#7)",
+		"alice (#8)",
+		"#9",
+		"#404",
+	}
+	for i := range rows {
+		if rows[i].UserLabel != want[i] {
+			t.Fatalf("row %d label %q want %q", i, rows[i].UserLabel, want[i])
+		}
 	}
 }
 

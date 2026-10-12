@@ -784,13 +784,18 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesStagedFingerprint(t *testi
 	req, err := svc.buildUpstreamRequestOpenAIPassthrough(context.Background(), c, account, body, "test-token")
 	require.NoError(t, err)
 
-	assert.Equal(t, ids.sessionID, req.Header.Get("session_id"), "session 模式下出站 session_id 应为账号级收敛值")
-	assert.Equal(t, ids.installationID, req.Header.Get("x-codex-installation-id"))
+	// 收口后的官方线序：收敛值只体现在 session-id / thread-id / window-id /
+	// x-client-request-id 与 x-codex-turn-metadata；官方从不发的 session_id 与
+	// x-codex-installation-id 头必须缺席（安装 ID 见 turn-metadata/body）。
+	assert.Equal(t, ids.sessionID, req.Header.Get("session-id"), "session 模式下出站 session-id 应为账号级收敛值")
 	assert.Equal(t, ids.windowID, req.Header.Get("x-codex-window-id"))
 	assert.Equal(t, ids.threadID, req.Header.Get("x-client-request-id"))
+	assert.Empty(t, req.Header.Get("session_id"), "official /responses never sends the underscored session header")
+	assert.Empty(t, req.Header.Get("x-codex-installation-id"), "installation id belongs to turn-metadata/body, not a header")
 	turnMetadata := req.Header.Get("x-codex-turn-metadata")
 	require.NotEmpty(t, turnMetadata)
 	assert.Contains(t, turnMetadata, ids.sessionID, "turn-metadata JSON 中的 session_id 应被收敛")
+	assert.Contains(t, turnMetadata, ids.installationID, "turn-metadata JSON 中的 installation_id 应被收敛")
 	assert.Contains(t, turnMetadata, `"sandbox":"seatbelt"`, "turn-metadata 未指定字段应原样保留")
 }
 
@@ -813,8 +818,12 @@ func TestBuildUpstreamRequestOpenAIPassthrough_OffModeKeepsIsolatedSession(t *te
 	req, err := svc.buildUpstreamRequestOpenAIPassthrough(context.Background(), c, account, body, "test-token")
 	require.NoError(t, err)
 
-	assert.NotEmpty(t, req.Header.Get("session_id"))
-	assert.NotEqual(t, resolveConvergedSessionID(testCodexFingerprintSeed), req.Header.Get("session_id"), "off 模式不得收敛 session_id")
+	// off 模式仍走隔离：会话值落在官方 session-id 头上，且不得等于账号级收敛值；
+	// 官方从不发的 session_id / x-codex-installation-id 头由线序收口削平。
+	assert.NotEmpty(t, req.Header.Get("session-id"))
+	assert.NotEqual(t, resolveConvergedSessionID(testCodexFingerprintSeed), req.Header.Get("session-id"), "off 模式不得收敛 session-id")
+	assert.Empty(t, req.Header.Get("session_id"))
+	assert.Empty(t, req.Header.Get("x-codex-installation-id"))
 	assert.NotEmpty(t, req.Header.Get("x-codex-window-id"), "Codex metadata defaults should include a context window")
 }
 

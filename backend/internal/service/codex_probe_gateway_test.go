@@ -37,14 +37,14 @@ func TestCodexProbeBuildersHonorTemplateSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	repo.values[SettingKeyOpenAICodexTicketPromptTemplate] = strings.Replace(custom, "pinned workspace", "updated workspace", 1)
 	svc.settingService.InvalidateCodexProbeTemplateCache()
-	body, headers, err := svc.BuildCodexDiagnosticRequest(pinned, account.ID, "gpt-6-astra", ModelTraceChallenge{Prompt: "diagnostic challenge"})
+	body, headers, err := svc.buildCodexProbeRequest(pinned, account, "gpt-6-astra", ModelTraceChallenge{Prompt: "diagnostic challenge"})
 	require.NoError(t, err)
 	assertCodexProbeIdentity(t, body, headers)
 	require.Contains(t, string(body), "pinned workspace")
 	require.Equal(t, "diagnostic challenge", gjson.GetBytes(body, "input.4.content.0.text").String())
 	require.NotEqual(t, harvestHeaders.Get("session-id"), headers.Get("session-id"))
 	require.Equal(t, harvestHeaders.Get("x-codex-installation-id"), headers.Get("x-codex-installation-id"))
-	body, _, err = svc.BuildCodexDiagnosticRequest(context.Background(), account.ID, "gpt-5.4", ModelTraceChallenge{Prompt: "next model challenge"})
+	body, _, err = svc.buildCodexProbeRequest(context.Background(), account, "gpt-5.4", ModelTraceChallenge{Prompt: "next model challenge"})
 	require.NoError(t, err)
 	require.Contains(t, string(body), "updated workspace")
 }
@@ -74,17 +74,18 @@ func TestCodexProbeGatewayAccountAndFingerprintRewritesStayConsistent(t *testing
 			request, err := svc.buildUpstreamRequest(context.Background(), c, account, encoded, "test-token", true, headers.Get("session-id"), true)
 			require.NoError(t, err)
 			cm := gjson.GetBytes(encoded, "client_metadata")
-			for _, pair := range [][2]string{{"session-id", "session_id"}, {"thread-id", "thread_id"}, {"x-codex-installation-id", "x-codex-installation-id"}, {"x-codex-window-id", "x-codex-window-id"}} {
-				if !openaiAllowedHeaders[pair[0]] && (mode == "off" || mode == "device") {
-					// Normal gateway filtering still applies to optional session/thread headers.
-					require.Empty(t, request.Header.Get(pair[0]), pair[0])
-					continue
-				}
+			// 官方 /responses 只把 session-id / thread-id / window-id 作为头发送，
+			// 安装 ID 只在 body client_metadata 里（见 codex-rs responses.rs /
+			// client.rs）。收口后这些头必须与 client_metadata 一致，且安装 ID 头缺席。
+			for _, pair := range [][2]string{{"session-id", "session_id"}, {"thread-id", "thread_id"}, {"x-codex-window-id", "x-codex-window-id"}} {
 				require.Equal(t, cm.Get(pair[1]).String(), request.Header.Get(pair[0]), pair[0])
 			}
+			require.NotEmpty(t, cm.Get("x-codex-installation-id").String(), "installation id must remain in client_metadata")
+			require.Empty(t, request.Header.Get("x-codex-installation-id"), "official /responses never sends the installation-id header")
+			require.Empty(t, request.Header.Get("session_id"), "official /responses never sends the underscored session header")
 			require.Equal(t, cm.Get("session_id").String(), gjson.GetBytes(encoded, "prompt_cache_key").String())
 			require.JSONEq(t, cm.Get("x-codex-turn-metadata").String(), request.Header.Get("x-codex-turn-metadata"))
-			require.NotEqual(t, headers.Get("x-codex-installation-id"), request.Header.Get("x-codex-installation-id"))
+			require.NotEqual(t, headers.Get("session-id"), request.Header.Get("session-id"))
 			require.Equal(t, "probe challenge", gjson.GetBytes(encoded, "input.4.content.0.text").String())
 		})
 	}

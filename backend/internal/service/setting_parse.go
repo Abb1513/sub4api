@@ -918,6 +918,18 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	}
 	result.OpenAICodexTicketHarvestProxyURL = strings.TrimSpace(settings[SettingKeyOpenAICodexTicketHarvestProxyURL])
 	result.OpenAICodexTicketPromptTemplate = settings[SettingKeyOpenAICodexTicketPromptTemplate]
+	// 自动降智检测：key 缺失或损坏时回显默认值（默认关闭），
+	// 保证读取路径（GET 回显 / 保存合并）永远拿到可用配置。
+	result.CodexAutoDegradationCheck = DefaultCodexAutoDegradationCheckSettings()
+	if raw := strings.TrimSpace(settings[SettingKeyCodexAutoDegradationCheck]); raw != "" {
+		parsed := *DefaultCodexAutoDegradationCheckSettings()
+		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+			slog.Warn("[Setting] parseSettings: unmarshal codex_auto_degradation_check failed", "error", err)
+		} else {
+			normalizeCodexAutoDegradationCheckSettings(&parsed)
+			result.CodexAutoDegradationCheck = &parsed
+		}
+	}
 	// codex_cli_only 加固
 	result.MinCodexVersion = settings[SettingKeyMinCodexVersion]
 	result.MaxCodexVersion = settings[SettingKeyMaxCodexVersion]
