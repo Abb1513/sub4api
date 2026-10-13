@@ -29,6 +29,10 @@ func groupAuditConversations(rows []*service.UserRequestAudit) []auditConversati
 }
 
 func groupAuditConversationsWithProof(rows []*service.UserRequestAudit, proofs map[int64]service.UserRequestAuditContinuityProof) []auditConversation {
+	return groupAuditConversationsWithDependencies(rows, proofs, nil)
+}
+
+func groupAuditConversationsWithDependencies(rows []*service.UserRequestAudit, proofs map[int64]service.UserRequestAuditContinuityProof, dependencies map[int64]int64) []auditConversation {
 	parents := make([]int, len(rows))
 	for i := range parents {
 		parents[i] = i
@@ -116,6 +120,21 @@ func groupAuditConversationsWithProof(rows []*service.UserRequestAudit, proofs m
 			parents[root(child)] = root(parent)
 		}
 	}
+	// Persisted byte dependencies outlive changing response/branch evidence.
+	// Keep them in one retention/deletion unit even if continuity later splits.
+	if len(dependencies) > 0 {
+		byID := make(map[int64]int, len(rows))
+		for i, row := range rows {
+			byID[row.ID] = i
+		}
+		for childID, parentID := range dependencies {
+			child, childOK := byID[childID]
+			parent, parentOK := byID[parentID]
+			if childOK && parentOK && parentID < childID && rows[child].UserID == rows[parent].UserID && rows[child].APIKeyID == rows[parent].APIKeyID {
+				parents[root(child)] = root(parent)
+			}
+		}
+	}
 	groups := make(map[int]int)
 	out := make([]auditConversation, 0)
 	for i, row := range rows {
@@ -160,20 +179,6 @@ func auditRowBefore(a, b *service.UserRequestAudit) bool {
 	return a.CreatedAt.Before(b.CreatedAt)
 }
 
-func auditMatchesFilter(row *service.UserRequestAudit, filter service.UserRequestAuditFilter) bool {
-	if filter.UserID != nil && row.UserID != *filter.UserID || filter.APIKeyID != nil && row.APIKeyID != *filter.APIKeyID || filter.GroupID != nil && !sameGroup(row.GroupID, filter.GroupID) || filter.GroupName != "" && !strings.EqualFold(row.GroupName, filter.GroupName) || filter.Protocol != "" && !strings.EqualFold(row.Protocol, filter.Protocol) || filter.RequestedModel != "" && !strings.EqualFold(row.RequestedModel, filter.RequestedModel) || filter.ResponseID != "" && !strings.EqualFold(row.ResponseID, filter.ResponseID) || filter.ClientRequestID != "" && !strings.EqualFold(row.ClientRequestID, filter.ClientRequestID) || filter.Status != "" && !strings.EqualFold(row.Status, filter.Status) {
-		return false
-	}
-	if filter.StartTime != nil && row.CreatedAt.Before(*filter.StartTime) || filter.EndTime != nil && !row.CreatedAt.Before(*filter.EndTime) {
-		return false
-	}
-	if q := strings.ToLower(strings.TrimSpace(filter.Q)); q != "" {
-		blob := strings.ToLower(row.GroupName + " " + row.Protocol + " " + row.RequestedModel + " " + row.ClientRequestID + " " + row.ResponseID + " " + row.LastError + " " + string(mustJSON(row.Metadata)) + " " + row.RequestChatML + " " + row.ResponseChatML)
-		return strings.Contains(blob, q)
-	}
-	return true
-}
-
 func auditConversationSummary(group auditConversation) *service.UserRequestAudit {
 	row := *group.latest
 	row.ID = group.representative.ID
@@ -188,6 +193,10 @@ func auditConversationSummary(group auditConversation) *service.UserRequestAudit
 }
 
 func (r *FileUserRequestAuditRepository) labelUsers(ctx context.Context, rows []*service.UserRequestAudit) error {
+	return auditLabelUsers(ctx, r.db, rows)
+}
+
+func auditLabelUsers(ctx context.Context, db auditQueryer, rows []*service.UserRequestAudit) error {
 	ids := make(map[int64]bool)
 	args := make([]any, 0)
 	placeholders := make([]string, 0)
@@ -199,10 +208,10 @@ func (r *FileUserRequestAuditRepository) labelUsers(ctx context.Context, rows []
 			placeholders = append(placeholders, "$"+strconv.Itoa(len(args)))
 		}
 	}
-	if len(args) == 0 || r.legacy == nil {
+	if len(args) == 0 {
 		return nil
 	}
-	users, err := r.legacy.db.QueryContext(ctx, `SELECT id,COALESCE(NULLIF(username,''),email,'') FROM users WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	users, err := db.QueryContext(ctx, `SELECT id,COALESCE(NULLIF(username,''),email,'') FROM users WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	if err != nil {
 		return err
 	}
@@ -227,12 +236,6 @@ func (r *FileUserRequestAuditRepository) labelUsers(ctx context.Context, rows []
 		}
 	}
 	return nil
-}
-
-// Rendered export and reader use the same protocol-aware chronological blocks.
-// Original capture bytes remain separately available in requests.
-func auditConversationTranscript(rows []*service.UserRequestAudit) string {
-	return auditMessagesTranscript(service.BuildUserRequestAuditTranscript(rows))
 }
 
 func auditMessagesTranscript(messages []service.UserRequestAuditMessage) string {

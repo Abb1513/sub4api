@@ -1419,6 +1419,19 @@ func newUpstreamDialer() *net.Dialer {
 	}
 }
 
+// isOpenAIUpstreamProtocolMode reports whether a transport serves the OpenAI
+// ChatGPT/Codex upstream lane, whose wire shape is matched against the official
+// Codex client rather than a generic JSON API.
+func isOpenAIUpstreamProtocolMode(protocolMode string) bool {
+	switch protocolMode {
+	case upstreamProtocolModeOpenAIH1, upstreamProtocolModeOpenAIH2,
+		upstreamProtocolModeOpenAIH1Fallback, upstreamProtocolModeOpenAIH1NoReuse:
+		return true
+	default:
+		return false
+	}
+}
+
 // buildUpstreamTransport 构建上游请求的 Transport
 // 使用配置文件中的连接池参数，支持生产环境调优
 //
@@ -1470,6 +1483,13 @@ func buildUpstreamTransport(settings poolSettings, proxyURL *url.URL, protocolMo
 		// 显式禁用 HTTP/2，确保代理不兼容场景回退到 HTTP/1.1。
 		transport.ForceAttemptHTTP2 = false
 		transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	}
+	if isOpenAIUpstreamProtocolMode(protocolMode) {
+		// Go 的 Transport 默认自动注入 `Accept-Encoding: gzip` 并透明解压。官方
+		// Codex 客户端不广告 gzip（reqwest 未开解压 feature），这个头是可被
+		// 上游观测的客户端特征。响应侧解压由本文件的 decompressResponseBody
+		// 按 Content-Encoding 手工处理，禁用后语义不变。
+		transport.DisableCompression = true
 	}
 	if err := proxyutil.ConfigureTransportProxy(transport, proxyURL); err != nil {
 		return nil, err

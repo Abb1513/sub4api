@@ -2,277 +2,157 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strconv"
-
-	"github.com/MACOS-DO/sub4api/internal/service"
+	"time"
 )
 
-// Locking contract (see the note in user_request_audit_file.go):
-//
-//	mu    guards the association maps and the archive journal; sections contain
-//	      map/state operations only, never payload encoding, renames or SQL.
-//	ioMu  serializes archive mutations. Readers never take it.
-//
-// Every helper here snapshots what it needs under mu, performs I/O with no lock
-// held, then publishes the result under mu again.
-
-func (r *FileUserRequestAuditRepository) pendingPath(id int64) string {
-	return filepath.Join(r.root, "pending", strconv.FormatInt(id, 10)+".pending")
+// Deletion never discovers paths from disk. The transaction queues every known
+// immutable payload before deleting membership; the SQL queue survives crashes.
+func (r *FileUserRequestAuditRepository) deleteConversations(ctx context.Context, tx *sql.Tx, ids []int64) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	placeholders, args := auditIDArguments(ids)
+	var count int64
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM user_request_audit_request_index WHERE conversation_id IN ("+placeholders+")", args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO user_request_audit_payload_gc(relative_path) SELECT p.relative_path FROM user_request_audit_payloads p JOIN user_request_audit_request_index q ON q.id=p.request_id WHERE q.conversation_id IN (`+placeholders+`) ON CONFLICT(relative_path) DO NOTHING`, args...)
+	if err != nil {
+		return 0, err
+	}
+	// Explicit child deletes also make the contract independent of SQLite FK pragmas.
+	if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_payloads WHERE request_id IN (SELECT id FROM user_request_audit_request_index WHERE conversation_id IN ("+placeholders+"))", args...); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_request_index WHERE conversation_id IN ("+placeholders+")", args...); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_conversations WHERE id IN ("+placeholders+")", args...); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
-// commitDocuments publishes document replacements durably. Callers hold ioMu.
-// Encoding and renaming happen without mu, so list/read requests are never
-// queued behind a large conversation rewrite.
-func (r *FileUserRequestAuditRepository) commitDocuments(ctx context.Context, docs []*auditDiskConversation, obsolete []int64) error {
-	ids := make([]int64, 0, len(docs))
-	for _, doc := range docs {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := r.checkDisk(ctx); err != nil {
-			return err
-		}
-		if err := auditAtomicJSON(r.pendingPath(doc.ID), doc); err != nil {
-			r.invalidateDocuments(doc.ID)
-			return err
-		}
-		ids = append(ids, doc.ID)
-	}
-
-	// Journal the intent before publishing, so recovery can finish by retry.
-	r.mu.Lock()
-	r.state.PendingIDs = ids
-	r.state.ObsoleteIDs = obsolete
-	if err := r.saveStateLocked(); err != nil {
-		r.mu.Unlock()
-		r.invalidateDocuments(append(append([]int64(nil), ids...), obsolete...)...)
-		return err
-	}
-	r.mu.Unlock()
-
-	if err := r.finishWrites(ctx); err != nil {
-		r.invalidateDocuments(append(append([]int64(nil), ids...), obsolete...)...)
-		return err
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, id := range obsolete {
-		r.forgetDocumentLocked(id)
-	}
-	for _, doc := range docs {
-		r.indexDocumentLocked(doc)
-	}
-	return nil
-}
-
-// finishWrites applies the publication journal. Callers hold ioMu and must not
-// hold mu. It is idempotent: a timed-out writer can retry without losing rows.
-func (r *FileUserRequestAuditRepository) finishWrites(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	r.mu.Lock()
-	pending := append([]int64(nil), r.state.PendingIDs...)
-	obsolete := append([]int64(nil), r.state.ObsoleteIDs...)
-	r.mu.Unlock()
-	if len(pending) == 0 && len(obsolete) == 0 {
-		return nil
-	}
-	targets := filepath.Join(r.root, "conversations")
-	if len(pending) > 0 {
-		// A fresh archive has no conversations directory yet, and a rename into
-		// a missing directory fails outright on Windows.
-		if err := os.MkdirAll(targets, 0o750); err != nil {
-			return err
-		}
-	}
-	for _, id := range pending {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		source, target := r.pendingPath(id), r.conversationPath(id)
-		if _, err := os.Stat(source); os.IsNotExist(err) {
-			if _, err = readAuditConversation(target); err != nil {
-				return fmt.Errorf("recover audit publication %d: %w", id, err)
-			}
-			continue
-		} else if err != nil {
-			return err
-		}
-		if err := os.Rename(source, target); err != nil {
-			return err
-		}
-	}
-	if len(pending) > 0 {
-		if err := auditSyncDirectory(filepath.Join(r.root, "pending")); err != nil {
-			return err
-		}
-	}
-	for _, id := range obsolete {
-		if err := os.Remove(r.conversationPath(id)); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	if err := auditSyncDirectory(filepath.Join(r.root, "conversations")); err != nil {
-		return err
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state.PendingIDs = nil
-	r.state.ObsoleteIDs = nil
-	return r.saveStateLocked()
-}
-
-// finishDeletes applies the deletion journal. Callers hold ioMu and must not
-// hold mu while files or SQL are touched.
-func (r *FileUserRequestAuditRepository) finishDeletes(ctx context.Context) error {
-	r.mu.Lock()
-	ids := append([]int64(nil), r.state.DeleteIDs...)
-	clearing := r.state.Clear
-	r.mu.Unlock()
-	if !clearing && len(ids) == 0 {
-		return nil
-	}
-	if clearing {
-		files, err := filepath.Glob(filepath.Join(r.root, "conversations", "*.json"))
+func (r *FileUserRequestAuditRepository) drainPayloadGC(ctx context.Context) error {
+	for {
+		result, err := r.db.QueryContext(ctx, "SELECT relative_path FROM user_request_audit_payload_gc ORDER BY relative_path LIMIT 500")
 		if err != nil {
 			return err
 		}
-		for _, path := range files {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		paths := make([]string, 0, 500)
+		for result.Next() {
+			var path string
+			if err = result.Scan(&path); err != nil {
+				result.Close()
 				return err
 			}
+			paths = append(paths, path)
 		}
-	} else {
-		for _, id := range ids {
-			if err := os.Remove(r.conversationPath(id)); err != nil && !os.IsNotExist(err) {
+		err = result.Err()
+		result.Close()
+		if err != nil {
+			return err
+		}
+		if len(paths) == 0 {
+			return nil
+		}
+		for _, relative := range paths {
+			if err = ctx.Err(); err != nil {
 				return err
 			}
-		}
-	}
-	if clearing {
-		if err := os.RemoveAll(r.root + "-migration-backup"); err != nil {
-			return err
-		}
-		if err := auditSyncDirectory(filepath.Dir(r.root)); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(filepath.Join(r.root, "pending")); err != nil {
-			return err
-		}
-	}
-	if err := auditSyncDirectory(filepath.Join(r.root, "conversations")); err != nil {
-		return err
-	}
-	if r.legacy != nil {
-		if clearing {
-			if _, err := r.legacy.db.ExecContext(ctx, "DELETE FROM user_request_audit_conversations"); err != nil {
-				return err
+			path, e := r.payloadPath(relative)
+			if e != nil {
+				return e
 			}
-		} else {
-			for _, id := range ids {
-				if _, err := r.legacy.db.ExecContext(ctx, "DELETE FROM user_request_audit_conversations WHERE id=$1", id); err != nil {
-					return err
-				}
+			if e = os.Remove(path); e != nil && !os.IsNotExist(e) {
+				return fmt.Errorf("remove audit payload: %w", e)
+			}
+			if _, e = r.db.ExecContext(ctx, "DELETE FROM user_request_audit_payload_gc WHERE relative_path=$1", relative); e != nil {
+				return e
 			}
 		}
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.state.Clear = false
-	r.state.DeleteIDs = nil
-	return r.saveStateLocked()
 }
 
-// syncSQLDocuments projects metadata for the supplied documents. No repository
-// lock is held during SQL I/O; each document's metadata is snapshotted first.
-func (r *FileUserRequestAuditRepository) syncSQLDocuments(ctx context.Context, docs []*auditDiskConversation, removed []int64, replace bool) error {
-	if r.legacy == nil {
-		return nil
+func (r *FileUserRequestAuditRepository) Clear(ctx context.Context) (int64, error) {
+	if err := r.requireDB(); err != nil {
+		return 0, err
 	}
-	tx, err := r.legacy.db.BeginTx(ctx, nil)
+	r.payloadMu.Lock()
+	defer r.payloadMu.Unlock()
+	tx, err := r.beginWrite(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
-	if replace {
-		if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_conversations"); err != nil {
-			return err
+	var count int64
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM user_request_audit_request_index").Scan(&count); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO user_request_audit_payload_gc(relative_path) SELECT relative_path FROM user_request_audit_payloads WHERE TRUE ON CONFLICT(relative_path) DO NOTHING"); err != nil {
+		return 0, err
+	}
+	for _, table := range []string{"user_request_audit_payloads", "user_request_audit_request_index", "user_request_audit_conversations"} {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			return 0, err
 		}
 	}
-	for _, id := range removed {
-		if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_conversations WHERE id=$1", id); err != nil {
-			return err
-		}
+	if err = tx.Commit(); err != nil {
+		return 0, err
 	}
-	for _, doc := range docs {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		r.mu.Lock()
-		meta := r.documents[doc.ID]
-		r.mu.Unlock()
-		summary, err := json.Marshal(meta.summary)
-		if err != nil {
-			return err
-		}
-		relative := "conversations/" + strconv.FormatInt(doc.ID, 10) + ".json"
-		_, err = tx.ExecContext(ctx, `INSERT INTO user_request_audit_conversations(id,user_id,api_key_id,created_at,updated_at,expires_at,request_count,relative_path,summary) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) ON CONFLICT(id) DO UPDATE SET user_id=EXCLUDED.user_id,api_key_id=EXCLUDED.api_key_id,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at,expires_at=EXCLUDED.expires_at,request_count=EXCLUDED.request_count,relative_path=EXCLUDED.relative_path,summary=EXCLUDED.summary`, doc.ID, meta.summary.UserID, meta.summary.APIKeyID, meta.summary.CreatedAt, meta.summary.UpdatedAt, meta.expires, meta.summary.RequestCount, relative, string(summary))
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, "DELETE FROM user_request_audit_request_index WHERE conversation_id=$1", doc.ID); err != nil {
-			return err
-		}
-		for _, row := range doc.Requests {
-			metadata := auditMetadata(row)
-			body, err := json.Marshal(metadata)
-			if err != nil {
-				return err
-			}
-			if _, err = tx.ExecContext(ctx, `INSERT INTO user_request_audit_request_index(id,conversation_id,logical_key,created_at,metadata) VALUES($1,$2,$3,$4,$5::jsonb) ON CONFLICT(id) DO UPDATE SET conversation_id=EXCLUDED.conversation_id,logical_key=EXCLUDED.logical_key,created_at=EXCLUDED.created_at,metadata=EXCLUDED.metadata`, row.ID, doc.ID, row.LogicalKey, row.CreatedAt, string(body)); err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
+	return count, r.drainPayloadGC(ctx)
 }
 
-// reconcileSQL rebuilds the whole metadata projection from the association maps.
-func (r *FileUserRequestAuditRepository) reconcileSQL(ctx context.Context) error {
-	if r.legacy == nil {
-		return nil
+func (r *FileUserRequestAuditRepository) DeleteExpired(ctx context.Context, before time.Time, batchSize int) (int64, error) {
+	if err := r.requireDB(); err != nil {
+		return 0, err
 	}
-	type projectedRow struct {
-		conversationID int64
-		metadata       service.UserRequestAudit
+	if batchSize <= 0 {
+		batchSize = 500
 	}
-	r.mu.Lock()
-	rows := make([]projectedRow, 0, len(r.index))
-	for _, entry := range r.index {
-		rows = append(rows, projectedRow{conversationID: entry.conversationID, metadata: entry.row})
+	if batchSize > 500 {
+		batchSize = 500
 	}
-	ids := make([]int64, 0, len(r.documents))
-	for id := range r.documents {
+	r.payloadMu.Lock()
+	defer r.payloadMu.Unlock()
+	tx, err := r.beginWrite(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.QueryContext(ctx, "SELECT id FROM user_request_audit_conversations WHERE expires_at<$1 ORDER BY expires_at,id LIMIT $2", before, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	ids := make([]int64, 0, batchSize)
+	for result.Next() {
+		var id int64
+		if err = result.Scan(&id); err != nil {
+			result.Close()
+			return 0, err
+		}
 		ids = append(ids, id)
 	}
-	r.mu.Unlock()
-
-	docs := make([]*auditDiskConversation, 0, len(ids))
-	positions := make(map[int64]int, len(ids))
-	for _, id := range ids {
-		positions[id] = len(docs)
-		docs = append(docs, &auditDiskConversation{UserRequestAuditConversation: &service.UserRequestAuditConversation{ID: id}})
+	err = result.Err()
+	result.Close()
+	if err != nil {
+		return 0, err
 	}
-	for i := range rows {
-		metadata := rows[i].metadata
-		doc := docs[positions[rows[i].conversationID]]
-		doc.Requests = append(doc.Requests, &metadata)
+	count, err := r.deleteConversations(ctx, tx, ids)
+	if err != nil {
+		return 0, err
 	}
-	return r.syncSQLDocuments(ctx, docs, nil, true)
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	err = r.drainPayloadGC(ctx)
+	if err == nil {
+		r.mu.Lock()
+		r.lastCleanup = time.Now().UTC()
+		r.mu.Unlock()
+	}
+	return count, err
 }

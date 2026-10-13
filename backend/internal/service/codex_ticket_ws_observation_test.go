@@ -93,16 +93,24 @@ func TestCodexTicketWSObservationFailedHandshake(t *testing.T) {
 	require.Nil(t, svc.codexTicketHandshakeObserver(context.Background(), nil))
 }
 
-func TestCodexTicketWSHeadersPreserveInjectedGeneration(t *testing.T) {
+func TestCodexTicketWSHeadersPreserveClientTurnState(t *testing.T) {
 	account := ticketTestAccount(71)
 	ticket := verifiedTicket(account, "gpt-6-astra", "old-state", "__oailb=old")
 	account.Extra = map[string]any{openAICodexTicketExtraKey(ticket.Model): ticket}
 	svc := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: true}, nil)
+	// 官方语义：客户端回带的 turn-state 是本回合血统，即使账号已有门票也
+	// 不覆盖（覆盖会在同一账号上产生两个 blob）。只有缺回带时才注入。
 	headers, _, injected, err := svc.buildOpenAIWSHeadersWithTicket(context.Background(), nil, account, "token", OpenAIWSProtocolDecision{}, true, "client-state", "", "session", ticket.Model, "")
+	require.NoError(t, err)
+	require.Nil(t, injected)
+	require.Equal(t, "client-state", headers.Get(openAIWSTurnStateHeader))
+	require.Empty(t, headers.Get("Cookie"))
+
+	headers, _, injected, err = svc.buildOpenAIWSHeadersWithTicket(context.Background(), nil, account, "token", OpenAIWSProtocolDecision{}, true, "", "", "session", ticket.Model, "")
 	require.NoError(t, err)
 	require.NotNil(t, injected)
 	require.Equal(t, ticket.GenerationID, injected.GenerationID)
-	require.Equal(t, ticket.State, headers.Get(openAICodexTurnStateHeader))
+	require.Equal(t, ticket.State, headers.Get(openAIWSTurnStateHeader))
 	require.Equal(t, ticket.Cookie, headers.Get("Cookie"))
 }
 

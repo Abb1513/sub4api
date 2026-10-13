@@ -2,128 +2,29 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
 )
 
-// List retains the repository's request-level contract for statistics. The
-// service's public conversation listing calls ListConversations separately.
-// Payload reads happen after the association maps have been snapshotted, so a
-// statistics query never holds the capture lock across disk I/O.
+// List supplies request-level metadata for statistics. Text search never opens
+// cold evidence; explicit GetByID/GetConversation/export are the only readers.
 func (r *FileUserRequestAuditRepository) List(ctx context.Context, f service.UserRequestAuditFilter) ([]*service.UserRequestAudit, int64, error) {
-	if f.Legacy && r.legacy != nil {
-		return r.legacy.List(ctx, f)
+	if err := r.requireDB(); err != nil {
+		return nil, 0, err
 	}
-	content := strings.TrimSpace(f.Q) != ""
-	page, size := auditPage(f)
-	rows := make([]*service.UserRequestAudit, 0)
+	where, args := auditSQLConditions(f, true)
+	from := " FROM user_request_audit_request_index q JOIN user_request_audit_conversations c ON c.id=q.conversation_id WHERE " + where
 	var total int64
-	if r.legacy == nil {
-		if err := r.ensureIndex(ctx); err != nil {
-			return nil, 0, err
-		}
-		noContent := f
-		noContent.Q = ""
-		r.mu.Lock()
-		if r.index == nil {
-			r.mu.Unlock()
-			return nil, 0, errors.New("audit archive index is unavailable")
-		}
-		for _, entry := range r.index {
-			if auditMatchesFilter(&entry.row, noContent) {
-				row := entry.row
-				rows = append(rows, &row)
-			}
-		}
-		r.mu.Unlock()
-		sort.Slice(rows, func(i, j int) bool { return auditRowBefore(rows[j], rows[i]) })
-		total = int64(len(rows))
-	} else {
-		where, args := auditSQLConditions(f, true)
-		from := " FROM user_request_audit_request_index q JOIN user_request_audit_conversations c ON c.id=q.conversation_id WHERE " + where
-		if err := r.legacy.db.QueryRowContext(ctx, "SELECT count(*)"+from, args...).Scan(&total); err != nil {
-			return nil, 0, err
-		}
-		query := "SELECT q.metadata" + from + " ORDER BY q.created_at DESC,q.id DESC"
-		if !content {
-			args = append(args, size, int64(page-1)*int64(size))
-			query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)-1, len(args))
-		}
-		result, err := r.legacy.db.QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, 0, err
-		}
-		for result.Next() {
-			var b []byte
-			if err = result.Scan(&b); err != nil {
-				result.Close()
-				return nil, 0, err
-			}
-			var row service.UserRequestAudit
-			if err = json.Unmarshal(b, &row); err != nil {
-				result.Close()
-				return nil, 0, err
-			}
-			rows = append(rows, &row)
-		}
-		err = result.Err()
-		result.Close()
-		if err != nil {
-			return nil, 0, err
-		}
+	if err := r.db.QueryRowContext(ctx, "SELECT count(*)"+from, args...).Scan(&total); err != nil {
+		return nil, 0, err
 	}
-	if content {
-		if err := r.ensureIndex(ctx); err != nil {
-			return nil, 0, err
-		}
-		r.mu.Lock()
-		targets := make(map[int64]int64, len(rows))
-		for _, row := range rows {
-			entry, ok := r.index[row.ID]
-			if !ok {
-				r.mu.Unlock()
-				return nil, 0, fmt.Errorf("audit request %d disappeared", row.ID)
-			}
-			targets[row.ID] = entry.conversationID
-		}
-		r.mu.Unlock()
-		filtered := rows[:0]
-		loaded := make(map[int64]*auditDiskConversation)
-		for _, row := range rows {
-			if err := ctx.Err(); err != nil {
-				return nil, 0, err
-			}
-			conversationID := targets[row.ID]
-			doc := loaded[conversationID]
-			if doc == nil {
-				var err error
-				doc, err = readAuditConversation(r.conversationPath(conversationID))
-				if err != nil {
-					return nil, 0, err
-				}
-				loaded[conversationID] = doc
-			}
-			for _, full := range doc.Requests {
-				if full.ID == row.ID && auditMatchesFilter(full, f) {
-					filtered = append(filtered, row)
-					break
-				}
-			}
-		}
-		rows = filtered
-		total = int64(len(rows))
+	page, size := auditPage(f)
+	args = append(args, size, int64(page-1)*int64(size))
+	result, err := r.db.QueryContext(ctx, "SELECT q.metadata"+from+fmt.Sprintf(" ORDER BY q.created_at DESC,q.id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
+	if err != nil {
+		return nil, 0, err
 	}
-	if content || r.legacy == nil {
-		if page-1 > len(rows)/size {
-			return []*service.UserRequestAudit{}, total, nil
-		}
-		start := (page - 1) * size
-		rows = rows[start:min(start+size, len(rows))]
-	}
-	return rows, total, nil
+	rows, err := readAuditMetadataRows(result)
+	return rows, total, err
 }

@@ -2,9 +2,11 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,87 +14,150 @@ import (
 	"github.com/MACOS-DO/sub4api/internal/service"
 )
 
-func TestFileUserRequestAuditConcurrentAppendReadSearch(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("DATA_DIR", dir)
-	r := NewFileUserRequestAuditRepository(nil)
+func TestAuditConcurrentDatabaseIDs(t *testing.T) {
+	r := auditConversationTestRepository(t)
 	var wg sync.WaitGroup
-	for i := range 32 {
+	for i := range 24 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			gid := int64(i % 2)
-			err := r.Create(context.Background(), &service.UserRequestAudit{UserID: int64(i), GroupID: &gid, GroupName: "group", Protocol: "openai_responses", RequestedModel: "model", RequestChatML: "secret-token", Status: "received", LogicalKey: string(rune('a' + i))})
-			if err != nil {
+			if err := r.Create(context.Background(), &service.UserRequestAudit{LogicalKey: fmt.Sprint(i), RequestedModel: "search-model", RequestChatML: "private-payload"}); err != nil {
 				t.Errorf("create: %v", err)
 			}
 		}(i)
 	}
 	wg.Wait()
-	rows, total, err := r.List(context.Background(), service.UserRequestAuditFilter{Q: "secret-token", Page: 1, PageSize: 100})
-	if err != nil || total != 32 || len(rows) != 32 {
-		t.Fatalf("search rows=%d total=%d err=%v", len(rows), total, err)
+	rows, n, err := r.List(context.Background(), service.UserRequestAuditFilter{Q: "search-model", Page: 1, PageSize: 100})
+	if err != nil || n != 24 || len(rows) != 24 {
+		t.Fatalf("list: %d %d %v", len(rows), n, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "user-request-audit")); err != nil {
-		t.Fatal(err)
+	seen := map[int64]bool{}
+	for _, row := range rows {
+		if row.ID <= 0 || seen[row.ID] {
+			t.Fatalf("invalid ID %d", row.ID)
+		}
+		seen[row.ID] = true
+		if row.RequestChatML != "" || row.ResponseChatML != "" || row.ChatML != "" {
+			t.Fatal("list loaded cold text")
+		}
 	}
-}
-
-func TestFileUserRequestAuditRestartAndComplete(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("DATA_DIR", dir)
-	r := NewFileUserRequestAuditRepository(nil)
-	a := &service.UserRequestAudit{UserID: 1, Protocol: "openai_responses", CreatedAt: time.Now().UTC(), LogicalKey: "logical", RequestChatML: "request", Status: "received"}
-	if err := r.Create(context.Background(), a); err != nil {
-		t.Fatal(err)
-	}
-	beforeComplete, beforeErr := r.GetByID(context.Background(), a.ID)
-	if beforeErr != nil || beforeComplete.RequestChatML != "request" || beforeComplete.ResponseChatML != "" {
-		t.Fatalf("initial request=%+v err=%v", beforeComplete, beforeErr)
-	}
-	if err := r.Complete(context.Background(), &service.UserRequestAuditCompletion{LogicalKey: "logical", ResponseID: "resp_123", ResponseChatML: "response", Status: "completed"}); err != nil {
-		t.Fatal(err)
-	}
-	r2 := NewFileUserRequestAuditRepository(nil)
-	got, err := r2.GetByID(context.Background(), a.ID)
-	if err != nil || got.Status != "completed" || got.ResponseID != "resp_123" || got.ConversationKey != "response:resp_123" || got.ResponseChatML != "response" {
-		t.Fatalf("restart got=%+v err=%v", got, err)
+	if _, n, err := r.List(context.Background(), service.UserRequestAuditFilter{Q: "private-payload"}); err != nil || n != 0 {
+		t.Fatalf("payload search: %d %v", n, err)
 	}
 }
 
-func TestFileUserRequestAuditNormalizesExistingResponseConversationKey(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("DATA_DIR", dir)
-	r := NewFileUserRequestAuditRepository(nil)
-	audit := &service.UserRequestAudit{UserID: 1, Protocol: "openai_responses", ResponseID: "resp_existing", FallbackHash: "old", LogicalKey: "legacy", Status: "completed"}
-	if err := r.Create(context.Background(), audit); err != nil {
+func auditRequestPath(t *testing.T, r *FileUserRequestAuditRepository, id int64) string {
+	t.Helper()
+	var relative string
+	if err := r.db.QueryRow(`SELECT request_path FROM user_request_audit_request_index WHERE id=$1`, id).Scan(&relative); err != nil {
 		t.Fatal(err)
 	}
-	got, err := r.GetByID(context.Background(), audit.ID)
-	if err != nil || got.ConversationKey != "response:resp_existing" {
-		t.Fatalf("normalized conversation key=%q err=%v", got.ConversationKey, err)
+	return filepath.Join(r.root, filepath.FromSlash(relative))
+}
+
+func TestAuditDiskGuardProtectsRequestAndCompletion(t *testing.T) {
+	r := auditConversationTestRepository(t)
+	ctx := context.Background()
+	healthy := r.diskUsage
+	r.diskUsage = func(context.Context, string) (int64, int64, error) { return 16 * userRequestAuditMinFreeBytes, 0, nil }
+	if err := r.Create(ctx, &service.UserRequestAudit{LogicalKey: "blocked"}); err == nil {
+		t.Fatal("low space capture succeeded")
+	}
+	if _, n, err := r.List(ctx, service.UserRequestAuditFilter{}); err != nil || n != 0 {
+		t.Fatalf("blocked row persisted: %d %v", n, err)
+	}
+	r.diskUsage = healthy
+	row := &service.UserRequestAudit{LogicalKey: "resumed", RequestChatML: "request evidence"}
+	auditCreate(t, r, row)
+	r.diskUsage = func(context.Context, string) (int64, int64, error) { return 0, 0, fmt.Errorf("probe failure") }
+	if !r.StorageStatus().RecordingPaused {
+		t.Fatal("failed disk probe not paused")
+	}
+	if err := r.Complete(ctx, &service.UserRequestAuditCompletion{LogicalKey: "resumed", ResponseChatML: "blocked response"}); err == nil {
+		t.Fatal("completion bypassed guard")
+	}
+	r.diskUsage = healthy
+	got, err := r.GetByID(ctx, row.ID)
+	if err != nil || got.RequestChatML != "request evidence" || got.ResponseChatML != "" {
+		t.Fatalf("paused capture changed evidence: %+v %v", got, err)
 	}
 }
 
-func TestFileUserRequestAuditConfigAndRetention(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("DATA_DIR", dir)
-	r := NewFileUserRequestAuditRepository(nil)
+func TestAuditConfigPersistsAcrossRestart(t *testing.T) {
+	r := auditConversationTestRepository(t)
 	cfg := service.UserRequestAuditConfig{RetentionDays: 3, CleanupIntervalHours: 4}
 	if err := r.SetAuditConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
-	r2 := NewFileUserRequestAuditRepository(nil)
-	got := r2.GetAuditConfig()
-	if !reflect.DeepEqual(got, cfg) {
-		t.Fatalf("config roundtrip got=%+v want=%+v", got, cfg)
+	if got := auditReopen(r).GetAuditConfig(); !reflect.DeepEqual(got, cfg) {
+		t.Fatalf("config: %+v", got)
 	}
-	old := time.Now().UTC().Add(-48 * time.Hour)
-	if err := r2.Create(context.Background(), &service.UserRequestAudit{CreatedAt: old, ExpiresAt: old.Add(time.Hour), LogicalKey: "expired", Protocol: "openai_responses"}); err != nil {
+}
+
+func TestAuditCompletionDoesNotReadMissingRequestPayload(t *testing.T) {
+	r := auditConversationTestRepository(t)
+	row := &service.UserRequestAudit{LogicalKey: "missing", RequestChatML: continuityChat("user", "question")}
+	auditCreate(t, r, row)
+	path := auditRequestPath(t, r, row.ID)
+	original, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	deleted, err := r2.DeleteExpired(context.Background(), time.Now().UTC(), 10)
-	if err != nil || deleted != 1 || r2.StorageStatus().LastCleanup.IsZero() {
-		t.Fatalf("deleted=%d err=%v", deleted, err)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	for i, text := range []string{"first", "second"} {
+		if err := r.Complete(context.Background(), &service.UserRequestAuditCompletion{LogicalKey: "missing", ResponseChatML: continuityChat("assistant", text), Status: "completed"}); err != nil {
+			t.Fatalf("completion %d read old payload: %v", i, err)
+		}
+	}
+	if _, err := r.GetByID(context.Background(), row.ID); err == nil {
+		t.Fatal("human read concealed missing evidence")
+	}
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := auditReopen(r).GetByID(context.Background(), row.ID)
+	if err != nil || got.RequestChatML != row.RequestChatML || got.ResponseChatML != continuityChat("assistant", "first")+continuityChat("assistant", "second") {
+		t.Fatalf("completion chunks: %+v %v", got, err)
+	}
+}
+
+func TestAuditExpiredPayloadDeletionNeedsOnlySQL(t *testing.T) {
+	r := auditConversationTestRepository(t)
+	row := &service.UserRequestAudit{LogicalKey: "expired", RequestChatML: "evidence", ExpiresAt: time.Now().Add(-time.Hour)}
+	auditCreate(t, r, row)
+	if err := os.WriteFile(auditRequestPath(t, r, row.ID), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.DeleteExpired(context.Background(), time.Now(), 10); err != nil || n != 1 {
+		t.Fatalf("delete read cold payload: %d %v", n, err)
+	}
+	if _, n, err := auditReopen(r).List(context.Background(), service.UserRequestAuditFilter{}); err != nil || n != 0 {
+		t.Fatalf("expired resurrection: %d %v", n, err)
+	}
+}
+
+func TestAuditSQLContainsMetadataNotPayload(t *testing.T) {
+	r := auditConversationTestRepository(t)
+	row := &service.UserRequestAudit{ID: 999999, LogicalKey: "database-id", RequestChatML: continuityChat("user", "PRIVATE_REQUEST_SENTINEL")}
+	auditCreate(t, r, row)
+	if row.ID == 999999 || row.ID <= 0 {
+		t.Fatalf("caller controlled ID %d", row.ID)
+	}
+	if err := r.Complete(context.Background(), &service.UserRequestAuditCompletion{LogicalKey: row.LogicalKey, ResponseChatML: continuityChat("assistant", "PRIVATE_RESPONSE_SENTINEL"), Status: "completed"}); err != nil {
+		t.Fatal(err)
+	}
+	var metadata, proof, summary string
+	if err := r.db.QueryRow(`SELECT metadata,proof FROM user_request_audit_request_index WHERE id=$1`, row.ID).Scan(&metadata, &proof); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.db.QueryRow(`SELECT summary FROM user_request_audit_conversations WHERE id=$1`, row.ID).Scan(&summary); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{metadata, proof, summary} {
+		if strings.Contains(value, "PRIVATE_REQUEST_SENTINEL") || strings.Contains(value, "PRIVATE_RESPONSE_SENTINEL") {
+			t.Fatal("SQL retained cold payload text")
+		}
 	}
 }

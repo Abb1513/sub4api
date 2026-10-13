@@ -169,50 +169,85 @@ func BuildUserRequestAuditTranscript(rows []*UserRequestAudit) []UserRequestAudi
 	return out
 }
 
-// Prefix proof is indexed from captured payloads, never caller-provided hashes.
-// Hashes cover all message roles, tool identities and exact text, not a prompt.
+// Proofs contain hashes only. A rolling digest permits completion to extend the
+// current capture without reading any previous request payload from cold storage.
 type UserRequestAuditContinuityProof struct {
-	Prefixes []string
-	Terminal string
+	Prefixes   []string
+	Terminal   string
+	Digest     string
+	Count      int
+	Meaningful bool
+	// RequestDigest is immutable request-only evidence; completion extends Digest.
+	RequestDigest string
+	// RequestValid rejects truncated/incomplete capture, not unfamiliar tool
+	// schemas. Storage proves exact bytes independently of association semantics.
+	RequestValid bool
+	Valid        bool
 }
 
 func UserRequestAuditProof(row *UserRequestAudit) UserRequestAuditContinuityProof {
-	proof := UserRequestAuditContinuityProof{}
-	if strings.Contains(row.RequestChatML, "...[truncated]") || strings.Contains(row.ResponseChatML, "...[truncated]") || row.Protocol == ContentModerationProtocolTypeSafeSystemOne {
-		return proof
-	}
-	for key, value := range row.Metadata {
-		if strings.Contains(key, "truncat") && value != false && value != nil && value != "" {
-			return proof
-		}
+	proof := UserRequestAuditContinuityProof{Valid: true, RequestValid: true}
+	if !auditProofEvidenceValid(row.RequestChatML, row.Metadata) || row.Protocol == ContentModerationProtocolTypeSafeSystemOne {
+		return UserRequestAuditContinuityProof{}
 	}
 	req := auditDecodeChatML(row.RequestChatML, "user", 0)
-	res := auditDecodeChatML(row.ResponseChatML, "assistant", 0)
-	h := sha256.New()
-	meaningful := false
-	valid := true
-	add := func(m UserRequestAuditMessage) string {
-		m.RequestID = 0
-		if m.Incomplete || m.Kind == "error" || (m.Kind == "metadata" && m.Role != "tools" && m.Role != "reasoning" && m.Role != "system") {
-			valid = false
-		}
-		meaningful = meaningful || m.Role == "assistant" || m.Kind == "tool_result"
-		b, _ := json.Marshal(m)
-		h.Write(b)
-		h.Write([]byte{0})
-		return hex.EncodeToString(h.Sum(nil))
-	}
 	for i, m := range req {
-		key := add(m)
-		if valid && meaningful && i >= 1 && i < len(req)-1 {
-			proof.Prefixes = append(proof.Prefixes, key)
+		proof.add(m)
+		if m.Incomplete {
+			proof.RequestValid = false
+		}
+		if proof.Valid && proof.Meaningful && i >= 1 && i < len(req)-1 {
+			proof.Prefixes = append(proof.Prefixes, proof.Digest)
+			// Bounded SQL evidence; retain the most recent complete boundaries.
+			if len(proof.Prefixes) > 256 {
+				proof.Prefixes = proof.Prefixes[1:]
+			}
 		}
 	}
-	for _, m := range res {
-		add(m)
+	if proof.RequestValid && len(req) > 0 {
+		proof.RequestDigest = proof.Digest
 	}
-	if valid && meaningful && len(req)+len(res) >= 2 && (row.Status == "completed" || len(res) == 0) {
-		proof.Terminal = hex.EncodeToString(h.Sum(nil))
+	return CompleteUserRequestAuditProof(proof, row.ResponseChatML, row.Status, row.Metadata)
+}
+
+func auditProofEvidenceValid(text string, metadata map[string]any) bool {
+	if strings.Contains(text, "...[truncated]") {
+		return false
+	}
+	for key, value := range metadata {
+		if strings.Contains(key, "truncat") && value != false && value != nil && value != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *UserRequestAuditContinuityProof) add(m UserRequestAuditMessage) {
+	m.RequestID = 0
+	if m.Incomplete || m.Kind == "error" || (m.Kind == "metadata" && m.Role != "tools" && m.Role != "reasoning" && m.Role != "system") {
+		p.Valid = false
+	}
+	p.Meaningful = p.Meaningful || m.Role == "assistant" || m.Kind == "tool_result"
+	b, _ := json.Marshal(m)
+	h := sha256.New()
+	h.Write([]byte(p.Digest))
+	h.Write([]byte{0})
+	h.Write(b)
+	p.Digest = hex.EncodeToString(h.Sum(nil))
+	p.Count++
+}
+
+func CompleteUserRequestAuditProof(proof UserRequestAuditContinuityProof, response, status string, metadata map[string]any) UserRequestAuditContinuityProof {
+	if !proof.Valid || !auditProofEvidenceValid(response, metadata) {
+		return UserRequestAuditContinuityProof{RequestDigest: proof.RequestDigest, RequestValid: proof.RequestValid}
+	}
+	res := auditDecodeChatML(response, "assistant", 0)
+	for _, m := range res {
+		proof.add(m)
+	}
+	proof.Terminal = ""
+	if proof.Valid && proof.Meaningful && proof.Count >= 2 && (status == "completed" || len(res) == 0) {
+		proof.Terminal = proof.Digest
 	}
 	return proof
 }

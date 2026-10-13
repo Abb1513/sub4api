@@ -87,7 +87,7 @@ func normalizeOpenAIResponsesLegacyIngress(body []byte) ([]byte, bool, error) {
 	if err != nil {
 		return body, false, fmt.Errorf("serialize legacy Responses ingress: %w", err)
 	}
-	return normalized, true, nil
+	return restoreOpenAIUpstreamJSONTopLevelOrder(body, normalized), true, nil
 }
 
 type convertedLegacyResponsesMessages struct {

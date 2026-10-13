@@ -56,8 +56,10 @@ func adaptOpenAIResponsesClientTools(body []byte) ([]byte, apicompat.ResponsesCl
 	}
 	rebuilt, err := marshalOpenAIUpstreamJSON(requestBody)
 	if err != nil {
-		return body, apicompat.ResponsesClientToolMapping{}, fmt.Errorf("encode OpenAI Responses client tools: %w", err)
+		return body, mapping, fmt.Errorf("encode OpenAI Responses client tools: %w", err)
 	}
+	// 客户端工具改写走 map 重编码；还原客户端原始顶层顺序。
+	rebuilt = restoreOpenAIUpstreamJSONTopLevelOrder(body, rebuilt)
 	return rebuilt, mapping, nil
 }
 

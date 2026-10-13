@@ -48,13 +48,22 @@ func TestCodexTicketLegacyLengthOnlyIsNotReusable(t *testing.T) {
 
 func TestCodexTicketCookieOnlyIsReusable(t *testing.T) {
 	account := ticketTestAccount(41)
-	account.Extra = map[string]any{openAICodexTicketExtraKey("gpt-6-astra"): verifiedTicket(account, "gpt-6-astra", "", "session=old")}
+	// 基础设施 Cookie（__oailb 路由）才可随票复用；账号/会话 Cookie 会被
+	// filterOpenAICodexInfrastructureCookies 丢弃。
+	account.Extra = map[string]any{openAICodexTicketExtraKey("gpt-6-astra"): verifiedTicket(account, "gpt-6-astra", "", "__oailb=old")}
 	svc := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: true, FailClosed: true}, nil)
 	headers := http.Header{}
-	headers.Set(openAICodexTurnStateHeader, "client-old")
 	require.NoError(t, svc.applyOpenAICodexTicket(context.Background(), account, "gpt-6-astra", headers))
 	require.Empty(t, headers.Get(openAICodexTurnStateHeader))
-	require.Equal(t, "session=old", headers.Get("Cookie"))
+	require.Equal(t, "__oailb=old", headers.Get("Cookie"))
+
+	// 客户端回带 turn-state 时保持原样，不注入。
+	echoed := http.Header{}
+	echoed.Set(openAICodexTurnStateHeader, "client-old")
+	require.NoError(t, svc.applyOpenAICodexTicket(context.Background(), account, "gpt-6-astra", echoed))
+	require.Equal(t, "client-old", echoed.Get(openAICodexTurnStateHeader))
+	require.Empty(t, echoed.Get("Cookie"))
+
 	statuses := OpenAICodexTicketStatuses(account, svc.openAICodexTicketConfig(), time.Now())
 	require.Len(t, statuses, 6)
 	for _, status := range statuses {

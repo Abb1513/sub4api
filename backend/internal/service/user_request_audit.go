@@ -94,7 +94,6 @@ type UserRequestAuditFilter struct {
 	ClientRequestID string
 	Status          string
 	Q               string
-	Legacy          bool
 	StartTime       *time.Time
 	EndTime         *time.Time
 }

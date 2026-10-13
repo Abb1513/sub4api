@@ -2,10 +2,12 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,9 +17,33 @@ import (
 	"github.com/MACOS-DO/sub4api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	_ "modernc.org/sqlite"
 )
 
 const validSystemOneHandlerBody = `{"model":"jev-latest","state":"sample","questions":{"q":{"type":"noul","instructions":"Evaluate"}}}`
+
+func systemOneAuditDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(os.Getenv("DATA_DIR"), "audit-metadata.db"))
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		`PRAGMA foreign_keys=ON`,
+		`CREATE TABLE users(id INTEGER PRIMARY KEY, username TEXT, email TEXT)`,
+		`CREATE TABLE user_request_audit_conversations(id INTEGER PRIMARY KEY, user_id BIGINT NOT NULL, api_key_id BIGINT NOT NULL, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL, expires_at TIMESTAMP NOT NULL, request_count INTEGER NOT NULL, summary JSON NOT NULL)`,
+		`CREATE TABLE user_request_audit_request_index(id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id BIGINT REFERENCES user_request_audit_conversations(id) ON DELETE CASCADE, logical_key TEXT NOT NULL, created_at TIMESTAMP NOT NULL, metadata JSON NOT NULL, request_path TEXT NOT NULL DEFAULT '', response_path TEXT NOT NULL DEFAULT '', payload_bytes BIGINT NOT NULL DEFAULT 0, proof JSON NOT NULL DEFAULT '{}', request_parent_id BIGINT REFERENCES user_request_audit_request_index(id), request_prefix_bytes BIGINT NOT NULL DEFAULT 0, request_bytes BIGINT NOT NULL DEFAULT 0, request_sha256 TEXT NOT NULL DEFAULT '')`,
+		`CREATE UNIQUE INDEX audit_logical_key ON user_request_audit_request_index(logical_key) WHERE logical_key<>''`,
+		`CREATE TABLE user_request_audit_writer_lock(id INTEGER PRIMARY KEY, version INTEGER NOT NULL)`,
+		`INSERT INTO user_request_audit_writer_lock VALUES(1,0)`,
+		`CREATE TABLE user_request_audit_payloads(request_id BIGINT NOT NULL REFERENCES user_request_audit_request_index(id) ON DELETE CASCADE, relative_path TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('request','response')), byte_size BIGINT NOT NULL, ordinal INTEGER NOT NULL, UNIQUE(request_id,ordinal))`,
+		`CREATE TABLE user_request_audit_payload_gc(relative_path TEXT PRIMARY KEY)`,
+	} {
+		_, err := db.Exec(statement)
+		require.NoError(t, err)
+	}
+	return db
+}
 
 func newSystemOneHandlerContext(body string) (*gin.Context, *httptest.ResponseRecorder) {
 	gin.SetMode(gin.TestMode)
@@ -128,7 +154,8 @@ func TestSystemOneAuditNativeEvidenceAndGroupSelection(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DATA_DIR", t.TempDir())
-			archive := repository.NewFileUserRequestAuditRepository(nil)
+			db := systemOneAuditDatabase(t)
+			archive := repository.NewFileUserRequestAuditRepository(db)
 			settings := &contentModerationHandlerSettingRepo{values: map[string]string{
 				service.SettingKeyUserRequestAuditGroupIDs: tc.groupIDs,
 			}}
@@ -175,7 +202,7 @@ func TestSystemOneAuditNativeEvidenceAndGroupSelection(t *testing.T) {
 			_, total, err = svc.List(context.Background(), service.UserRequestAuditFilter{Protocol: service.ContentModerationProtocolOpenAIResponses})
 			require.NoError(t, err)
 			require.Zero(t, total, "native records must not appear under a chat protocol")
-			reopened := repository.NewFileUserRequestAuditRepository(nil)
+			reopened := repository.NewFileUserRequestAuditRepository(db)
 			persisted, err := reopened.GetByID(context.Background(), record.ID)
 			require.NoError(t, err)
 			require.Equal(t, record.RequestChatML, persisted.RequestChatML)
@@ -204,7 +231,7 @@ func TestSystemOneAuditCapturesModerationDenialBeforeForward(t *testing.T) {
 		service.SettingKeyContentModerationConfig:  string(moderationConfig),
 		service.SettingKeyUserRequestAuditGroupIDs: "[9]",
 	}}
-	archive := repository.NewFileUserRequestAuditRepository(nil)
+	archive := repository.NewFileUserRequestAuditRepository(systemOneAuditDatabase(t))
 	svc := service.NewUserRequestAuditService(archive, settings)
 	t.Cleanup(svc.Stop)
 	moderationSvc := service.NewContentModerationService(settings, &contentModerationHandlerTestRepo{}, nil, nil, nil, nil, nil, nil)

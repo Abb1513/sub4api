@@ -81,8 +81,12 @@ func TestCodexTicketProbeParsesNormalSSEAndCookies(t *testing.T) {
 	upstream := &codexTicketFuncUpstream{do: func(req *http.Request) (*http.Response, error) {
 		header := http.Header{}
 		header.Set(openAICodexTurnStateHeader, "new-state")
-		header.Add("Set-Cookie", "session=first; HttpOnly")
-		header.Add("Set-Cookie", "route=second; Secure")
+		header.Add("Set-Cookie", "__cfruid=first; HttpOnly")
+		header.Add("Set-Cookie", "cf_clearance=second; Secure")
+		// 真实 Codex 客户端只持久化 Cloudflare 基础设施 Cookie
+		// （http-client/src/chatgpt_cloudflare_cookies.rs），账号/会话
+		// Cookie 回放是真实客户端不会产生的特征，必须整对丢弃。
+		header.Add("Set-Cookie", "session=secret; HttpOnly")
 		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"1 2 3\"}\n\ndata: [DONE]\n\n"))}, nil
 	}}
 	svc := ticketTestService(t, config.OpenAICodexTicketConfig{Enabled: true}, upstream)
@@ -90,8 +94,9 @@ func TestCodexTicketProbeParsesNormalSSEAndCookies(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "1 2 3", output)
 	require.Equal(t, "new-state", state)
-	require.Contains(t, cookie, "session=first")
-	require.Contains(t, cookie, "route=second")
+	require.Contains(t, cookie, "__cfruid=first")
+	require.Contains(t, cookie, "cf_clearance=second")
+	require.NotContains(t, cookie, "session")
 	require.Equal(t, http.StatusOK, status)
 }
 

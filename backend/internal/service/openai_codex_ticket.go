@@ -301,10 +301,11 @@ func (s *OpenAIGatewayService) storeOpenAICodexTicket(ctx context.Context, accou
 	s.openaiCodexTickets.Store(openAICodexTicketKey(account.ID, model), ticket)
 	return nil
 }
-
-// applyOpenAICodexTicket 在出站请求上覆盖 x-codex-turn-state。
-// 请求路径只注入已捕获的有效门票，不现场打票；仅在无票策略禁止时返回
-// ErrOpenAICodexTicketUnavailable。关闭全局、账号或当前模型参与时不限制无票请求。
+// applyOpenAICodexTicket 在出站请求上补齐 x-codex-turn-state：仅当请求没有回带
+// 该头时注入已捕获的有效门票（客户端自己回合内的回带保持原样，见
+// applyOpenAICodexTicketWithGeneration）。请求路径不现场打票；仅在无票策略
+// 禁止时返回 ErrOpenAICodexTicketUnavailable。关闭全局、账号或当前模型参与时
+// 不限制无票请求。
 func (s *OpenAIGatewayService) applyOpenAICodexTicket(ctx context.Context, account *Account, model string, h http.Header) error {
 	_, err := s.applyOpenAICodexTicketWithGeneration(ctx, account, model, h)
 	return err
@@ -316,6 +317,14 @@ func (s *OpenAIGatewayService) applyOpenAICodexTicketWithGeneration(ctx context.
 	}
 	model = normalizeOpenAICodexTicketModel(model)
 	if model == "" || !s.openAICodexTicketGatedModel(model) {
+		return nil, nil
+	}
+	// 官方语义：turn-state 由本回合首个响应铸造，回合内后续请求原样回带
+	// （codex-rs client.rs 的 turn_state 是 OnceLock）。因此客户端自己带来、
+	// 且已通过账号溯源守卫的头就是本回合的真实血统，覆盖它会打断回合链，并在
+	// 同一账号上产生「同回合两个不同 blob」这种真实客户端不会有的形态。
+	// 只有客户端没有回带（回合首请求或换号被剥离）时才注入打票所得。
+	if strings.TrimSpace(h.Get(openAICodexTurnStateHeader)) != "" {
 		return nil, nil
 	}
 	var ticket *openAICodexTicket
@@ -351,19 +360,59 @@ func (s *OpenAIGatewayService) applyOpenAICodexTicketWithGeneration(ctx context.
 
 // applyOpenAICodexTicketCookie 把打票成功时捕获的 Cookie 与票据一并复用。
 // 已有 Cookie（当前出站路径默认不透传客户端 Cookie）按追加处理，避免覆盖其他来源。
+// 复用前按官方基础设施 Cookie 名单再过一遍：票据可能来自修复前捕获的全量
+// 回放，账号/会话类 Cookie 混进业务请求会形成真实 Codex 客户端不会有的特征。
 func applyOpenAICodexTicketCookie(h http.Header, ticket *openAICodexTicket) {
 	if h == nil || ticket == nil {
 		return
 	}
-	cookie := strings.TrimSpace(ticket.Cookie)
+	cookie := filterOpenAICodexInfrastructureCookies(ticket.Cookie)
 	if cookie == "" {
 		return
 	}
-	if existing := strings.TrimSpace(h.Get("Cookie")); existing != "" {
+	if existing := filterOpenAICodexInfrastructureCookies(h.Get("Cookie")); existing != "" {
 		h.Set("Cookie", existing+"; "+cookie)
 		return
 	}
 	h.Set("Cookie", cookie)
+}
+
+// isOpenAICodexInfrastructureCookieName 与 codex-rs
+// http-client/src/chatgpt_cloudflare_cookies.rs 的
+// is_allowed_cloudflare_cookie_name 对齐：只有 Cloudflare 基础设施 Cookie 与
+// `__oailb` 路由 Cookie 可以被复用，其余（账号、会话、认证）一律不透传。
+func isOpenAICodexInfrastructureCookieName(name string) bool {
+	switch name {
+	case "__cf_bm", "__cflb", "__cfruid", "__cfseq", "__cfwaitingroom", "__oailb",
+		"_cfuvid", "cf_clearance", "cf_ob_info", "cf_use_ob":
+		return true
+	}
+	return strings.HasPrefix(name, "cf_chl_")
+}
+
+// filterOpenAICodexInfrastructureCookies 保留 `name=value` 对中的允许项，
+// 顺序稳定，非法/未允许的名称整对丢弃。
+func filterOpenAICodexInfrastructureCookies(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	kept := make([]string, 0, 4)
+	seen := make(map[string]bool, 4)
+	for _, pair := range strings.Split(raw, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		name, _, ok := strings.Cut(pair, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" || seen[name] || !isOpenAICodexInfrastructureCookieName(name) {
+			continue
+		}
+		seen[name] = true
+		kept = append(kept, name+"="+strings.TrimSpace(pair[len(name)+1:]))
+	}
+	return strings.Join(kept, "; ")
 }
 
 // openAICodexTicketOutboundModel 预测本请求真正出站的模型名，也就是
@@ -514,6 +563,12 @@ func extractOpenAICodexResponseCookies(h http.Header) string {
 	seen := make(map[string]bool, len(parsed))
 	for _, item := range parsed {
 		if item == nil || item.Name == "" || seen[item.Name] {
+			continue
+		}
+		// Only infrastructure cookies may be persisted with a ticket. Replaying
+		// account/session cookies on business requests is a signature no real
+		// Codex client produces (see isOpenAICodexInfrastructureCookieName).
+		if !isOpenAICodexInfrastructureCookieName(item.Name) {
 			continue
 		}
 		seen[item.Name] = true

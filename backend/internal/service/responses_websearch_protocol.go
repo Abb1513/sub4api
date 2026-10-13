@@ -9,7 +9,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const responsesWebSearchFunctionPrefix = "__sub4api_web_search"
+// The synthesized function-tool name must carry no proxy branding: it is
+// declared upstream verbatim. The client never sees it (the stream rewrite
+// maps it back to `web_search`), so any neutral, collision-checked name works.
+const responsesWebSearchFunctionPrefix = "client_web_search"
 
 type responsesWebSearchPlan struct {
 	Body               []byte

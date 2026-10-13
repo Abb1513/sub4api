@@ -8,7 +8,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Pin the current file version without preventing atomic conversation updates.
+// Allow deletion of an already-open immutable payload without invalidating its reader.
 func openAuditSnapshot(path string) (*os.File, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {

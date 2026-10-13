@@ -108,7 +108,7 @@ func (h *UserRequestAuditHandler) Conversation(c *gin.Context) {
 }
 
 func parseUserRequestAuditFilter(c *gin.Context, page, pageSize int) (service.UserRequestAuditFilter, error) {
-	filter := service.UserRequestAuditFilter{Page: page, PageSize: pageSize, GroupName: strings.TrimSpace(c.Query("group_name")), Protocol: strings.TrimSpace(c.Query("protocol")), RequestedModel: strings.TrimSpace(c.Query("requested_model")), ResponseID: strings.TrimSpace(c.Query("response_id")), ClientRequestID: strings.TrimSpace(c.Query("client_request_id")), Status: strings.TrimSpace(c.Query("status")), Q: strings.TrimSpace(c.Query("q")), Legacy: strings.EqualFold(strings.TrimSpace(c.Query("legacy")), "true")}
+	filter := service.UserRequestAuditFilter{Page: page, PageSize: pageSize, GroupName: strings.TrimSpace(c.Query("group_name")), Protocol: strings.TrimSpace(c.Query("protocol")), RequestedModel: strings.TrimSpace(c.Query("requested_model")), ResponseID: strings.TrimSpace(c.Query("response_id")), ClientRequestID: strings.TrimSpace(c.Query("client_request_id")), Status: strings.TrimSpace(c.Query("status")), Q: strings.TrimSpace(c.Query("q"))}
 	parseID := func(name string) (*int64, error) {
 		raw := strings.TrimSpace(c.Query(name))
 		if raw == "" {
@@ -221,7 +221,6 @@ func (h *UserRequestAuditHandler) Export(c *gin.Context) {
 		Q               string  `json:"q"`
 		StartTime       string  `json:"start_time"`
 		EndTime         string  `json:"end_time"`
-		Legacy          bool    `json:"legacy"`
 		ConversationIDs []int64 `json:"conversation_ids"`
 	}
 	if c.Request.ContentLength != 0 {
@@ -264,9 +263,6 @@ func (h *UserRequestAuditHandler) Export(c *gin.Context) {
 	}
 	if req.Q != "" {
 		filter.Q = req.Q
-	}
-	if req.Legacy {
-		filter.Legacy = true
 	}
 	parseBodyTime := func(raw string) (*time.Time, error) {
 		if strings.TrimSpace(raw) == "" {

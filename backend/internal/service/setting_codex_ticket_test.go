@@ -38,10 +38,14 @@ func TestCodexTicketEnabledRuntimeSettingOverridesYaml(t *testing.T) {
 	repo.values[SettingKeyOpenAICodexTicketEnabled] = "true"
 	settings.InvalidateOpenAICodexTicketEnabledCache()
 	require.True(t, svc.openAICodexTicketEnabled())
-	h = http.Header{}
-	h.Set(openAICodexTurnStateHeader, "client-state")
-	require.NoError(t, svc.applyOpenAICodexTicket(context.Background(), account, "gpt-6-astra", h))
-	require.Equal(t, fakeCodexTicketState(292), h.Get(openAICodexTurnStateHeader))
+	echoed := http.Header{}
+	echoed.Set(openAICodexTurnStateHeader, "client-state")
+	require.NoError(t, svc.applyOpenAICodexTicket(context.Background(), account, "gpt-6-astra", echoed))
+	require.Equal(t, "client-state", echoed.Get(openAICodexTurnStateHeader))
+	// 开启且客户端未回带时才注入票。
+	fresh := http.Header{}
+	require.NoError(t, svc.applyOpenAICodexTicket(context.Background(), account, "gpt-6-astra", fresh))
+	require.Equal(t, fakeCodexTicketState(292), fresh.Get(openAICodexTurnStateHeader))
 
 	repo.values[SettingKeyOpenAICodexTicketEnabled] = "false"
 	settings.InvalidateOpenAICodexTicketEnabledCache()

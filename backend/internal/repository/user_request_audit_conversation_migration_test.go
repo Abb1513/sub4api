@@ -3,117 +3,87 @@ package repository
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
 )
 
-func TestAuditConversationMigratesLatestSnapshotsThenArchivesOriginal(t *testing.T) {
-	t.Setenv("DATA_DIR", t.TempDir())
-	root := filepath.Join(os.Getenv("DATA_DIR"), "user-request-audit")
-	if err := os.MkdirAll(root, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	first := &service.UserRequestAudit{ID: 1, UserID: 1, APIKeyID: 2, SessionID: "s", LogicalKey: "a", CreatedAt: now, UpdatedAt: now, Status: "received", RequestChatML: "first"}
-	var raw bytes.Buffer
-	encoder := json.NewEncoder(&raw)
-	if err := encoder.Encode(userRequestAuditFileLine{LogicalKey: "a", UserRequestAudit: first}); err != nil {
-		t.Fatal(err)
-	}
-	completed := *first
-	completed.UpdatedAt = now.Add(time.Second)
-	completed.ResponseChatML = "final evidence"
-	completed.Status = "completed"
-	encoder.Encode(userRequestAuditFileLine{LogicalKey: "a", UserRequestAudit: &completed})
-	second := &service.UserRequestAudit{ID: 2, UserID: 1, APIKeyID: 2, SessionID: "s", LogicalKey: "b", CreatedAt: now.Add(time.Minute), UpdatedAt: now.Add(time.Minute), Status: "failed", RequestChatML: "second"}
-	encoder.Encode(userRequestAuditFileLine{LogicalKey: "b", UserRequestAudit: second})
-	original := filepath.Join(root, "old.ndjson")
-	if err := os.WriteFile(original, raw.Bytes(), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	r := NewFileUserRequestAuditRepository(nil)
-	conversation, err := r.GetConversation(context.Background(), 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if conversation.RequestCount != 2 || conversation.Requests[0].ResponseChatML != "final evidence" {
-		t.Fatalf("migration %+v", conversation)
-	}
-	if len(conversationFiles(t, r)) != 1 {
-		t.Fatal("migration did not consolidate session")
-	}
-	archived, err := os.ReadFile(filepath.Join(root+"-migration-backup", "old.ndjson"))
-	if err != nil || !bytes.Equal(archived, raw.Bytes()) {
-		t.Fatalf("original backup changed %v", err)
-	}
-	if _, err = os.Stat(original); !os.IsNotExist(err) {
-		t.Fatal("legacy source still active")
-	}
-	if !r.state.Migrated {
-		t.Fatal("missing migration marker")
-	}
-	if _, err = r.Clear(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	reopened := NewFileUserRequestAuditRepository(nil)
-	if _, total, err := reopened.ListConversations(context.Background(), service.UserRequestAuditFilter{}); err != nil || total != 0 {
-		t.Fatal("migration resurrected cleared evidence")
-	}
-}
-
-func TestAuditMigrationFailureKeepsOriginalEvidence(t *testing.T) {
-	t.Setenv("DATA_DIR", t.TempDir())
-	root := filepath.Join(os.Getenv("DATA_DIR"), "user-request-audit")
-	os.MkdirAll(root, 0o750)
-	original := []byte("{\"id\":1,\"logical_key\":\"a\",\"request_chatml\":\"evidence\"}\n{\"id\":")
-	path := filepath.Join(root, "broken.ndjson")
-	if err := os.WriteFile(path, original, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	r := NewFileUserRequestAuditRepository(nil)
-	if _, _, err := r.ListConversations(context.Background(), service.UserRequestAuditFilter{}); err == nil {
-		t.Fatal("invalid legacy tail silently discarded")
-	}
-	got, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(got, original) {
-		t.Fatal("failed migration changed original")
-	}
-}
-
-func TestAuditConversationRecoversInterruptedPublicationAndDeletion(t *testing.T) {
+func TestAuditOrphanFilesNeverBecomeDatabaseRecords(t *testing.T) {
 	r := auditConversationTestRepository(t)
+	for _, relative := range []string{"conversations/999.json", "payloads/orphan.json", "broken.ndjson", "state.json"} {
+		path := filepath.Join(r.root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("{malformed"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A directory where an orphan payload might be expected is unreadable as JSON
+	// on all platforms, including Windows where chmod(000) is not reliable.
+	if err := os.MkdirAll(filepath.Join(r.root, "payloads", "unreadable.json"), 0o750); err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	row := &service.UserRequestAudit{LogicalKey: "a", SessionID: "s", RequestChatML: "before"}
-	if err := r.Create(ctx, row); err != nil {
+	reopened := auditReopen(r)
+	if _, n, err := reopened.List(ctx, service.UserRequestAuditFilter{}); err != nil || n != 0 {
+		t.Fatalf("bootstrap scanned orphan: %d %v", n, err)
+	}
+	if _, n, err := reopened.ListConversations(ctx, service.UserRequestAuditFilter{}); err != nil || n != 0 {
+		t.Fatalf("conversation bootstrap scanned orphan: %d %v", n, err)
+	}
+	row := &service.UserRequestAudit{LogicalKey: "live", RequestedModel: "indexed", RequestChatML: "human evidence"}
+	auditCreate(t, reopened, row)
+	// Even a referenced malformed payload must not affect metadata operations.
+	path := auditRequestPath(t, reopened, row.ID)
+	if err := os.WriteFile(path, []byte("{malformed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	changed := *row
-	changed.ResponseChatML = "after"
-	changed.Status = "completed"
-	doc := r.makeDocument([]*service.UserRequestAudit{&changed}, row.ID)
-	if err := auditAtomicJSON(r.pendingPath(row.ID), doc); err != nil {
-		t.Fatal(err)
+	again := auditReopen(reopened)
+	if rows, n, err := again.List(ctx, service.UserRequestAuditFilter{Q: "indexed"}); err != nil || n != 1 || len(rows) != 1 {
+		t.Fatalf("list read payload: %d %v", n, err)
 	}
-	r.state.PendingIDs = []int64{row.ID}
-	if err := r.saveStateLocked(); err != nil {
-		t.Fatal(err)
+	if _, n, err := again.ListConversations(ctx, service.UserRequestAuditFilter{}); err != nil || n != 1 {
+		t.Fatalf("conversation list read payload: %d %v", n, err)
 	}
-	reopened := NewFileUserRequestAuditRepository(nil)
-	got, err := reopened.GetByID(ctx, row.ID)
-	if err != nil || got.ResponseChatML != "after" {
-		t.Fatalf("publication recovery %+v %v", got, err)
+	status := again.StorageStatus()
+	if status.FileCount != 1 || status.TotalBytes <= 0 {
+		t.Fatalf("SQL storage stats: %+v", status)
 	}
-	reopened.state.DeleteIDs = []int64{row.ID}
-	if err = reopened.saveStateLocked(); err != nil {
-		t.Fatal(err)
+	svc := service.NewUserRequestAuditService(again, nil)
+	stats, err := svc.GroupStats(ctx, service.UserRequestAuditFilter{})
+	if err != nil || len(stats) != 1 {
+		t.Fatalf("group stats read payload: %+v %v", stats, err)
 	}
-	deleted := NewFileUserRequestAuditRepository(nil)
-	if _, total, err := deleted.ListConversations(ctx, service.UserRequestAuditFilter{}); err != nil || total != 0 {
-		t.Fatalf("delete recovery %d %v", total, err)
+	other := &service.UserRequestAudit{LogicalKey: "unrelated", RequestChatML: "unrelated evidence"}
+	auditCreate(t, again, other)
+	if got, err := again.GetByID(ctx, other.ID); err != nil || got.RequestChatML != "unrelated evidence" {
+		t.Fatalf("unrelated read: %+v %v", got, err)
+	}
+	if _, err := again.GetByID(ctx, row.ID); err == nil {
+		t.Fatal("human read concealed corrupt payload")
+	}
+	var out bytes.Buffer
+	if _, err := again.ExportConversations(ctx, service.UserRequestAuditFilter{}, []int64{row.ID}, &out, "jsonl"); err == nil {
+		t.Fatal("export concealed corrupt payload")
+	}
+	if n, err := again.Clear(ctx); err != nil || n != 2 {
+		t.Fatalf("clear read payload: %d %v", n, err)
+	}
+	if _, n, err := auditReopen(again).List(ctx, service.UserRequestAuditFilter{}); err != nil || n != 0 {
+		t.Fatalf("orphan resurrection: %d %v", n, err)
+	}
+}
+
+func TestAuditRepositoryWithoutDatabaseFailsClosed(t *testing.T) {
+	t.Setenv("DATA_DIR", t.TempDir())
+	r := NewFileUserRequestAuditRepository(nil)
+	if _, _, err := r.List(context.Background(), service.UserRequestAuditFilter{}); err == nil {
+		t.Fatal("nil DB silently used file authority")
+	}
+	if err := r.Create(context.Background(), &service.UserRequestAudit{LogicalKey: "no-db"}); err == nil {
+		t.Fatal("nil DB capture succeeded")
 	}
 }

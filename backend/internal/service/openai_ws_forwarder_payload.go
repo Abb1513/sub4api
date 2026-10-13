@@ -158,6 +158,9 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithTicket(
 	if state := strings.TrimSpace(turnState); state != "" {
 		headers.Set(openAIWSTurnStateHeader, state)
 	}
+	// 与 HTTP 出站同一守卫：异账号铸造的回带先剥离，剩下的就是本回合
+	// 真实血统；applyOpenAICodexTicketWithGeneration 只在头缺失时注入。
+	s.guardOpenAICodexTurnStateEcho(c, account, headers)
 	ticket, err := s.applyOpenAICodexTicketWithGeneration(ctx, account, routingModel, headers)
 	if err != nil {
 		return nil, sessionResolution, nil, err
@@ -418,11 +421,11 @@ func setPreviousResponseIDToRawPayload(payload []byte, previousResponseID string
 		return nil, err
 	}
 	reqBody["previous_response_id"] = normalizedPrevID
-	rebuilt, marshalErr := json.Marshal(reqBody)
+	rebuilt, marshalErr := marshalOpenAIUpstreamJSON(reqBody)
 	if marshalErr != nil {
 		return nil, marshalErr
 	}
-	return rebuilt, nil
+	return restoreOpenAIUpstreamJSONTopLevelOrder(payload, rebuilt), nil
 }
 
 type openAIWSContextWindowBoundary struct {
