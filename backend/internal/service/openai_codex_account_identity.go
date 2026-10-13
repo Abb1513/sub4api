@@ -103,14 +103,28 @@ func scopeCodexAccountIdentityValue(account *Account, apiKeyID int64, kind, raw 
 			return scopeCodexAccountIdentityValue(account, apiKeyID, "thread", thread) + ":" + ordinal
 		}
 	}
-	return deriveStableUUIDv4(fmt.Sprintf(
+	seed := fmt.Sprintf(
 		"sub2api:codex-account-identity:%s:user:%d:account:%s:kind:%s:value:%s",
 		codexAccountIdentityNamespaceVersion,
 		apiKeyID,
 		namespace,
 		kind,
 		raw,
-	))
+	)
+	// 官方 session_id / thread_id / turn_id 恒为 Uuid::now_v7()，installation_id
+	// 才是 Uuid::new_v4()。改写成账号级值时必须保持同一版本，否则出站头的
+	// 版本半字节（v4 vs v7）与官方客户端逐字节不一致；同时保留原值的 v7
+	// 时间戳，使「turn_id 时刻 ≈ turn_started_at」这类官方时间一致性在改写
+	// 后依然成立。原值不是 v7 时退回种子派生的稳定过去锚点。
+	switch kind {
+	case "session", "thread", "turn":
+		anchorMs, ok := codexV7TimestampMs(raw)
+		if !ok {
+			anchorMs = deriveCodexStableTimestampMs(seed)
+		}
+		return deriveStableCodexUUIDv7(seed, anchorMs)
+	}
+	return deriveStableUUIDv4(seed)
 }
 
 var codexAccountIdentityFields = []struct {
