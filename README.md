@@ -1,18 +1,19 @@
-**社区地址：[macos.do](https://macos.do)**
-
-**TG 交流群：[t.me/macosdo](https://t.me/macosdo)**
-
 <div align="center">
 
 <img src="assets/logo.svg" alt="Sub4API 标志" width="128" />
 
-# Sub4API
+# Sub6API
 
-**兼容 sub2api，增强 Codex 使用体验**
+**完全重写Claude,codex协议的SUB2API，基于SUB4API二开, 前AI时代的OLD School手艺人打造,无OpenAI降智,无Claude封号**
 
 </div>
 
-Sub4API 基于 sub2api 二次开发，完全兼容 sub2api，并会持续同步合并 sub2api 的版本更新。
+# 为什么是Sub6API
+> 网上所有SUBXAPI特征都非常多,有些特征低级的可怕,一看就是不懂技术没搞过协议模拟的人用AI写的泔水，用了就是自爆卡车。SUB6API重写了这些协议，完全吻合claudecode和codex特征，实现了不降智，不封号。
+
+# Sub4Api
+
+Sub6API基于 Sub4API开发，Sub4API 基于 sub2api 二次开发，完全兼容 sub2api，并会持续同步合并 sub2api 的版本更新。
 
 在原有 API 网关与账号管理能力的基础上，Sub4API 重点增强 **Codex 打票与票据管理、请求时区替换以及请求头语言统一**，并提供票据流水和降智检测，方便管理与排查账号状态。
 
