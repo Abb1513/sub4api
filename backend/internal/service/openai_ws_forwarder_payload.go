@@ -131,6 +131,13 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithTicket(
 				headers.Set(name, value)
 			}
 		}
+		if account != nil && account.UsesOpenAICodexProtocol() {
+			for _, name := range [...]string{"x-codex-parent-thread-id", "x-openai-subagent", "x-openai-memgen-request", "x-responsesapi-include-timing-metrics"} {
+				if value := strings.TrimSpace(c.Request.Header.Get(name)); value != "" {
+					headers.Set(name, value)
+				}
+			}
+		}
 	}
 	// 真实 Codex 的 WS 握手同样携带会话级 x-codex-beta-features
 	// （client.rs build_websocket_headers 复用 build_responses_headers），
@@ -233,10 +240,10 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithTicket(
 
 	// WS 握手线序收口：官方握手集 = build_responses_headers + originator +
 	// x-client-request-id + session-id/thread-id + 兼容头 + routing hint +
-	// OpenAI-Beta（core/src/client.rs:1304-1330）。session_id、conversation_id、
-	// x-codex-installation-id、version、accept-language 五个名字官方握手从不携带，
-	// 上面为了兼容旧行为都补过，这里统一削平；OpenAI-Beta 与 x-client-request-id
-	// 是官方 WS 专有头，保留。
+	// OpenAI-Beta (core/src/client.rs:1304-1337). Provider/auth/default headers
+	// are merged separately, including version and account authentication.
+	// Legacy underscore IDs, installation-id and accept-language are stripped;
+	// OpenAI-Beta and x-client-request-id remain on the WS lane.
 	//
 	// 注意：这只是本函数输出的第一道收口。三条 WS 通道（v2 forwarder、
 	// v2 passthrough adapter、ingress）在拿到头之后还会调用

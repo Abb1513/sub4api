@@ -399,7 +399,11 @@ func normalizeCodexClientMetadata(cm map[string]any, headers http.Header, isComp
 		}
 		set(cm, openAIWSTurnMetadataHeader, string(raw))
 		if headers != nil {
-			headers.Set(openAIWSTurnMetadataHeader, string(raw))
+			headerRaw, err := sjson.DeleteBytes(raw, "tool_namespaces_info")
+			if err != nil {
+				return false, err
+			}
+			headers.Set(openAIWSTurnMetadataHeader, string(headerRaw))
 		}
 	}
 	return changed, nil
@@ -552,7 +556,11 @@ func ensureCodexClientMetadataDefaults(cm map[string]any, headers http.Header, b
 		headers.Set("x-client-request-id", threadID)
 		headers.Set("x-codex-window-id", windowID)
 		headers.Set("session_id", sessionID)
-		headers.Set(openAIWSTurnMetadataHeader, string(raw))
+		headerRaw, err := sjson.DeleteBytes(raw, "tool_namespaces_info")
+		if err != nil {
+			return false, err
+		}
+		headers.Set(openAIWSTurnMetadataHeader, string(headerRaw))
 	}
 	return changed, nil
 }
