@@ -167,6 +167,8 @@ func TestBuildOpenAIWSHeadersNamespacesCodexIdentityByOAuthAccount(t *testing.T)
 	}
 	require.Empty(t, first.Get("session_id"), "official WS handshake never sends the underscored session header")
 	require.Empty(t, first.Get("x-codex-installation-id"), "installation id belongs to client_metadata, not the handshake")
+	require.Empty(t, first.Get("conversation_id"), "official WS handshake never sends the conversation_id header")
+	require.Empty(t, first.Get("x-oai-attestation"), "ordinary Responses WS must not fabricate attestation")
 
 	httpRequest, err := service.buildUpstreamRequest(
 		context.Background(), c, account11,
