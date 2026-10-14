@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/service"
 )
@@ -112,6 +112,40 @@ func (r *FileUserRequestAuditRepository) ListConversations(ctx context.Context, 
 		err = r.labelUsers(ctx, rows)
 	}
 	return rows, total, err
+}
+
+// ListModelFacets reports the models actually present in the retained archive so
+// callers select from evidence instead of guessing model strings. Request-level
+// predicates are shared with listing/export, so the facets track the active
+// time/group/protocol filters exactly.
+func (r *FileUserRequestAuditRepository) ListModelFacets(ctx context.Context, f service.UserRequestAuditFilter) ([]service.UserRequestAuditModelFacet, error) {
+	if err := r.requireDB(); err != nil {
+		return nil, err
+	}
+	where, args := auditSQLConditions(f, true)
+	result, err := r.db.QueryContext(ctx, `SELECT COALESCE(q.metadata->>'protocol',''), q.metadata->>'requested_model', count(*), count(DISTINCT q.conversation_id), max(q.created_at) FROM user_request_audit_request_index q JOIN user_request_audit_conversations c ON c.id=q.conversation_id WHERE `+where+` AND COALESCE(q.metadata->>'requested_model','') <> '' GROUP BY 1,2 ORDER BY count(*) DESC,1,2 LIMIT 500`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer result.Close()
+	out := make([]service.UserRequestAuditModelFacet, 0)
+	for result.Next() {
+		var facet service.UserRequestAuditModelFacet
+		var latest any
+		if err := result.Scan(&facet.Protocol, &facet.RequestedModel, &facet.Requests, &facet.Conversations, &latest); err != nil {
+			return nil, err
+		}
+		switch value := latest.(type) {
+		case time.Time:
+			facet.LatestAt = value.UTC()
+		case string:
+			if parsed, e := time.Parse(time.RFC3339Nano, value); e == nil {
+				facet.LatestAt = parsed.UTC()
+			}
+		}
+		out = append(out, facet)
+	}
+	return out, result.Err()
 }
 
 func auditResolveConversationIDs(ctx context.Context, tx *sql.Tx, ids []int64) ([]int64, error) {
@@ -240,7 +274,7 @@ func (r *FileUserRequestAuditRepository) loadConversation(ctx context.Context, t
 	if err = auditLabelUsers(ctx, tx, rows); err != nil {
 		return nil, err
 	}
-	return &service.UserRequestAuditConversation{ID: id, UserLabel: rows[0].UserLabel, RequestCount: len(rows), Requests: rows, Messages: service.BuildUserRequestAuditTranscript(rows)}, nil
+	return &service.UserRequestAuditConversation{ID: id, UserLabel: rows[0].UserLabel, RequestCount: len(rows), RequestStart: 1, RequestEnd: len(rows), Requests: rows, Messages: service.BuildUserRequestAuditTranscript(rows)}, nil
 }
 
 func (r *FileUserRequestAuditRepository) GetConversation(ctx context.Context, id int64) (*service.UserRequestAuditConversation, error) {
@@ -265,20 +299,29 @@ func (r *FileUserRequestAuditRepository) GetConversation(ctx context.Context, id
 	return doc, tx.Commit()
 }
 
-func (r *FileUserRequestAuditRepository) GetByID(ctx context.Context, id int64) (*service.UserRequestAudit, error) {
-	doc, err := r.GetConversation(ctx, id)
+// GetConversationWindow reads one request range of a conversation. The reader
+// lock is held for the same reason as a full read: immutable payload files must
+// not be deleted while their paths are still being resolved from SQL.
+func (r *FileUserRequestAuditRepository) GetConversationWindow(ctx context.Context, id int64, offset, limit int) (*service.UserRequestAuditConversation, error) {
+	if err := r.requireDB(); err != nil {
+		return nil, err
+	}
+	r.payloadMu.RLock()
+	defer r.payloadMu.RUnlock()
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
-	for _, row := range doc.Requests {
-		if row.ID == id {
-			normalizeConversationKey(row)
-			row.ChatML = auditMessagesTranscript(doc.Messages)
-			row.RequestCount = doc.RequestCount
-			return row, nil
-		}
+	defer tx.Rollback()
+	ids, err := auditResolveConversationIDs(ctx, tx, []int64{id})
+	if err != nil {
+		return nil, err
 	}
-	return nil, sql.ErrNoRows
+	doc, _, _, err := r.loadConversationWindow(ctx, tx, ids[0], offset, limit)
+	if err != nil {
+		return nil, err
+	}
+	return doc, tx.Commit()
 }
 
 // Exports use one repeatable-read SQL snapshot and pin immutable files against
@@ -304,39 +347,30 @@ func (r *FileUserRequestAuditRepository) ExportConversations(ctx context.Context
 	}
 	defer tx.Rollback()
 	var summaries []*service.UserRequestAudit
-	if len(ids) == 0 {
-		where, args := auditSQLConditions(f, false)
-		result, e := tx.QueryContext(ctx, "SELECT c.summary FROM user_request_audit_conversations c WHERE "+where+" ORDER BY c.updated_at DESC,c.id DESC", args...)
-		if e != nil {
-			return 0, e
-		}
-		summaries, err = readAuditMetadataRows(result)
-	} else {
+	where, args := auditSQLConditions(f, false)
+	if len(ids) > 0 {
+		// The selection narrows the filtered set; filters always apply, so an
+		// export of selected conversations honours the active model/group/time filters.
 		var resolved []int64
 		resolved, err = auditResolveConversationIDs(ctx, tx, ids)
 		if err != nil {
 			return 0, err
 		}
-		sort.Slice(resolved, func(i, j int) bool { return resolved[i] > resolved[j] })
-		for _, id := range resolved {
-			var raw []byte
-			where, args := auditSQLConditions(f, false)
-			args = append(args, id)
-			err = tx.QueryRowContext(ctx, "SELECT c.summary FROM user_request_audit_conversations c WHERE "+where+fmt.Sprintf(" AND c.id=$%d", len(args)), args...).Scan(&raw)
-			if err == sql.ErrNoRows {
-				err = nil
-				continue
-			}
-			if err != nil {
-				return 0, err
-			}
-			summary := new(service.UserRequestAudit)
-			if err = json.Unmarshal(raw, summary); err != nil {
-				return 0, err
-			}
-			summaries = append(summaries, summary)
+		if len(resolved) == 0 {
+			return 0, nil
 		}
+		placeholders := make([]string, 0, len(resolved))
+		for _, id := range resolved {
+			args = append(args, id)
+			placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
+		}
+		where += " AND c.id IN (" + strings.Join(placeholders, ",") + ")"
 	}
+	result, e := tx.QueryContext(ctx, "SELECT c.summary FROM user_request_audit_conversations c WHERE "+where+" ORDER BY c.updated_at DESC,c.id DESC", args...)
+	if e != nil {
+		return 0, e
+	}
+	summaries, err = readAuditMetadataRows(result)
 	if err != nil {
 		return 0, err
 	}

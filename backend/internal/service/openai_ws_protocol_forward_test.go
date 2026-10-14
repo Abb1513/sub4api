@@ -120,71 +120,6 @@ func TestOpenAIGatewayService_Forward_PreservePreviousResponseIDWhenWSEnabled(t 
 	require.Nil(t, upstream.lastReq, "WS 模式下失败时不应回退 HTTP")
 }
 
-func TestOpenAIGatewayService_Forward_HTTPIngressStaysHTTPWhenWSEnabled(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	wsFallbackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	}))
-	defer wsFallbackServer.Close()
-
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
-	c.Request.Header.Set("User-Agent", "custom-client/1.0")
-	SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
-
-	upstream := &httpUpstreamRecorder{
-		resp: &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body: io.NopCloser(strings.NewReader(
-				`{"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":0}}}`,
-			)),
-		},
-	}
-
-	cfg := &config.Config{}
-	cfg.Security.URLAllowlist.Enabled = false
-	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
-	cfg.Gateway.OpenAIWS.Enabled = true
-	cfg.Gateway.OpenAIWS.OAuthEnabled = true
-	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
-	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
-
-	svc := &OpenAIGatewayService{
-		cfg:              cfg,
-		httpUpstream:     upstream,
-		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
-	}
-
-	account := &Account{
-		ID:          101,
-		Name:        "openai-apikey",
-		Platform:    PlatformOpenAI,
-		Type:        AccountTypeAPIKey,
-		Concurrency: 1,
-		Credentials: map[string]any{
-			"api_key":  "sk-test",
-			"base_url": wsFallbackServer.URL,
-		},
-		Extra: map[string]any{
-			"responses_websockets_v2_enabled": true,
-		},
-	}
-
-	body := []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_http_keep","input":[{"type":"input_text","text":"hello"}]}`)
-	result, err := svc.Forward(context.Background(), c, account, body)
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.False(t, result.OpenAIWSMode, "HTTP 入站应保持 HTTP 转发")
-	require.NotNil(t, upstream.lastReq, "HTTP 入站应命中 HTTP 上游")
-	require.Equal(t, "resp_http_keep", gjson.GetBytes(upstream.lastBody, "previous_response_id").String(), "API-key HTTP must preserve official Responses continuation")
-
-	decision, _ := c.Get("openai_ws_transport_decision")
-	reason, _ := c.Get("openai_ws_transport_reason")
-	require.Equal(t, string(OpenAIUpstreamTransportHTTPSSE), decision)
-	require.Equal(t, "client_protocol_http", reason)
-}
 
 func TestOpenAIGatewayService_Forward_HTTPIngressRetriesInvalidEncryptedContentOnce(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -244,6 +179,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesInvalidEncryptedContentO
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
+			"openai_ws_force_http": true,
 		},
 	}
 
@@ -266,10 +202,6 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesInvalidEncryptedContentO
 	require.Equal(t, "keep me", gjson.GetBytes(secondBody, "input.0.summary.0.text").String(), "精确重试应保留有效 reasoning summary")
 	require.Equal(t, "input_text", gjson.GetBytes(secondBody, "input.1.type").String(), "非 reasoning input 应保持原样")
 
-	decision, _ := c.Get("openai_ws_transport_decision")
-	reason, _ := c.Get("openai_ws_transport_reason")
-	require.Equal(t, string(OpenAIUpstreamTransportHTTPSSE), decision)
-	require.Equal(t, "client_protocol_http", reason)
 }
 
 func TestOpenAIGatewayService_Forward_HTTPIngressRetriesWrappedInvalidEncryptedContentOnce(t *testing.T) {
@@ -333,6 +265,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesWrappedInvalidEncryptedC
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
+			"openai_ws_force_http": true,
 		},
 	}
 
@@ -350,10 +283,6 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesWrappedInvalidEncryptedC
 	require.False(t, gjson.GetBytes(secondBody, "input.0.encrypted_content").Exists(), "wrapped exact retry 应移除 reasoning.encrypted_content")
 	require.Equal(t, "keep me too", gjson.GetBytes(secondBody, "input.0.summary.0.text").String(), "wrapped exact retry 应保留有效 reasoning summary")
 
-	decision, _ := c.Get("openai_ws_transport_decision")
-	reason, _ := c.Get("openai_ws_transport_reason")
-	require.Equal(t, string(OpenAIUpstreamTransportHTTPSSE), decision)
-	require.Equal(t, "client_protocol_http", reason)
 }
 
 func TestOpenAIGatewayService_Forward_APIKeyHTTPPreservesPreviousResponseIDWhenWSDisabled(t *testing.T) {

@@ -110,6 +110,48 @@ func TestAuditConversationScopeAndBranches(t *testing.T) {
 	}
 }
 
+func TestAuditExportSelectionIntersectsFiltersAndModelFacets(t *testing.T) {
+	r := auditConversationTestRepository(t)
+	ctx := context.Background()
+	group := int64(4)
+	base := &service.UserRequestAudit{UserID: 10, APIKeyID: 20, GroupID: &group, Protocol: "anthropic_messages", RequestedModel: "claude-opus-4-1", LogicalKey: "opus", ResponseID: "o1", RequestChatML: "opus prompt", Status: "completed"}
+	auditCreate(t, r, base)
+	gpt := *base
+	gpt.ID, gpt.LogicalKey, gpt.ResponseID, gpt.RequestedModel, gpt.Protocol, gpt.RequestChatML = 0, "gpt", "g1", "gpt-5.1-codex", "openai_responses", "gpt prompt"
+	auditCreate(t, r, &gpt)
+
+	// Selecting both conversations while filtering by model exports only the
+	// model's conversation: the selection narrows the filtered set.
+	var out bytes.Buffer
+	n, err := r.ExportConversations(ctx, service.UserRequestAuditFilter{RequestedModel: "claude-opus-4-1"}, []int64{base.ID, gpt.ID}, &out, "jsonl")
+	if err != nil || n != 1 {
+		t.Fatalf("filtered selection export: %d %v", n, err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("opus prompt")) || bytes.Contains(out.Bytes(), []byte("gpt prompt")) {
+		t.Fatalf("filter ignored during selection export: %s", out.Bytes())
+	}
+
+	facets, err := r.ListModelFacets(ctx, service.UserRequestAuditFilter{})
+	if err != nil || len(facets) != 2 {
+		t.Fatalf("facets: %+v %v", facets, err)
+	}
+	reported := map[string]service.UserRequestAuditModelFacet{}
+	for _, facet := range facets {
+		reported[facet.RequestedModel] = facet
+	}
+	if got := reported["claude-opus-4-1"]; got.Protocol != "anthropic_messages" || got.Requests != 1 || got.Conversations != 1 {
+		t.Fatalf("claude facet: %+v", got)
+	}
+	if got := reported["gpt-5.1-codex"]; got.Protocol != "openai_responses" || got.Requests != 1 {
+		t.Fatalf("openai facet: %+v", got)
+	}
+	// Facets honour the protocol filter so the picker can be scoped.
+	scoped, err := r.ListModelFacets(ctx, service.UserRequestAuditFilter{Protocol: "openai_responses"})
+	if err != nil || len(scoped) != 1 || scoped[0].RequestedModel != "gpt-5.1-codex" {
+		t.Fatalf("protocol-scoped facets: %+v %v", scoped, err)
+	}
+}
+
 func TestAuditConversationReaderExportAndRestart(t *testing.T) {
 	r := auditConversationTestRepository(t)
 	ctx := context.Background()

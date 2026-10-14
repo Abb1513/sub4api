@@ -13,9 +13,19 @@ import (
 
 	"github.com/MACOS-DO/sub4api/internal/pkg/logger"
 	"github.com/MACOS-DO/sub4api/internal/util/responseheaders"
+	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
+
+func isOpenAIWSGracefulClose(err error) bool {
+	switch websocket.CloseStatus(err) {
+	case websocket.StatusNormalClosure, websocket.StatusGoingAway, websocket.StatusServiceRestart:
+		return true
+	default:
+		return false
+	}
+}
 
 func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	ctx context.Context,
@@ -151,7 +161,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 	}
 	storeDisabled := s.isOpenAIWSStoreDisabledInRequest(reqBody, account)
-	if stateStore != nil && storeDisabled && previousResponseID == "" && sessionHash != "" {
+	if stateStore != nil && previousResponseID == "" && sessionHash != "" {
 		if connID, ok := stateStore.GetSessionConn(groupID, sessionHash); ok {
 			preferredConnID = connID
 		}
@@ -619,6 +629,23 @@ readLoop:
 				}
 				break
 			}
+			if wroteDownstream && reqStream && isOpenAIWSGracefulClose(readErr) {
+				incomplete := map[string]any{
+					"type": "response.incomplete",
+					"response": map[string]any{
+						"id":                 responseID,
+						"object":             "response",
+						"status":             "incomplete",
+						"incomplete_details": map[string]any{"reason": "server_error"},
+					},
+				}
+				if eventBytes, marshalErr := json.Marshal(incomplete); marshalErr == nil {
+					upstreamTerminalEvent = "response.incomplete"
+					terminalEventCount++
+					emitStreamMessage(eventBytes, true)
+					break readLoop
+				}
+			}
 			if !wroteDownstream {
 				return nil, wrapOpenAIWSFallback(classifyOpenAIWSReadFallbackReason(readErr), readErr)
 			}
@@ -844,7 +871,7 @@ readLoop:
 		logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, stateStore.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
 		stateStore.BindResponseConn(responseID, lease.ConnID(), ttl)
 	}
-	if stateStore != nil && storeDisabled && sessionHash != "" {
+	if stateStore != nil && sessionHash != "" {
 		stateStore.BindSessionConn(groupID, sessionHash, lease.ConnID(), s.openAIWSSessionStickyTTL())
 	}
 	firstTokenMsValue := -1

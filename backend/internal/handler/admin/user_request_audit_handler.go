@@ -95,7 +95,17 @@ func (h *UserRequestAuditHandler) Conversation(c *gin.Context) {
 		response.BadRequest(c, "Invalid conversation id")
 		return
 	}
-	conversation, err := h.service.GetConversation(c.Request.Context(), id)
+	// Long conversations are read in request windows: a page costs the selected
+	// slice instead of every stored history copy, so opening them stays bounded.
+	offset, err := strconv.Atoi(strings.TrimSpace(c.Query("request_offset")))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	limit, err := strconv.Atoi(strings.TrimSpace(c.Query("request_limit")))
+	if err != nil || limit < 0 {
+		limit = 0
+	}
+	conversation, err := h.service.GetConversationWindow(c.Request.Context(), id, offset, limit)
 	if errors.Is(err, sql.ErrNoRows) {
 		response.ErrorWithDetails(c, http.StatusNotFound, "Conversation not found", "USER_REQUEST_AUDIT_NOT_FOUND", nil)
 		return
@@ -103,6 +113,14 @@ func (h *UserRequestAuditHandler) Conversation(c *gin.Context) {
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
+	}
+	// Each captured request stores a full copy of the history it replayed, so
+	// serializing them alongside the deduplicated messages would make the reader
+	// response grow quadratically. The reader renders messages; raw ChatML stays
+	// available on the single-request detail endpoint.
+	for _, request := range conversation.Requests {
+		request.RequestChatML = ""
+		request.ResponseChatML = ""
 	}
 	response.Success(c, conversation)
 }
@@ -204,6 +222,25 @@ func (h *UserRequestAuditHandler) Groups(c *gin.Context) {
 		return
 	}
 	response.Success(c, stats)
+}
+
+// Models lists the models present under the current filters so the console can
+// offer real choices instead of free-typed model names.
+func (h *UserRequestAuditHandler) Models(c *gin.Context) {
+	filter, err := parseUserRequestAuditFilter(c, 1, 200)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	// The facet list feeds the model picker itself, so the model predicate is
+	// dropped: options stay browsable while protocol/group/time filters narrow them.
+	filter.RequestedModel = ""
+	facets, err := h.service.ModelFacets(c.Request.Context(), filter)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, facets)
 }
 
 func (h *UserRequestAuditHandler) Export(c *gin.Context) {

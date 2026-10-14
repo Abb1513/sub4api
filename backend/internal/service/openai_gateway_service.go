@@ -33,7 +33,7 @@ const (
 	// OpenAI Platform API for API Key accounts (fallback)
 	openaiPlatformAPIURL            = "https://api.openai.com/v1/responses"
 	openaiPlatformAPIInputTokensURL = "https://api.openai.com/v1/responses/input_tokens"
-	openaiStickySessionTTL          = time.Hour // 粘性会话TTL
+	openaiStickySessionTTL          = 5 * time.Minute // 粘性会话TTL
 	// Local Codex baseline observed on this Windows host:
 	// Windows 10.0.22621.1848 / AMD64 / TERM=dumb.
 	// Keep explicit administrator UA settings authoritative; this is the built-in fallback.

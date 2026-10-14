@@ -26,7 +26,6 @@ export interface UserRequestAudit {
   metadata?: Record<string, unknown>
   request_chatml?: string
   response_chatml?: string
-  chatml?: string
   conversation_key?: string
   user_label?: string
   request_count?: number
@@ -45,6 +44,8 @@ export interface UserRequestAuditConversation {
   id: number
   user_label: string
   request_count: number
+  request_start: number
+  request_end: number
   messages: UserRequestAuditMessage[]
   requests: UserRequestAudit[]
 }
@@ -57,6 +58,7 @@ export interface UserRequestAuditConfig {
   group_ids: number[]
 }
 export interface UserRequestAuditStatus { total_bytes: number; file_count: number; disk_total_bytes: number; disk_free_bytes: number; recording_paused: boolean; pause_reason?: string; oldest_at?: string; latest_at?: string; last_cleanup_at?: string }
+export interface UserRequestAuditModelFacet { protocol: string; requested_model: string; requests: number; conversations: number; latest_at: string }
 export interface UserRequestAuditGroupStat { group_id?: number; group_name?: string; count: number; completed: number; failed: number; input_total: number; output_total: number; latest_at?: string }
 export type UserRequestAuditGroupStatsResponse = UserRequestAuditGroupStat[]
 export type UserRequestAuditExportFormat = 'jsonl' | 'json'
@@ -86,15 +88,19 @@ function filenameFromDisposition(value: unknown, format: UserRequestAuditExportF
 export const userRequestAuditAPI = {
   async list(params: UserRequestAuditQuery): Promise<PaginatedResponse<UserRequestAudit>> { return (await apiClient.get('/admin/user-request-audit', { params })).data },
   async get(id: number): Promise<UserRequestAudit> { return (await apiClient.get(`/admin/user-request-audit/${id}`)).data },
-  async getConversation(id: number, signal?: AbortSignal): Promise<UserRequestAuditConversation> { return (await apiClient.get(`/admin/user-request-audit/${id}/conversation`, { signal })).data },
+  async getConversationWindow(id: number, offset: number, limit: number, signal?: AbortSignal): Promise<UserRequestAuditConversation> {
+    return (await apiClient.get(`/admin/user-request-audit/${id}/conversation`, { params: { request_offset: offset, request_limit: limit }, signal })).data
+  },
   async getGroupStats(params: UserRequestAuditQuery): Promise<UserRequestAuditGroupStatsResponse> { return (await apiClient.get('/admin/user-request-audit/groups', { params: exportFilters(params) })).data },
+  async getModels(params: UserRequestAuditQuery, signal?: AbortSignal): Promise<UserRequestAuditModelFacet[]> { return (await apiClient.get('/admin/user-request-audit/models', { params: exportFilters(params), signal })).data },
   async getStatus(): Promise<UserRequestAuditStatus> { return (await apiClient.get('/admin/user-request-audit/status')).data },
   async getConfig(): Promise<UserRequestAuditConfig> { return (await apiClient.get('/admin/user-request-audit/config')).data },
   async updateConfig(config: Partial<UserRequestAuditConfig>): Promise<UserRequestAuditConfig> { return (await apiClient.put('/admin/user-request-audit/config', config)).data },
   async cleanup(): Promise<void> { await apiClient.post('/admin/user-request-audit/cleanup') },
   async clear(): Promise<{ message?: string }> { return (await apiClient.post('/admin/user-request-audit/clear')).data },
   async export(params: UserRequestAuditQuery, format: UserRequestAuditExportFormat, conversationIDs?: number[]): Promise<UserRequestAuditExportJob> {
-    const selection = conversationIDs?.length ? { conversation_ids: conversationIDs } : exportFilters(params)
+    // Selection narrows the filtered set; it never discards the active filters.
+    const selection = conversationIDs?.length ? { ...exportFilters(params), conversation_ids: conversationIDs } : exportFilters(params)
     return (await apiClient.post('/admin/user-request-audit/export', { format, ...selection })).data
   },
   async getExports(signal?: AbortSignal): Promise<UserRequestAuditExportJob[]> {

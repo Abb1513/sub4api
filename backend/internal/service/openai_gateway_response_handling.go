@@ -49,6 +49,7 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 }
 
 func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel, reasoningEffort string) (*openaiStreamingResult, error) {
+	timing := openAIForwardTimingFromContext(c)
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)
@@ -122,6 +123,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	ttftMode := s.openAITTFTMode(ctx)
 	firstOutputProgressObserved := false
 	bufferedWriter := bufio.NewWriterSize(w, 4*1024)
+	semanticOutputPendingFlush := false
 	var firstOutputStage *openAIFirstOutputStage
 	if stageFirstOutput {
 		firstOutputStage = newDefaultOpenAIFirstOutputStage()
@@ -154,6 +156,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 		}
 		flusher.Flush()
+		if semanticOutputPendingFlush {
+			timing.MarkFlush()
+			semanticOutputPendingFlush = false
+		}
 		return nil
 	}
 
@@ -595,7 +601,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 							s.recordOpenAIStreamUpstreamError(c, account, false, upstreamRequestID, "http_error", dataBytes, failedMessage)
 							MarkResponseCommitted(c)
 							c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-							c.JSON(status, gin.H{
+							writeOpenAIResponsesErrorJSON(c, status, gin.H{
 								"error": gin.H{
 									"type":    errType,
 									"message": errMsg,
@@ -674,6 +680,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			startsClientOutput := forceFlushFailedEvent || openAIStreamDataStartsClientOutput(data, eventType)
 			startsVisibleOutput := openAIStreamDataStartsVisibleOutput(data, eventType)
 			startsTTFTOutput := openAIStreamDataStartsTTFT(data, eventType, forceFlushFailedEvent, ttftMode)
+			semanticOutput := startsClientOutput && eventType != "error" && !openAIStreamEventIsTerminalWithType(data, eventType)
+			if semanticOutput {
+				timing.MarkSemantic()
+			}
 			if stageFirstOutput {
 				eventStartsClientOutput = eventStartsClientOutput || startsClientOutput
 				eventStartsTTFTOutput = eventStartsTTFTOutput || startsTTFTOutput
@@ -711,6 +721,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					handlePendingWriteError(err)
 				} else {
 					eventInProgress = true
+					semanticOutputPendingFlush = semanticOutputPendingFlush || semanticOutput
 				}
 			}
 
@@ -959,7 +970,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			if clientDisconnected || failureDelivered {
 				continue
 			}
-			if eventInProgress {
+			if eventInProgress && (firstOutputStage == nil || firstOutputStage.closed) {
 				continue
 			}
 			if time.Since(lastDownstreamWriteAt) < keepaliveInterval {

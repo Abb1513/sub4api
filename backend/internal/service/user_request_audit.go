@@ -363,6 +363,32 @@ func (s *UserRequestAuditService) GetByID(ctx context.Context, id int64) (*UserR
 	return s.repo.GetByID(ctx, id)
 }
 
+type UserRequestAuditModelFacet struct {
+	Protocol       string    `json:"protocol"`
+	RequestedModel string    `json:"requested_model"`
+	Requests       int64     `json:"requests"`
+	Conversations  int64     `json:"conversations"`
+	LatestAt       time.Time `json:"latest_at"`
+}
+
+type userRequestAuditModelFaceter interface {
+	ListModelFacets(context.Context, UserRequestAuditFilter) ([]UserRequestAuditModelFacet, error)
+}
+
+// ModelFacets lists retained models under the same request predicates as
+// listing/export so the console can filter and export a chosen model.
+func (s *UserRequestAuditService) ModelFacets(ctx context.Context, filter UserRequestAuditFilter) ([]UserRequestAuditModelFacet, error) {
+	if s == nil || s.repo == nil {
+		return nil, nil
+	}
+	r, ok := s.repo.(userRequestAuditModelFaceter)
+	if !ok {
+		return nil, nil
+	}
+	filter.Page, filter.PageSize = 0, 0
+	return r.ListModelFacets(ctx, filter)
+}
+
 type UserRequestAuditGroupStat struct {
 	GroupID     *int64    `json:"group_id,omitempty"`
 	GroupName   string    `json:"group_name,omitempty"`

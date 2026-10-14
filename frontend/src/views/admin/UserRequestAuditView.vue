@@ -10,6 +10,10 @@
               <label :for="`audit-filter-${field}`" class="input-label">{{ t(`admin.userRequestAudit.filters.${field}`) }}</label>
               <input :id="`audit-filter-${field}`" v-model.trim="filters[field]" class="input" @keyup.enter="search" />
             </div>
+            <div class="w-full sm:w-auto sm:min-w-[240px]">
+              <label for="audit-filter-requested_model" class="input-label">{{ t('admin.userRequestAudit.filters.requested_model') }}</label>
+              <Select id="audit-filter-requested_model" v-model="filters.requested_model" :options="modelOptions" searchable creatable :loading="modelsLoading" :aria-label="t('admin.userRequestAudit.filters.requested_model')" />
+            </div>
             <div>
               <label for="audit-filter-protocol" class="input-label">{{ t('admin.userRequestAudit.filters.protocol') }}</label>
               <Select id="audit-filter-protocol" v-model="filters.protocol" :options="protocolOptions" :aria-label="t('admin.userRequestAudit.filters.protocol')" />
@@ -146,7 +150,7 @@
               </div>
             </div>
             <div v-if="expandedConversationID === row.id" class="border-t border-gray-200 p-4 dark:border-dark-700">
-              <UserRequestAuditTranscript :conversation="conversation" :loading="conversationLoading" :error="conversationError" @retry="loadConversation(row.id)" />
+              <UserRequestAuditTranscript :conversation="conversation" :loading="conversationLoading" :error="conversationError" :loading-more="conversationMoreLoading" :window-size="conversationWindow" @retry="loadConversation(row.id)" @load-more="loadMoreConversation" @load-previous="loadPreviousConversation" />
             </div>
             </article>
           </template>
@@ -167,10 +171,9 @@
       <div v-if="detailLoading" class="py-12 text-center">{{ t('common.loading') }}</div>
       <div v-else-if="detail" class="space-y-4 py-2">
         <div class="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2"><div v-for="key in detailKeys" :key="key"><span class="text-gray-500">{{ key }}:</span> <span class="break-all font-mono">{{ detail[key] ?? '—' }}</span></div></div>
-        <div v-if="detail.request_chatml || detail.response_chatml || detail.chatml" class="space-y-3">
+        <div v-if="detail.request_chatml || detail.response_chatml" class="space-y-3">
           <div v-if="detail.request_chatml"><h4 class="font-medium">{{ t('admin.userRequestAudit.requestChatml') }}</h4><pre class="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-gray-100 p-3 text-xs dark:bg-dark-800">{{ detail.request_chatml }}</pre></div>
           <div v-if="detail.response_chatml"><h4 class="font-medium">{{ t('admin.userRequestAudit.responseChatml') }}</h4><pre class="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-gray-100 p-3 text-xs dark:bg-dark-800">{{ detail.response_chatml }}</pre></div>
-          <div v-if="detail.chatml"><h4 class="font-medium">{{ t('admin.userRequestAudit.mergedChatml') }}</h4><pre class="max-h-96 overflow-auto whitespace-pre-wrap rounded bg-gray-100 p-3 text-xs dark:bg-dark-800">{{ detail.chatml }}</pre></div>
         </div>
       </div>
     </BaseDialog>
@@ -179,15 +182,15 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { adminAPI, type UserRequestAudit, type UserRequestAuditGroupStat, type UserRequestAuditQuery, type UserRequestAuditExportFormat, type UserRequestAuditStatus } from '@/api/admin'
+import { adminAPI, type UserRequestAudit, type UserRequestAuditGroupStat, type UserRequestAuditModelFacet, type UserRequestAuditQuery, type UserRequestAuditExportFormat, type UserRequestAuditStatus } from '@/api/admin'
 import type { UserRequestAuditConversation, UserRequestAuditExportJob } from '@/api/admin/userRequestAudit'
 import type { AdminGroup } from '@/types'
 import AppLayout from '@/components/layout/AppLayout.vue'
 import TablePageLayout from '@/components/layout/TablePageLayout.vue'
 import Pagination from '@/components/common/Pagination.vue'
-import Select from '@/components/common/Select.vue'
+import Select, { type SelectOption } from '@/components/common/Select.vue'
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import UserRequestAuditTranscript from '@/components/admin/UserRequestAuditTranscript.vue'
@@ -215,6 +218,10 @@ const expandedConversationID = ref<number | null>(null)
 const conversation = ref<UserRequestAuditConversation | null>(null)
 const conversationLoading = ref(false)
 const conversationError = ref('')
+const conversationMoreLoading = ref(false)
+// A window of 20 requests keeps a first read small while still showing real
+// progress in long sessions; the server clamps oversized requests.
+const conversationWindow = 20
 let conversationRequest = 0
 let conversationController: AbortController | undefined
 const exporting = ref(false)
@@ -238,9 +245,19 @@ const cleanupLoading = ref(false)
 let detailRequest = 0
 
 const filters = reactive<Record<string, string>>({ user_id: '', group_id: '', group_name: '', q: '', requested_model: '', response_id: '', client_request_id: '', status: '', protocol: '', start_time: '', end_time: '' })
-const filterFields = ['q', 'user_id', 'group_id', 'group_name', 'requested_model', 'response_id', 'client_request_id', 'start_time', 'end_time']
+const filterFields = ['q', 'user_id', 'group_id', 'group_name', 'response_id', 'client_request_id', 'start_time', 'end_time']
+const modelFacets = ref<UserRequestAuditModelFacet[]>([])
+const modelsLoading = ref(false)
+let modelsController: AbortController | undefined
 const protocolOptions = [{ value: '', label: '—' }, { value: 'anthropic_messages', label: 'Anthropic' }, { value: 'openai_responses', label: 'OpenAI Responses' }, { value: 'openai_chat_completions', label: 'OpenAI Chat' }, { value: 'openai_responses_ws', label: 'Responses WS' }, { value: 'typesafe_systemone', label: 'TypeSafe System One' }]
 const exportOptions = [{ value: 'jsonl', label: 'JSONL' }, { value: 'json', label: 'JSON' }]
+const modelOptions = computed<SelectOption[]>(() => {
+  const options: SelectOption[] = [{ value: '', label: t('admin.userRequestAudit.allModels') }]
+  for (const facet of modelFacets.value) {
+    options.push({ value: facet.requested_model, label: `${facet.requested_model} · ${protocolLabel(facet.protocol)} · ${t('admin.userRequestAudit.modelRequests', { count: facet.requests })}` })
+  }
+  return options
+})
 const detailKeys = ['id', 'created_at', 'updated_at', 'expires_at', 'user_id', 'api_key_id', 'group_id', 'group_name', 'protocol', 'endpoint', 'requested_model', 'upstream_model', 'client_request_id', 'response_id', 'previous_response_id', 'fallback_hash', 'status', 'input_usage', 'output_usage', 'cache_usage', 'conversation_key', 'last_error'] as const
 
 function protocolLabel(protocol: string) {
@@ -281,6 +298,7 @@ function closeConversation(): void {
   expandedConversationID.value = null
   conversation.value = null
   conversationLoading.value = false
+  conversationMoreLoading.value = false
   conversationError.value = ''
 }
 
@@ -300,14 +318,51 @@ async function loadConversation(id: number): Promise<void> {
   expandedConversationID.value = id
   conversation.value = null
   conversationError.value = ''
+  conversationMoreLoading.value = false
   conversationLoading.value = true
   try {
-    const value = await adminAPI.userRequestAudit.getConversation(id, controller.signal)
+    const value = await adminAPI.userRequestAudit.getConversationWindow(id, 0, conversationWindow, controller.signal)
     if (token === conversationRequest && !controller.signal.aborted && !unmounted) conversation.value = value
   } catch (e: any) {
     if (token === conversationRequest && !controller.signal.aborted && !unmounted) conversationError.value = e?.message || t('admin.userRequestAudit.conversationLoadFailed')
   } finally {
     if (token === conversationRequest && !controller.signal.aborted && !unmounted) conversationLoading.value = false
+  }
+}
+
+// Replace the visible window instead of accumulating all earlier messages.
+// Previous windows remain available from the archive, not retained in the DOM.
+function loadMoreConversation(): Promise<void> {
+  return loadConversationPage(false)
+}
+
+function loadPreviousConversation(): Promise<void> {
+  return loadConversationPage(true)
+}
+
+async function loadConversationPage(previous: boolean): Promise<void> {
+  const base = conversation.value
+  const id = expandedConversationID.value
+  if (!base || !id || conversationMoreLoading.value) return
+  if (previous ? base.request_start <= 1 : base.request_end >= base.request_count) return
+  const offset = previous ? Math.max(0, base.request_start - 1 - conversationWindow) : base.request_end
+  const token = ++conversationRequest
+  const controller = new AbortController()
+  conversationController = controller
+  conversationMoreLoading.value = true
+  try {
+    const next = await adminAPI.userRequestAudit.getConversationWindow(id, offset, conversationWindow, controller.signal)
+    if (token !== conversationRequest || controller.signal.aborted || unmounted) return
+    if (next.request_start !== offset + 1) {
+      // The conversation changed underneath the reader; restart cleanly.
+      await loadConversation(id)
+      return
+    }
+    conversation.value = next
+  } catch (e: any) {
+    if (token === conversationRequest && !controller.signal.aborted && !unmounted) appStore.showError(e?.message || t('admin.userRequestAudit.conversationLoadFailed'))
+  } finally {
+    if (token === conversationRequest && !controller.signal.aborted && !unmounted) conversationMoreLoading.value = false
   }
 }
 
@@ -362,11 +417,33 @@ async function fetchGroupStats() {
   }
 }
 
+async function fetchModelFacets() {
+  modelsController?.abort()
+  const controller = new AbortController()
+  modelsController = controller
+  modelsLoading.value = true
+  try {
+    // Facets follow the protocol/group/time filters only; the model itself is
+    // the value being chosen, so the picker keeps offering every other model.
+    const params = query()
+    delete params.requested_model
+    const facets = await adminAPI.userRequestAudit.getModels(params)
+    if (controller.signal.aborted || unmounted) return
+    modelFacets.value = facets
+  } catch (e: any) {
+    if (controller.signal.aborted || unmounted) return
+    appStore.showError(e?.message || t('admin.userRequestAudit.loadFailed'))
+  } finally {
+    if (!controller.signal.aborted && !unmounted) modelsLoading.value = false
+  }
+}
+
 function search() {
   selectedConversationIDs.value = []
   closeConversation()
   page.value = 1
   fetchItems()
+  fetchModelFacets()
   if (activeTab.value === 'groups') fetchGroupStats()
 }
 
@@ -391,7 +468,7 @@ function onPageSizeChange(value: number) {
 async function queueExport() {
   exporting.value = true
   try {
-    const job = await adminAPI.userRequestAudit.export(selectedConversationIDs.value.length ? {} : query(), exportFormat.value, selectedConversationIDs.value)
+    const job = await adminAPI.userRequestAudit.export(query(), exportFormat.value, selectedConversationIDs.value)
     exportJobs.value = [job, ...exportJobs.value.filter(existing => existing.id !== job.id)]
     appStore.showSuccess(t('admin.userRequestAudit.exportQueued'))
     await refreshJobs()
@@ -462,7 +539,7 @@ async function clearArchives() {
     detail.value = null
     page.value = 1
     appStore.showSuccess(result?.message || t('admin.userRequestAudit.clearSuccess'))
-    await Promise.all([fetchItems(), refreshStatus(), fetchGroupStats()])
+    await Promise.all([fetchItems(), refreshStatus(), fetchGroupStats(), fetchModelFacets()])
   } catch (e: any) {
     appStore.showError(e?.message || t('admin.userRequestAudit.clearFailed'))
   } finally {
@@ -559,6 +636,7 @@ async function loadGroups() {
 
 onMounted(() => {
   fetchItems()
+  fetchModelFacets()
   refreshStatus()
   loadConfig()
   loadGroups()
@@ -572,6 +650,7 @@ onUnmounted(() => {
   jobsController?.abort()
   conversationRequest++
   conversationController?.abort()
+  modelsController?.abort()
 })
 </script>
 

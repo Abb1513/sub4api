@@ -23,15 +23,80 @@ type UserRequestAuditMessage struct {
 }
 
 type UserRequestAuditConversation struct {
-	ID           int64                     `json:"id"`
-	UserLabel    string                    `json:"user_label"`
-	RequestCount int                       `json:"request_count"`
+	ID           int64  `json:"id"`
+	UserLabel    string `json:"user_label"`
+	RequestCount int    `json:"request_count"`
+	// A window is a contiguous request range of the conversation. Start/End are
+	// one-based inclusive ordinals so the reader can page a long conversation
+	// without serializing every stored history copy at once.
+	RequestStart int                       `json:"request_start"`
+	RequestEnd   int                       `json:"request_end"`
 	Messages     []UserRequestAuditMessage `json:"messages"`
 	Requests     []*UserRequestAudit       `json:"requests"`
 }
 
 type userRequestAuditConversationReader interface {
 	GetConversation(context.Context, int64) (*UserRequestAuditConversation, error)
+}
+
+type userRequestAuditConversationWindowReader interface {
+	GetConversationWindow(context.Context, int64, int, int) (*UserRequestAuditConversation, error)
+}
+
+// ConversationWindowLimits clamps reader-supplied paging.
+func ConversationWindowLimits(offset, limit int) (int, int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = ConversationWindowDefaultRequests
+	}
+	if limit > ConversationWindowMaxRequests {
+		limit = ConversationWindowMaxRequests
+	}
+	return offset, limit
+}
+
+const (
+	ConversationWindowDefaultRequests = 20
+	ConversationWindowMaxRequests     = 100
+)
+
+// GetConversationWindow reads one request range so opening a large conversation
+// costs the requested slice instead of the whole quadratic request history.
+func (s *UserRequestAuditService) GetConversationWindow(ctx context.Context, id int64, offset, limit int) (*UserRequestAuditConversation, error) {
+	if s == nil || s.repo == nil {
+		return nil, sql.ErrNoRows
+	}
+	offset, limit = ConversationWindowLimits(offset, limit)
+	if repo, ok := s.repo.(userRequestAuditConversationWindowReader); ok {
+		return repo.GetConversationWindow(ctx, id, offset, limit)
+	}
+	doc, err := s.GetConversation(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= len(doc.Requests) {
+		return nil, sql.ErrNoRows
+	}
+	end := offset + limit
+	if end > len(doc.Requests) {
+		end = len(doc.Requests)
+	}
+	window := *doc
+	window.RequestStart = offset + 1
+	window.RequestEnd = end
+	window.Requests = doc.Requests[offset:end]
+	window.Messages = BuildUserRequestAuditTranscriptFrom(window.Requests, seedBefore(doc, offset))
+	return &window, nil
+}
+
+// seedBefore returns the request preceding an offset in a full document.
+func seedBefore(doc *UserRequestAuditConversation, offset int) *UserRequestAudit {
+	if offset <= 0 || offset > len(doc.Requests) {
+		return nil
+	}
+	return doc.Requests[offset-1]
 }
 
 func (s *UserRequestAuditService) GetConversation(ctx context.Context, id int64) (*UserRequestAuditConversation, error) {
@@ -96,13 +161,31 @@ func auditReplayPrefix(request, history []UserRequestAuditMessage) int {
 // Only a complete prefix is replay evidence. A matching first question alone
 // never removes a new turn, and status markers do not participate in matching.
 func BuildUserRequestAuditTranscript(rows []*UserRequestAudit) []UserRequestAuditMessage {
+	return buildUserRequestAuditTranscript(rows, nil)
+}
+
+// BuildUserRequestAuditTranscriptFrom renders a windowed slice of a larger
+// conversation. The seed is the request/response pair immediately before the
+// window, so the first windowed request still recognizes replayed history and
+// the rendered blocks match a full-conversation build.
+func BuildUserRequestAuditTranscriptFrom(rows []*UserRequestAudit, seed *UserRequestAudit) []UserRequestAuditMessage {
+	return buildUserRequestAuditTranscript(rows, seed)
+}
+
+func buildUserRequestAuditTranscript(rows []*UserRequestAudit, seed *UserRequestAudit) []UserRequestAuditMessage {
 	out := make([]UserRequestAuditMessage, 0)
-	if len(rows) == 1 && rows[0].SessionID == "" && rows[0].PreviousResponseID == "" && rows[0].Protocol != ContentModerationProtocolTypeSafeSystemOne {
+	if len(rows) == 1 && seed == nil && rows[0].SessionID == "" && rows[0].PreviousResponseID == "" && rows[0].Protocol != ContentModerationProtocolTypeSafeSystemOne {
 		out = append(out, UserRequestAuditMessage{Role: "system", Kind: "metadata", Content: "No stored session or previous-response link; only the captured request history is available.", RequestID: rows[0].ID})
 	}
 	var history []UserRequestAuditMessage
 	var previousRequest []UserRequestAuditMessage
 	previousRetryable := false
+	if seed != nil {
+		previousRequest = auditDecodeChatML(seed.RequestChatML, "user", seed.ID)
+		seedResponse := auditDecodeChatML(seed.ResponseChatML, "assistant", seed.ID)
+		history = append(append([]UserRequestAuditMessage{}, previousRequest...), seedResponse...)
+		previousRetryable = seed.Status != "completed"
+	}
 	for _, row := range rows {
 		req := auditDecodeChatML(row.RequestChatML, "user", row.ID)
 		response := auditDecodeChatML(row.ResponseChatML, "assistant", row.ID)
