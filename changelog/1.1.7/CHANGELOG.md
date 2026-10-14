@@ -3,6 +3,7 @@
 ## 更新内容
 
 - OpenAI OAuth/Codex 账号的 HTTP Responses 客户端可按账号面板既有 WSv2 开关/模式使用 WebSocket 上游，网关仍返回 SSE/JSON，客户端无需更换协议。API Key 自定义中转站的 HTTP 入站保持 HTTP 上游；其他平台不变。账号/全局强制 HTTP 与禁用 WS 仍有效，独立 compact 端点保持 unary HTTP。协议切换不保证模型首输出更快。
+- Codex OAuth/SetupToken 的 Responses WebSocket 握手固定使用官方当前 WSv2 Beta `responses_websockets=2026-02-06`；API Key 兼容路径仍按协商协议保留旧兼容值。账号隔离、turn-state 与连接池安全边界不变。
 - 新增 OpenAI HTTP Responses 按请求/账号/尝试编号关联的 `openai.forward_timing` 日志：连接获取、请求发送、上游首响应字节及响应头、首个有效输出事件、首次有效输出 Flush 返回。只记录阶段与耗时，不记录正文、凭据或上游 URL；Flush 表示本地写入边界，不等于客户端已收到，传输未触发的回调不补造时间。重试、缓存、并发及流式行为保持不变。
 - 修复 OpenAI Responses 流式请求在等待上游 HTTP 响应头及首个完整事件期间的下游保活；心跳不拆分 SSE 事件、不计入语义输出，跨重试累计扣除心跳字节。首拍前保留 HTTP 错误状态，首拍后使用流内失败事件；保活不代表上游推理提速。
 - 移除 OpenAI 容量降载（`server_is_overloaded` 等）的请求级早退：命中账号配置的 `temp_unschedulable_rules` 后照常写入模型级冷却（例如 503 + overloaded → 30 分钟），同账号有界重试与切号流程保持不变。
