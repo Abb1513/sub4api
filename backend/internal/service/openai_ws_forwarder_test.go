@@ -10,6 +10,7 @@ import (
 	"github.com/MACOS-DO/sub4api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // TestIsOpenAIWSTokenEvent_TerminalEventsExcluded 覆盖 isOpenAIWSTokenEvent 的回归用例。
@@ -159,6 +160,34 @@ func TestOpenAIWSErrorEvent_ServerErrorRecordsModelTransient(t *testing.T) {
 	}
 
 	require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-5.5"))
+}
+
+func TestOpenAIWSErrorEvent_ServerErrAliasRecordsModelTransient(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	svc.rateLimitService = NewRateLimitService(transientCooldownAccountRepo{}, nil, &config.Config{}, nil, nil)
+	account := &Account{ID: 5204, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	payload := []byte(`{"type":"error","error":{"code":"server_err","type":"server_err","message":"An error occurred while processing your request."}}`)
+
+	for range 2 {
+		svc.handleOpenAIWSErrorEventTransientFailure(context.Background(), account, "gpt-6.1-sol", http.Header{}, payload)
+	}
+
+	require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-6.1-sol"))
+}
+
+func TestOpenAIWSErrorEvent_ServerErrNormalizesConfiguredPolicyMessage(t *testing.T) {
+	payload := []byte(`{"type":"error","error":{"code":"server_err","type":"server_err","message":"An error occurred while processing your request."}}`)
+	status, body := openAIWSErrorEventPolicySignal(payload)
+	require.Equal(t, http.StatusBadGateway, status)
+	require.Equal(t, "Upstream request failed", gjson.GetBytes(body, "error.message").String())
+	require.Equal(t, "An error occurred while processing your request.", gjson.GetBytes(body, "error.upstream_message").String())
+}
+
+func TestOpenAIWSErrorEvent_OverloadMessageUsesServiceUnavailablePolicy(t *testing.T) {
+	payload := []byte(`{"type":"error","error":{"code":"server_err","type":"server_err","message":"Our servers are currently overloaded. Please try again later."}}`)
+	status, body := openAIWSErrorEventPolicySignal(payload)
+	require.Equal(t, http.StatusServiceUnavailable, status)
+	require.Equal(t, payload, body)
 }
 
 func TestOpenAIWSPayloadTransientStatus_Explicit529IsNotModelTransient(t *testing.T) {
