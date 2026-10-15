@@ -28,6 +28,13 @@
         >
           {{ statusText }}
         </button>
+        <span
+          v-for="(result, index) in autoDegradationProbeResults"
+          :key="index"
+          class="max-w-[180px] break-all text-center text-[11px] leading-4 text-gray-500 dark:text-gray-400"
+        >
+          {{ result }}
+        </span>
         <span class="max-w-[180px] text-center text-[11px] leading-4 text-gray-500 dark:text-gray-400">
           {{ tempUnschedRecoveryText }}
         </span>
@@ -287,6 +294,28 @@ const isOverloaded = computed(() => {
 const isTempUnschedulable = computed(() => {
   if (!props.account.temp_unschedulable_until) return false
   return new Date(props.account.temp_unschedulable_until) > new Date()
+})
+
+const autoDegradationProbeResults = computed<string[]>(() => {
+  if (!isTempUnschedulable.value || !props.account.temp_unschedulable_reason) return []
+
+  try {
+    const reason: unknown = JSON.parse(props.account.temp_unschedulable_reason)
+    if (!reason || typeof reason !== 'object' || Array.isArray(reason)) return []
+
+    const payload = reason as Record<string, unknown>
+    if (payload.source !== 'auto_degradation_check' || !Array.isArray(payload.probe_results)) return []
+
+    return payload.probe_results.flatMap((entry: unknown) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+      const probe = entry as Record<string, unknown>
+      const model = typeof probe.model === 'string' ? probe.model.trim() : ''
+      const predictedModel = typeof probe.predicted_model === 'string' ? probe.predicted_model.trim() : ''
+      return model && predictedModel ? [`${model} → ${predictedModel}`] : []
+    })
+  } catch {
+    return []
+  }
 })
 
 // Computed: has error status

@@ -409,7 +409,7 @@ func TestCodexAutoDegradationCheckHealthyClearsOnlyOwnBlocks(t *testing.T) {
 		account := activeOpenAIOAuthAccount(1)
 		blockedUntil := base.Add(5 * time.Minute)
 		account.TempUnschedulableUntil = &blockedUntil
-		account.TempUnschedulableReason = buildCodexAutoDegradationCheckReason("degraded", []string{"gpt-6.1-sol"}, blockedUntil)
+		account.TempUnschedulableReason = `{"source":"auto_degradation_check","status":"degraded","models":["gpt-6.1-sol"],"until_unix":1790000000,"error_message":"auto degradation check: degraded"}`
 		repo := newCodexDegradationRepoStub(account)
 		probe := fixedVerdict("normal")
 		svc := newCodexDegradationTestService(repo, probe, enabledDegradationSettings())
@@ -579,29 +579,118 @@ func TestCodexAutoDegradationCheckProbeModelsCombination(t *testing.T) {
 
 	// 任一 degraded → degraded（阳性证据优先）。
 	verdicts = map[string]string{"a": "degraded", "b": "failed"}
-	status, reason := svc.probeModels(context.Background(), 1, []string{"a", "b"})
+	status, reason, _ := svc.probeModels(context.Background(), 1, []string{"a", "b"})
 	require.Equal(t, "degraded", status)
 	require.Contains(t, reason, "a")
 
 	// 无 degraded 但有 failed → failed（不封锁、不解封）。
 	verdicts = map[string]string{"a": "normal", "b": "failed"}
-	status, _ = svc.probeModels(context.Background(), 1, []string{"a", "b"})
+	status, _, _ = svc.probeModels(context.Background(), 1, []string{"a", "b"})
 	require.Equal(t, "failed", status)
 
 	// 全部 normal/uncertain → 健康。
 	verdicts = map[string]string{"a": "normal", "b": "uncertain"}
-	status, _ = svc.probeModels(context.Background(), 1, []string{"a", "b"})
+	status, _, _ = svc.probeModels(context.Background(), 1, []string{"a", "b"})
 	require.Equal(t, "uncertain", status)
 
 	verdicts = map[string]string{"a": "normal", "b": "normal"}
-	status, _ = svc.probeModels(context.Background(), 1, []string{"a", "b"})
+	status, _, _ = svc.probeModels(context.Background(), 1, []string{"a", "b"})
 	require.Equal(t, "normal", status)
 
 	// 探针不可用 → failed，不产生任何封锁倾向。
 	svc.probe = nil
-	status, reason = svc.probeModels(context.Background(), 1, []string{"a"})
+	status, reason, results := svc.probeModels(context.Background(), 1, []string{"a"})
 	require.Equal(t, "failed", status)
-	require.Equal(t, "probe_unavailable", reason)
+	require.Equal(t, "a: probe_unavailable", reason)
+	require.Equal(t, []CodexAutoDegradationProbeResult{{Model: "a", Status: "failed", Reason: "probe_unavailable"}}, results)
+}
+
+func TestCodexAutoDegradationCheckPersistsProbeEvidence(t *testing.T) {
+	base := time.Date(2026, 10, 15, 8, 0, 0, 0, time.UTC)
+	account := activeOpenAIOAuthAccount(1)
+	repo := newCodexDegradationRepoStub(account)
+	models := []string{"gpt-6.1-sol", "gpt-6-astra", "partial", "request-error"}
+	probe := &codexDegradationProbeStub{next: func(_ int64, model string) (CodexDiagnosticVerdict, error) {
+		switch model {
+		case "gpt-6.1-sol":
+			return CodexDiagnosticVerdict{Status: "degraded", PredictedModel: "gpt-5.6", Probability: 0.875, ParsedCount: 64, Reason: "fingerprint_mismatch"}, nil
+		case "gpt-6-astra":
+			return CodexDiagnosticVerdict{Status: "normal", PredictedModel: "gpt-6-astra", Probability: 0.95, ParsedCount: 64}, nil
+		case "partial":
+			return CodexDiagnosticVerdict{Status: "failed", ParsedCount: 3, Reason: "insufficient_numbers"}, nil
+		default:
+			return CodexDiagnosticVerdict{}, errProbeBoom
+		}
+	}}
+	svc := newCodexDegradationTestService(repo, probe, enabledDegradationSettings())
+	svc.now = func() time.Time { return base }
+	settings := &CodexAutoDegradationCheckSettings{Enabled: true, IntervalMinutes: 10, BlockMinutes: 30, Models: models}
+	require.NoError(t, svc.runAccountCheck(context.Background(), account.ID, settings))
+
+	// Assert the persisted JSON contract, including absence of invented predictions.
+	rawState, err := json.Marshal(account.Extra)
+	require.NoError(t, err)
+	var stored map[string]any
+	require.NoError(t, json.Unmarshal(rawState, &stored))
+	state := decodeCodexAutoDegradationCheckState(stored)
+	require.NotNil(t, state)
+	require.Equal(t, "degraded", state.Status)
+	expectedJSON := `[
+		{"model":"gpt-6.1-sol","status":"degraded","predicted_model":"gpt-5.6","probability":0.875,"parsed_count":64,"reason":"fingerprint_mismatch"},
+		{"model":"gpt-6-astra","status":"normal","predicted_model":"gpt-6-astra","probability":0.95,"parsed_count":64},
+		{"model":"partial","status":"failed","parsed_count":3,"reason":"insufficient_numbers"},
+		{"model":"request-error","status":"failed","reason":"boom"}
+	]`
+	var persistedState map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(rawState, &persistedState))
+	var stateFields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(persistedState[CodexAutoDegradationCheckExtraKey], &stateFields))
+	require.JSONEq(t, expectedJSON, string(stateFields["probe_results"]))
+
+	var reasonFields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(account.TempUnschedulableReason), &reasonFields))
+	require.JSONEq(t, expectedJSON, string(reasonFields["probe_results"]))
+	require.True(t, IsCodexAutoDegradationCheckReason(account.TempUnschedulableReason))
+	display := tempUnschedStateFromStoredReason(account.TempUnschedulableReason, 0)
+	require.Contains(t, display.ErrorMessage, "gpt-6.1-sol → gpt-5.6 (87.50%)")
+	require.NotContains(t, display.ErrorMessage, "gpt-6-astra →", "healthy models must not be presented as degraded")
+	require.Equal(t, base.Add(30*time.Minute).Unix(), display.UntilUnix)
+}
+
+func TestCodexAutoDegradationCheckCancellationRecordsUnattemptedModels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := &codexDegradationProbeStub{next: func(_ int64, _ string) (CodexDiagnosticVerdict, error) {
+		cancel()
+		return CodexDiagnosticVerdict{}, context.Canceled
+	}}
+	svc := &CodexAutoDegradationCheckService{probe: probe}
+	status, _, results := svc.probeModels(ctx, 1, []string{"first", "second"})
+	require.Equal(t, "failed", status)
+	require.Equal(t, 1, probe.callCount(), "canceled context must not issue another request")
+	require.Equal(t, []CodexAutoDegradationProbeResult{
+		{Model: "first", Status: "failed", Reason: "context canceled"},
+		{Model: "second", Status: "failed", Reason: "context canceled"},
+	}, results)
+}
+
+func TestCodexAutoDegradationCheckPreservesLongerForeignBlock(t *testing.T) {
+	base := time.Date(2026, 10, 15, 8, 0, 0, 0, time.UTC)
+	account := activeOpenAIOAuthAccount(1)
+	until := base.Add(time.Hour)
+	foreignReason := `{"source":"temp_unschedulable_rule","status_code":503,"error_message":"overloaded"}`
+	account.TempUnschedulableUntil = &until
+	account.TempUnschedulableReason = foreignReason
+	repo := newCodexDegradationRepoStub(account)
+	svc := newCodexDegradationTestService(repo, fixedVerdict("degraded"), enabledDegradationSettings())
+	svc.now = func() time.Time { return base }
+	settings, err := svc.getSettings(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, svc.runAccountCheck(context.Background(), account.ID, settings))
+	require.Equal(t, &until, account.TempUnschedulableUntil)
+	require.Equal(t, foreignReason, account.TempUnschedulableReason)
+	require.Equal(t, "degraded", repo.storedState(t, account.ID).Status)
+	require.Empty(t, repo.clearCalls)
 }
 
 func TestCodexAutoDegradationCheckStopIsIdempotent(t *testing.T) {

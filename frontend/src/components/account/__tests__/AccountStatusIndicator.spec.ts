@@ -51,6 +51,54 @@ function makeAccount(overrides: Partial<Account>): Account {
 }
 
 describe('AccountStatusIndicator', () => {
+  it('shows the predicted model only for an active automatic degradation block', async () => {
+    const account = makeAccount({
+      platform: 'openai',
+      temp_unschedulable_until: '2099-01-01T00:00:00Z',
+      temp_unschedulable_reason: JSON.stringify({
+        source: 'auto_degradation_check',
+        probe_results: [
+          { model: 'gpt-6-astra', predicted_model: 'gpt-5.6-sol' },
+          { model: 'gpt-6-astra' },
+          null
+        ]
+      })
+    })
+    const wrapper = mount(AccountStatusIndicator, {
+      props: { account },
+      global: { stubs: { Icon: true } }
+    })
+    expect(wrapper.text()).toContain('gpt-6-astra → gpt-5.6-sol')
+    await wrapper.setProps({
+      account: { ...account, temp_unschedulable_until: '2000-01-01T00:00:00Z' }
+    })
+    expect(wrapper.text()).not.toContain('gpt-5.6-sol')
+    wrapper.unmount()
+  })
+
+  it.each([
+    'legacy block',
+    '{broken',
+    'null',
+    JSON.stringify({ source: 'auto_degradation_check', probe_results: {} }),
+    JSON.stringify({
+      source: 'other',
+      probe_results: [{ model: 'gpt-6-astra', predicted_model: 'gpt-5.6-sol' }]
+    })
+  ])('does not invent predicted models for unsupported reasons: %s', (reason) => {
+    const wrapper = mount(AccountStatusIndicator, {
+      props: {
+        account: makeAccount({
+          temp_unschedulable_until: '2099-01-01T00:00:00Z',
+          temp_unschedulable_reason: reason
+        })
+      },
+      global: { stubs: { Icon: true } }
+    })
+    expect(wrapper.text()).not.toContain('→')
+    wrapper.unmount()
+  })
+
   it('Claude 5 系列模型限流时显示 Opus 和 Sonnet 的短别名', () => {
     const wrapper = mount(AccountStatusIndicator, {
       props: {

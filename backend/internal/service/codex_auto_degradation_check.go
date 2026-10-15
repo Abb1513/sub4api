@@ -20,7 +20,7 @@ import (
 const (
 	// CodexAutoDegradationCheckExtraKey 是 accounts.extra 中保存本功能
 	// 每账号调度状态的 key：{"status","checked_at","next_check_at",
-	// "blocked_until","models","reason"}。
+	// "blocked_until","models","reason","probe_results"}。
 	CodexAutoDegradationCheckExtraKey = "codex_degradation_check"
 
 	// CodexAutoDegradationCheckReasonSource 是写入 temp_unschedulable_reason
@@ -39,7 +39,7 @@ const (
 	codexAutoDegradationCheckProbeTimeout = 120 * time.Second
 	// 单轮运行上下文上限：maxPerRun × probeTimeout 之外再留余量，
 	// Stop() 取消父上下文时同样立刻生效，绝不泄漏 goroutine。
-	codexAutoDegradationCheckRunTimeout = 20 * time.Minute
+	codexAutoDegradationCheckRunTimeout    = 20 * time.Minute
 	codexAutoDegradationCheckLeaderLockKey = "codex:auto_degradation:check:leader"
 	codexAutoDegradationCheckLeaderLockTTL = 2 * time.Minute
 
@@ -151,14 +151,26 @@ func normalizeCodexAutoDegradationCheckSettings(settings *CodexAutoDegradationCh
 	}
 }
 
+// CodexAutoDegradationProbeResult 保留请求模型与该次探测的实际判定。
+// 未获得预测时省略预测模型和概率，解析失败仍可保留实际已解析数量。
+type CodexAutoDegradationProbeResult struct {
+	Model          string   `json:"model"`
+	Status         string   `json:"status"`
+	PredictedModel string   `json:"predicted_model,omitempty"`
+	Probability    *float64 `json:"probability,omitempty"`
+	ParsedCount    *int     `json:"parsed_count,omitempty"`
+	Reason         string   `json:"reason,omitempty"`
+}
+
 // CodexAutoDegradationCheckState 是保存在 accounts.extra 中的每账号调度状态。
 type CodexAutoDegradationCheckState struct {
-	Status       string     `json:"status"`
-	CheckedAt    time.Time  `json:"checked_at"`
-	NextCheckAt  time.Time  `json:"next_check_at"`
-	BlockedUntil *time.Time `json:"blocked_until,omitempty"`
-	Models       []string   `json:"models"`
-	Reason       string     `json:"reason,omitempty"`
+	Status       string                            `json:"status"`
+	CheckedAt    time.Time                         `json:"checked_at"`
+	NextCheckAt  time.Time                         `json:"next_check_at"`
+	BlockedUntil *time.Time                        `json:"blocked_until,omitempty"`
+	Models       []string                          `json:"models"`
+	Reason       string                            `json:"reason,omitempty"`
+	ProbeResults []CodexAutoDegradationProbeResult `json:"probe_results,omitempty"`
 }
 
 // decodeCodexAutoDegradationCheckState 兼容两种载体：DB 读回的 map（JSON）
@@ -192,20 +204,37 @@ func decodeCodexAutoDegradationCheckState(extra map[string]any) *CodexAutoDegrad
 // 机器可读封锁原因。source 是本功能的识别标记；until_unix/error_message 与
 // 既有 TempUnsched 展示链路（tempUnschedStateFromStoredReason）字段对齐。
 type codexAutoDegradationCheckReasonPayload struct {
-	Source       string   `json:"source"`
-	Status       string   `json:"status"`
-	Models       []string `json:"models"`
-	UntilUnix    int64    `json:"until_unix"`
-	ErrorMessage string   `json:"error_message"`
+	Source       string                            `json:"source"`
+	Status       string                            `json:"status"`
+	Models       []string                          `json:"models"`
+	ProbeResults []CodexAutoDegradationProbeResult `json:"probe_results,omitempty"`
+	UntilUnix    int64                             `json:"until_unix"`
+	ErrorMessage string                            `json:"error_message"`
 }
 
-func buildCodexAutoDegradationCheckReason(status string, models []string, until time.Time) string {
+func buildCodexAutoDegradationCheckReason(status string, models []string, until time.Time, results []CodexAutoDegradationProbeResult) string {
+	message := fmt.Sprintf("auto degradation check: %s", status)
+	var details []string
+	for _, result := range results {
+		if result.Status != codexAutoDegradationStatusDegraded || result.PredictedModel == "" {
+			continue
+		}
+		detail := result.Model + " → " + result.PredictedModel
+		if result.Probability != nil {
+			detail += fmt.Sprintf(" (%.2f%%)", *result.Probability*100)
+		}
+		details = append(details, detail)
+	}
+	if len(details) > 0 {
+		message += ": " + strings.Join(details, "; ")
+	}
 	payload := codexAutoDegradationCheckReasonPayload{
 		Source:       CodexAutoDegradationCheckReasonSource,
 		Status:       status,
 		Models:       models,
+		ProbeResults: results,
 		UntilUnix:    until.UTC().Unix(),
-		ErrorMessage: fmt.Sprintf("auto degradation check: %s", status),
+		ErrorMessage: message,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -512,12 +541,13 @@ func (s *CodexAutoDegradationCheckService) runAccountCheck(ctx context.Context, 
 	}
 	interval := time.Duration(settings.IntervalMinutes) * time.Minute
 
-	status, reason := s.probeModels(ctx, accountID, models)
+	status, reason, results := s.probeModels(ctx, accountID, models)
 	state := &CodexAutoDegradationCheckState{
-		Status:   status,
-		CheckedAt: now,
-		Models:   models,
-		Reason:   reason,
+		Status:       status,
+		CheckedAt:    now,
+		Models:       models,
+		Reason:       reason,
+		ProbeResults: results,
 	}
 	if previous != nil {
 		state.BlockedUntil = previous.BlockedUntil
@@ -528,7 +558,7 @@ func (s *CodexAutoDegradationCheckService) runAccountCheck(ctx context.Context, 
 		until := now.Add(time.Duration(settings.BlockMinutes) * time.Minute)
 		// SetTempUnschedulable 是单调只延长：已有更晚的封锁（例如 503 规则的
 		// 长封锁）不会被缩短，reason 也不会被覆盖，标记语义保持成立。
-		if err := s.accountRepo.SetTempUnschedulable(ctx, accountID, until, buildCodexAutoDegradationCheckReason(status, models, until)); err != nil {
+		if err := s.accountRepo.SetTempUnschedulable(ctx, accountID, until, buildCodexAutoDegradationCheckReason(status, models, until, results)); err != nil {
 			return fmt.Errorf("set temp unschedulable: %w", err)
 		}
 		state.BlockedUntil = &until
@@ -556,22 +586,36 @@ func (s *CodexAutoDegradationCheckService) runAccountCheck(ctx context.Context, 
 // probeModels 顺序探测全部配置模型并合并判定：
 // 任一 degraded → degraded；否则任一 failed → failed；否则任一 uncertain →
 // uncertain（与 normal 同属健康）；全 normal → normal。
-func (s *CodexAutoDegradationCheckService) probeModels(ctx context.Context, accountID int64, models []string) (string, string) {
-	if s == nil || s.probe == nil {
-		return codexAutoDegradationStatusFailed, "probe_unavailable"
-	}
+func (s *CodexAutoDegradationCheckService) probeModels(ctx context.Context, accountID int64, models []string) (string, string, []CodexAutoDegradationProbeResult) {
+	results := make([]CodexAutoDegradationProbeResult, 0, len(models))
 	var degraded []string
 	var failures []string
 	uncertain := false
 	for _, model := range models {
-		if err := ctx.Err(); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %s", model, err.Error()))
-			break
+		var verdict CodexDiagnosticVerdict
+		switch {
+		case ctx.Err() != nil:
+			verdict = CodexDiagnosticVerdict{Status: codexAutoDegradationStatusFailed, Reason: probeFailureMessage(ctx.Err())}
+		case s == nil || s.probe == nil:
+			verdict = CodexDiagnosticVerdict{Status: codexAutoDegradationStatusFailed, Reason: "probe_unavailable"}
+		default:
+			var err error
+			verdict, err = s.probe.ProbeCodexAutoDegradation(ctx, accountID, model)
+			if err != nil {
+				verdict = CodexDiagnosticVerdict{Status: codexAutoDegradationStatusFailed, Reason: probeFailureMessage(err)}
+			}
 		}
-		verdict, err := s.probe.ProbeCodexAutoDegradation(ctx, accountID, model)
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %s", model, probeFailureMessage(err)))
-			continue
+		result := CodexAutoDegradationProbeResult{
+			Model:          model,
+			Status:         verdict.Status,
+			PredictedModel: verdict.PredictedModel,
+			Reason:         verdict.Reason,
+		}
+		if verdict.PredictedModel != "" {
+			result.Probability = &verdict.Probability
+		}
+		if verdict.PredictedModel != "" || verdict.ParsedCount > 0 {
+			result.ParsedCount = &verdict.ParsedCount
 		}
 		switch verdict.Status {
 		case codexAutoDegradationStatusDegraded:
@@ -580,23 +624,24 @@ func (s *CodexAutoDegradationCheckService) probeModels(ctx context.Context, acco
 			uncertain = true
 		case codexAutoDegradationStatusNormal:
 		default:
-			detail := verdict.Reason
-			if detail == "" {
-				detail = codexAutoDegradationStatusFailed
+			result.Status = codexAutoDegradationStatusFailed
+			if result.Reason == "" {
+				result.Reason = codexAutoDegradationStatusFailed
 			}
-			failures = append(failures, fmt.Sprintf("%s: %s", model, detail))
+			failures = append(failures, fmt.Sprintf("%s: %s", model, result.Reason))
 		}
+		results = append(results, result)
 	}
 	if len(degraded) > 0 {
-		return codexAutoDegradationStatusDegraded, "degraded models: " + strings.Join(degraded, ",")
+		return codexAutoDegradationStatusDegraded, "degraded models: " + strings.Join(degraded, ","), results
 	}
 	if len(failures) > 0 {
-		return codexAutoDegradationStatusFailed, strings.Join(failures, ";")
+		return codexAutoDegradationStatusFailed, strings.Join(failures, ";"), results
 	}
 	if uncertain {
-		return codexAutoDegradationStatusUncertain, ""
+		return codexAutoDegradationStatusUncertain, "", results
 	}
-	return codexAutoDegradationStatusNormal, ""
+	return codexAutoDegradationStatusNormal, "", results
 }
 
 func probeFailureMessage(err error) string {
