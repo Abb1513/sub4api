@@ -7,6 +7,8 @@
 **完全重写Claude,codex协议的SUB2API，基于SUB4API二开, 前AI时代的OLD School手艺人打造,无OpenAI降智,无Claude封号**
 
 </div>
+# 本项目闭源了
+发现有人转卖，已转入内部私有仓库维护。不再更新！感谢你的关注。
 
 # 为什么是Sub6API
 > 网上所有SUBXAPI特征都非常多,有些特征低级的可怕,一看就是不懂技术没搞过协议模拟的人用AI写的泔水，用了就是自爆卡车。SUB6API重写了这些协议，完全吻合claudecode和codex特征，实现了不降智，不封号。
