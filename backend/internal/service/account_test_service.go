@@ -27,8 +27,10 @@ import (
 	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/config"
+	"github.com/MACOS-DO/sub4api/internal/pkg/anthropictokenizer"
 	"github.com/MACOS-DO/sub4api/internal/pkg/claude"
 	"github.com/MACOS-DO/sub4api/internal/pkg/geminicli"
+	kiropkg "github.com/MACOS-DO/sub4api/internal/pkg/kiro"
 	"github.com/MACOS-DO/sub4api/internal/pkg/openai"
 	"github.com/MACOS-DO/sub4api/internal/pkg/openai_compat"
 	"github.com/MACOS-DO/sub4api/internal/pkg/xai"
@@ -430,7 +432,186 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 		return s.testTypeSafeAccountConnection(c, account, prompt)
 	}
 
+	if account.IsKiro() && isKiroDirectModeAccount(account) {
+		return s.testKiroAccountConnection(c, account, modelID)
+	}
+
 	return s.testClaudeAccountConnection(c, account, modelID)
+}
+
+// testKiroAccountConnection probes the native Kiro endpoint. Kiro validates its
+// own bearer token and profile ARN, so sending it to api.anthropic.com always
+// produces a false 401 and marks a healthy account as needing reauthorization.
+func (s *AccountTestService) testKiroAccountConnection(c *gin.Context, account *Account, modelID string) error {
+	ctx := c.Request.Context()
+
+	testModelID := strings.TrimSpace(modelID)
+	if testModelID == "" {
+		testModelID = "claude-sonnet-4-6"
+	}
+	if mappedModel := account.GetMappedModel(testModelID); strings.TrimSpace(mappedModel) != "" {
+		testModelID = mappedModel
+	}
+
+	var accessToken string
+	switch account.Type {
+	case AccountTypeOAuth:
+		if s.kiroTokenProvider == nil {
+			return s.sendErrorAndEnd(c, "Kiro token provider not configured")
+		}
+		token, err := s.kiroTokenProvider.GetAccessToken(ctx, account)
+		if err != nil {
+			return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to get Kiro access token: %s", err.Error()))
+		}
+		accessToken = token
+	case AccountTypeAPIKey:
+		accessToken = strings.TrimSpace(account.GetCredential("api_key"))
+		if accessToken == "" {
+			return s.sendErrorAndEnd(c, "No API key available")
+		}
+	default:
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Unsupported Kiro account type: %s", account.Type))
+	}
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+
+	payload, err := createTestPayload(testModelID)
+	if err != nil {
+		return s.sendErrorAndEnd(c, "Failed to create test payload")
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return s.sendErrorAndEnd(c, "Failed to encode test payload")
+	}
+
+	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
+
+	resp, err := s.executeKiroTestUpstream(ctx, account, payloadBytes, testModelID, accessToken)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return s.sendErrorAndEnd(c, fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body)))
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer func() { _ = resp.Body.Close() }()
+		_, streamErr := kiropkg.StreamEventStreamAsAnthropicWithContext(
+			ctx,
+			resp.Body,
+			pw,
+			testModelID,
+			estimateKiroInputTokens(ctx, anthropictokenizer.AlgorithmOfficial, payloadBytes),
+			kiropkg.KiroRequestContext{},
+		)
+		if streamErr != nil {
+			_ = pw.CloseWithError(streamErr)
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	return s.processClaudeStream(c, pr)
+}
+
+func (s *AccountTestService) executeKiroTestUpstream(ctx context.Context, account *Account, anthropicBody []byte, mappedModel, token string) (*http.Response, error) {
+	modelID := resolveKiroUpstreamModel(mappedModel)
+	currentToken := token
+	profileARN := kiroResolveRequestProfileArn(account)
+	gateway := &GatewayService{}
+
+	buildPayload := func(profile string) ([]byte, error) {
+		result, err := gateway.buildKiroPayloadForAccountWithArn(
+			ctx,
+			account,
+			nil,
+			anthropicBody,
+			modelID,
+			currentToken,
+			mappedModel,
+			nil,
+			profile,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return result.Payload, nil
+	}
+
+	payload, err := buildPayload(profileARN)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoints := buildKiroEndpoints(account, KiroEndpointModeQ)
+	proxyURL := kiroProxyURL(account)
+	tlsProfile := s.tlsFPProfileService.ResolveTLSProfile(account)
+	accountKey := buildKiroAccountKey(account)
+	const maxRetries = 2
+
+	for _, endpoint := range endpoints {
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			req, err := newKiroJSONRequest(ctx, endpoint.URL, payload, currentToken, accountKey, buildKiroMachineID(account), endpoint.AmzTarget, account)
+			if err != nil {
+				return nil, err
+			}
+
+			resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+			if err != nil {
+				return nil, err
+			}
+
+			if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
+				return resp, nil
+			}
+
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				respBody, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr != nil {
+					return nil, readErr
+				}
+
+				if s.kiroTokenProvider != nil && (resp.StatusCode == http.StatusUnauthorized || isKiroTokenErrorBody(respBody)) && attempt < maxRetries {
+					refreshedToken, refreshErr := s.kiroTokenProvider.ForceRefreshAccessToken(ctx, account)
+					if refreshErr == nil && strings.TrimSpace(refreshedToken) != "" {
+						currentToken = refreshedToken
+						accountKey = buildKiroAccountKey(account)
+						profileARN = kiroResolveRequestProfileArn(account)
+						payload, err = buildPayload(profileARN)
+						if err != nil {
+							return nil, err
+						}
+						continue
+					}
+				}
+
+				resetHTTPResponseBody(resp, respBody)
+				return resp, nil
+			}
+
+			if resp.StatusCode == http.StatusBadRequest {
+				respBody, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr != nil {
+					return nil, readErr
+				}
+				resetHTTPResponseBody(resp, respBody)
+				return resp, nil
+			}
+
+			return resp, nil
+		}
+	}
+
+	return nil, fmt.Errorf("kiro upstream endpoints exhausted")
 }
 
 // testOpenCodeGoAccountConnection probes the native endpoint for the selected
