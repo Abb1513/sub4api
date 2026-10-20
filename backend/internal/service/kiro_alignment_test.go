@@ -700,6 +700,79 @@ func TestAccountUsageService_GetUsage_KiroCachesErrorSnapshotWhenRefreshFailsWit
 	require.Equal(t, 1, requestCount)
 }
 
+func TestAccountUsageService_GetUsage_KiroForceRefreshBypassesCachedError(t *testing.T) {
+	account := Account{
+		ID:       711,
+		Platform: PlatformKiro,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "kiro-access-token",
+			"provider":     "Github",
+			"auth_method":  "social",
+		},
+	}
+	repo := &stubOpenAIAccountRepo{accounts: []Account{account}}
+	svc := NewAccountUsageService(repo, nil, nil, nil, nil, nil, nil, nil, NewUsageCache(), nil, nil)
+
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			http.Error(w, `{"message":"Invalid token"}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(kiroUsageTestBody(42)))
+	}))
+	defer server.Close()
+	setKiroUsageTestEndpoint(t, server.URL)
+
+	firstUsage, err := svc.GetUsage(context.Background(), account.ID)
+	require.NoError(t, err)
+	require.True(t, firstUsage.NeedsReauth)
+	require.Equal(t, 1, requestCount)
+
+	refreshedUsage, err := svc.GetUsage(context.Background(), account.ID, true)
+	require.NoError(t, err)
+	require.False(t, refreshedUsage.NeedsReauth)
+	require.Empty(t, refreshedUsage.Error)
+	require.NotNil(t, refreshedUsage.KiroCredit)
+	require.Equal(t, 42.0, refreshedUsage.KiroCredit.CurrentUsage)
+	require.Equal(t, 2, requestCount)
+}
+
+func TestAccountUsageService_InvalidateKiroUsageCache(t *testing.T) {
+	account := Account{
+		ID:       712,
+		Platform: PlatformKiro,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "kiro-access-token",
+			"provider":     "Enterprise",
+			"auth_method":  "idc",
+			"profile_arn":  "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL",
+		},
+	}
+	repo := &stubOpenAIAccountRepo{accounts: []Account{account}}
+	svc := NewAccountUsageService(repo, nil, nil, nil, nil, nil, nil, nil, NewUsageCache(), nil, nil)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(kiroUsageTestBody(7)))
+	}))
+	defer server.Close()
+	setKiroUsageTestEndpoint(t, server.URL)
+
+	_, err := svc.GetUsage(context.Background(), account.ID)
+	require.NoError(t, err)
+	_, ok := svc.getCachedKiroUsage(account.ID)
+	require.True(t, ok)
+
+	svc.InvalidateKiroUsageCache(account.ID)
+	_, ok = svc.getCachedKiroUsage(account.ID)
+	require.False(t, ok)
+}
+
 func TestMapKiroUsageToInfo_CreditsExhausted(t *testing.T) {
 	info := mapKiroUsageToInfo(&kiroUsageLimitsResponse{
 		NextDateReset: "2099-03-13T12:00:00Z",

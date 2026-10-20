@@ -141,6 +141,13 @@ func (h *AccountHandler) SetKiroOAuthService(svc *service.KiroOAuthService) {
 	}
 }
 
+func (h *AccountHandler) invalidateKiroUsageCache(account *service.Account) {
+	if h == nil || h.accountUsageService == nil || account == nil || account.Platform != service.PlatformKiro {
+		return
+	}
+	h.accountUsageService.InvalidateKiroUsageCache(account.ID)
+}
+
 // CreateAccountRequest represents create account request
 type CreateAccountRequest struct {
 	Name                    string         `json:"name" binding:"required"`
@@ -1280,6 +1287,7 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	// 异步执行，探测失败不影响账号更新响应。
 	if len(req.Credentials) > 0 {
 		h.scheduleOpenAIResponsesProbe(account)
+		h.invalidateKiroUsageCache(account)
 	}
 
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
@@ -1625,6 +1633,7 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 	h.adminService.EnsureAntigravityPrivacy(ctx, updatedAccount)
 	// Kiro OAuth: 刷新成功后解析并回填 profile_arn
 	h.adminService.EnsureKiroProfileArn(ctx, updatedAccount)
+	h.invalidateKiroUsageCache(updatedAccount)
 
 	return updatedAccount, "", nil
 }
@@ -1777,6 +1786,7 @@ func (h *AccountHandler) ApplyOAuthCredentials(c *gin.Context) {
 	} else if cleared != nil {
 		updatedAccount = cleared
 	}
+	h.invalidateKiroUsageCache(updatedAccount)
 
 	if h.tokenCacheInvalidator != nil && updatedAccount.IsOAuth() {
 		if invalidateErr := h.tokenCacheInvalidator.InvalidateToken(ctx, updatedAccount); invalidateErr != nil {
@@ -1843,6 +1853,7 @@ func (h *AccountHandler) ClearError(c *gin.Context) {
 			log.Printf("[WARN] Failed to invalidate token cache for account %d: %v", accountID, invalidateErr)
 		}
 	}
+	h.invalidateKiroUsageCache(account)
 
 	response.Success(c, h.buildAccountResponseWithRuntime(c.Request.Context(), account))
 }

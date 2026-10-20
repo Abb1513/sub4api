@@ -91,11 +91,6 @@ func (s *AccountUsageService) getKiroUsage(ctx context.Context, account *Account
 	}
 
 	cached, hasCached := s.getCachedKiroUsage(account.ID)
-	if hasCached && (cached.ErrorCode != "" || cached.Error != "") {
-		cached.Source = source
-		s.attachKiroRuntimeState(ctx, account, cached)
-		return cached, nil
-	}
 	if !forceRefresh && hasCached {
 		cached.Source = source
 		s.attachKiroRuntimeState(ctx, account, cached)
@@ -104,11 +99,6 @@ func (s *AccountUsageService) getKiroUsage(ctx context.Context, account *Account
 
 	flightKey := fmt.Sprintf("kiro-usage:%d", account.ID)
 	result, fetchErr, _ := s.cache.kiroUsageFlight.Do(flightKey, func() (any, error) {
-		if !forceRefresh {
-			if usage, ok := s.getCachedKiroUsage(account.ID); ok {
-				return usage, nil
-			}
-		}
 		usage, err := s.fetchAndCacheKiroUsage(ctx, account, source)
 		if err != nil {
 			return nil, err
@@ -216,6 +206,15 @@ func (s *AccountUsageService) storeKiroUsageSnapshot(accountID int64, usage *Usa
 		usageInfo: cloneUsageInfo(usage),
 		timestamp: now,
 	})
+}
+
+// InvalidateKiroUsageCache drops the in-process Kiro usage snapshot for an account.
+// Re-auth and token refresh must not leave a stale needs_reauth response visible.
+func (s *AccountUsageService) InvalidateKiroUsageCache(accountID int64) {
+	if s == nil || s.cache == nil || accountID <= 0 {
+		return
+	}
+	s.cache.kiroUsageCache.Delete(accountID)
 }
 
 func (s *AccountUsageService) getCachedKiroUsage(accountID int64) (*UsageInfo, bool) {
