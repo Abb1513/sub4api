@@ -174,6 +174,11 @@ func GroupFromServiceAdmin(g *service.Group) *AdminGroup {
 			out.AccountGroups = append(out.AccountGroups, *AccountGroupFromService(&ag))
 		}
 	}
+	out.KiroCacheEmulationEnabled = g.KiroCacheEmulationEnabled
+	out.KiroCacheEmulationRatio = g.KiroCacheEmulationRatio
+	out.KiroCacheEmulationMode = g.KiroCacheEmulationMode
+	out.KiroCacheCreationEmulationRatio = g.KiroCacheCreationEmulationRatio
+	out.KiroCacheReadEmulationRatio = g.KiroCacheReadEmulationRatio
 	return out
 }
 
@@ -222,6 +227,14 @@ func groupFromServiceBase(g *service.Group) Group {
 		AllowLive:                       g.AllowLive,
 		RequireOAuthOnly:                g.RequireOAuthOnly,
 		RequirePrivacySet:               g.RequirePrivacySet,
+		KiroCacheEmulationEnabled:       g.EffectiveKiroCacheEmulationEnabled(),
+		KiroAutoStickyEnabled:           g.EffectiveKiroAutoStickyEnabled(),
+		KiroStickySessionTTLSeconds:     g.EffectiveKiroStickySessionTTLSeconds(),
+		KiroCacheEmulationRatio:         g.EffectiveKiroCacheEmulationRatio(),
+		KiroCacheEmulationMode:          g.EffectiveKiroCacheEmulationMode(),
+		KiroCacheCreationEmulationRatio: g.EffectiveKiroCacheCreationEmulationRatio(),
+		KiroCacheReadEmulationRatio:     g.EffectiveKiroCacheReadEmulationRatio(),
+		KiroEndpointMode:                g.EffectiveKiroEndpointMode(),
 		RPMLimit:                        g.RPMLimit,
 		MaxReasoningEffort:              g.MaxReasoningEffort,
 		MaxReasoningEffortOverLimit:     g.MaxReasoningEffortOverLimit,
@@ -275,6 +288,12 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		RateLimitedAt:           a.RateLimitedAt,
 		RateLimitResetAt:        a.RateLimitResetAt,
 		OverloadUntil:           a.OverloadUntil,
+		KiroQuotaState:          a.KiroQuotaState,
+		KiroQuotaReason:         a.KiroQuotaReason,
+		KiroQuotaResetAt:        a.KiroQuotaResetAt,
+		KiroRuntimeState:        a.KiroRuntimeState,
+		KiroRuntimeReason:       a.KiroRuntimeReason,
+		KiroRuntimeResetAt:      a.KiroRuntimeResetAt,
 		TempUnschedulableUntil:  a.TempUnschedulableUntil,
 		TempUnschedulableReason: a.TempUnschedulableReason,
 		SessionWindowStart:      a.SessionWindowStart,
@@ -780,9 +799,25 @@ func UsageLogFromServiceAdmin(l *service.UsageLog) *AdminUsageLog {
 		BillingTier:             l.BillingTier,
 		AccountRateMultiplier:   l.AccountRateMultiplier,
 		AccountStatsCost:        l.AccountStatsCost,
+		UpstreamCredits:         l.KiroCredits,
+		UpstreamCreditCost:      adminUpstreamCreditCost(l),
 		IPAddress:               l.IPAddress,
 		Account:                 AccountSummaryFromService(l.Account),
 	}
+}
+
+// adminUpstreamCreditCost 按账号当前积分单价估算本次上游成本（展示用，不参与计费）。
+// 没有积分、没有关联账号或未设单价时返回 nil。
+func adminUpstreamCreditCost(l *service.UsageLog) *float64 {
+	if l == nil || l.KiroCredits == nil || *l.KiroCredits <= 0 || l.Account == nil {
+		return nil
+	}
+	unitPrice := l.Account.CreditUnitPriceUSD()
+	if unitPrice <= 0 {
+		return nil
+	}
+	cost := *l.KiroCredits * unitPrice
+	return &cost
 }
 
 func userFacingReasoningEffort(l *service.UsageLog) *string {

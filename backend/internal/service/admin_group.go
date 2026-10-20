@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/MACOS-DO/sub4api/internal/pkg/claude"
 	infraerrors "github.com/MACOS-DO/sub4api/internal/pkg/errors"
 	"github.com/MACOS-DO/sub4api/internal/pkg/geminicli"
+	kiropkg "github.com/MACOS-DO/sub4api/internal/pkg/kiro"
 	"github.com/MACOS-DO/sub4api/internal/pkg/logger"
 	"github.com/MACOS-DO/sub4api/internal/pkg/openai"
 	"github.com/MACOS-DO/sub4api/internal/pkg/pagination"
@@ -301,6 +303,12 @@ func defaultModelsListCandidateIDs(platform string) []string {
 		return DefaultOpenCodeGoModelIDs()
 	case PlatformTypeSafe:
 		return []string{typesafe.JevLatestModel}
+	case PlatformKiro:
+		ids := make([]string, 0, len(kiropkg.DefaultModels))
+		for _, model := range kiropkg.DefaultModels {
+			ids = append(ids, model.ID)
+		}
+		return ids
 	case PlatformComposite:
 		return compositeDefaultModelsListCandidateIDs()
 	default:
@@ -348,8 +356,38 @@ func groupSupportsOAuthOnlyFilter(platform string) bool {
 		platform == PlatformAntigravity ||
 		platform == PlatformAnthropic ||
 		platform == PlatformGemini ||
+		platform == PlatformKiro ||
 		platform == PlatformGrok ||
 		platform == PlatformComposite
+}
+
+func validateKiroCacheEmulationRatio(name string, value *float64) error {
+	if value == nil {
+		return nil
+	}
+	if math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 || *value > 1 {
+		return infraerrors.BadRequest(
+			"INVALID_KIRO_CACHE_EMULATION_RATIO",
+			fmt.Sprintf("%s must be a finite number between 0 and 1", name),
+		)
+	}
+	return nil
+}
+
+func validateKiroCacheEmulationRatioInputs(ratio, creationRatio, readRatio *float64) error {
+	for _, field := range []struct {
+		name  string
+		value *float64
+	}{
+		{"kiro_cache_emulation_ratio", ratio},
+		{"kiro_cache_creation_emulation_ratio", creationRatio},
+		{"kiro_cache_read_emulation_ratio", readRatio},
+	} {
+		if err := validateKiroCacheEmulationRatio(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func groupSupportsOpenAIFast(platform string) bool {
@@ -394,6 +432,13 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 	}
 
 	platform := NormalizeGroupPlatform(input.Platform)
+	if err := validateKiroCacheEmulationRatioInputs(
+		input.KiroCacheEmulationRatio,
+		input.KiroCacheCreationEmulationRatio,
+		input.KiroCacheReadEmulationRatio,
+	); err != nil {
+		return nil, err
+	}
 	// 固定账号 manifest 配置：账号绑定发生在创建之后，创建时无法校验成员关系，
 	// 拒绝开启并在创建后的编辑里配置。
 	if normalizeCodexModelsManifestConfig(platform, input.CodexModelsManifestConfig).Enabled {
@@ -519,8 +564,30 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		mcpXMLInject = *input.MCPXMLInject
 	}
 
+	kiroAutoStickyEnabled := platform == PlatformKiro
+	if input.KiroAutoStickyEnabled != nil {
+		kiroAutoStickyEnabled = *input.KiroAutoStickyEnabled
+	}
 	allowImageGeneration := input.AllowImageGeneration || defaultAllowImageGenerationForPlatform(platform)
 	allowBatchImageGeneration := input.AllowBatchImageGeneration && allowImageGeneration && platform == PlatformGemini
+	kiroCacheEmulationRatio := 1.0
+	if input.KiroCacheEmulationRatio != nil {
+		kiroCacheEmulationRatio = *input.KiroCacheEmulationRatio
+	}
+	kiroCacheEmulationMode := KiroCacheEmulationModeUniform
+	if input.KiroCacheEmulationMode != nil {
+		kiroCacheEmulationMode = normalizeKiroCacheEmulationMode(*input.KiroCacheEmulationMode)
+	}
+	kiroCacheCreationEmulationRatio := kiroCacheEmulationRatio
+	kiroCacheReadEmulationRatio := kiroCacheEmulationRatio
+	if kiroCacheEmulationMode == KiroCacheEmulationModeIndependent {
+		if input.KiroCacheCreationEmulationRatio != nil {
+			kiroCacheCreationEmulationRatio = *input.KiroCacheCreationEmulationRatio
+		}
+		if input.KiroCacheReadEmulationRatio != nil {
+			kiroCacheReadEmulationRatio = *input.KiroCacheReadEmulationRatio
+		}
+	}
 
 	// 如果指定了复制账号的源分组，先获取账号 ID 列表
 	var accountIDsToCopy []int64
@@ -617,11 +684,23 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		ModelAllowlist:                  modelAllowlist,
 		// 固定账号 manifest 配置：账号绑定发生在分组创建之后，创建路径禁止开启，
 		// 成员关系无从校验（前端创建对话框也不展示）。
-		CodexModelsManifestConfig:   normalizeCodexModelsManifestConfig(platform, input.CodexModelsManifestConfig),
-		RPMLimit:                    input.RPMLimit,
-		MaxReasoningEffort:          maxReasoningEffort,
-		MaxReasoningEffortOverLimit: maxReasoningEffortOverLimit,
-		ReasoningEffortMappings:     reasoningEffortMappings,
+		CodexModelsManifestConfig:       normalizeCodexModelsManifestConfig(platform, input.CodexModelsManifestConfig),
+		RPMLimit:                        input.RPMLimit,
+		MaxReasoningEffort:              maxReasoningEffort,
+		MaxReasoningEffortOverLimit:     maxReasoningEffortOverLimit,
+		ReasoningEffortMappings:         reasoningEffortMappings,
+		KiroCacheEmulationEnabled:       input.KiroCacheEmulationEnabled,
+		KiroAutoStickyEnabled:           kiroAutoStickyEnabled,
+		KiroCacheEmulationRatio:         kiroCacheEmulationRatio,
+		KiroCacheEmulationMode:          kiroCacheEmulationMode,
+		KiroCacheCreationEmulationRatio: kiroCacheCreationEmulationRatio,
+		KiroCacheReadEmulationRatio:     kiroCacheReadEmulationRatio,
+	}
+	if input.KiroStickySessionTTLSeconds != nil {
+		group.KiroStickySessionTTLSeconds = *input.KiroStickySessionTTLSeconds
+	}
+	if input.KiroEndpointMode != nil {
+		group.KiroEndpointMode = *input.KiroEndpointMode
 	}
 	sanitizeGroupMessagesDispatchFields(group)
 	sanitizeGroupOpenAIFast(group)
@@ -629,6 +708,7 @@ func (s *adminServiceImpl) CreateGroup(ctx context.Context, input *CreateGroupIn
 		group.AllowLive = false
 	}
 	sanitizeGroupReasoningEffortPolicy(group)
+	NormalizeGroupRuntimeFields(group)
 	if err := s.groupRepo.Create(ctx, group); err != nil {
 		return nil, err
 	}
@@ -751,6 +831,13 @@ func (s *adminServiceImpl) validateFallbackGroupOnInvalidRequest(ctx context.Con
 }
 
 func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *UpdateGroupInput) (*Group, error) {
+	if err := validateKiroCacheEmulationRatioInputs(
+		input.KiroCacheEmulationRatio,
+		input.KiroCacheCreationEmulationRatio,
+		input.KiroCacheReadEmulationRatio,
+	); err != nil {
+		return nil, err
+	}
 	group, err := s.groupRepo.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -1038,12 +1125,46 @@ func (s *adminServiceImpl) UpdateGroup(ctx context.Context, id int64, input *Upd
 		}
 		group.ReasoningEffortMappings = reasoningEffortMappings
 	}
+	if input.KiroCacheEmulationEnabled != nil {
+		group.KiroCacheEmulationEnabled = *input.KiroCacheEmulationEnabled
+	}
+	if input.KiroAutoStickyEnabled != nil {
+		group.KiroAutoStickyEnabled = *input.KiroAutoStickyEnabled
+	}
+	if input.KiroStickySessionTTLSeconds != nil {
+		group.KiroStickySessionTTLSeconds = *input.KiroStickySessionTTLSeconds
+	}
+	if input.KiroCacheEmulationRatio != nil {
+		group.KiroCacheEmulationRatio = *input.KiroCacheEmulationRatio
+	}
+	previousCacheMode := group.EffectiveKiroCacheEmulationMode()
+	if input.KiroCacheEmulationMode != nil {
+		group.KiroCacheEmulationMode = *input.KiroCacheEmulationMode
+	}
+	if input.KiroCacheCreationEmulationRatio != nil {
+		group.KiroCacheCreationEmulationRatio = *input.KiroCacheCreationEmulationRatio
+	}
+	if input.KiroCacheReadEmulationRatio != nil {
+		group.KiroCacheReadEmulationRatio = *input.KiroCacheReadEmulationRatio
+	}
+	if previousCacheMode == KiroCacheEmulationModeUniform && normalizeKiroCacheEmulationMode(group.KiroCacheEmulationMode) == KiroCacheEmulationModeIndependent {
+		if input.KiroCacheCreationEmulationRatio == nil {
+			group.KiroCacheCreationEmulationRatio = group.KiroCacheEmulationRatio
+		}
+		if input.KiroCacheReadEmulationRatio == nil {
+			group.KiroCacheReadEmulationRatio = group.KiroCacheEmulationRatio
+		}
+	}
+	if input.KiroEndpointMode != nil {
+		group.KiroEndpointMode = *input.KiroEndpointMode
+	}
 	sanitizeGroupMessagesDispatchFields(group)
 	sanitizeGroupOpenAIFast(group)
 	if group.Platform != PlatformOpenAI && group.Platform != PlatformComposite {
 		group.AllowLive = false
 	}
 	sanitizeGroupReasoningEffortPolicy(group)
+	NormalizeGroupRuntimeFields(group)
 	// 固定账号 manifest 配置：按最终平台归一化（切出 openai 平台时静默归零，
 	// 与 ForceOpenAIFast 同一收口）；校验仅在本次显式携带配置时进行，
 	// 避免脏 ID 阻塞无关字段更新。

@@ -795,6 +795,10 @@ func (s *stubAdminService) EnsureAntigravityPrivacy(ctx context.Context, account
 	return ""
 }
 
+func (s *stubAdminService) EnsureKiroProfileArn(ctx context.Context, account *service.Account) string {
+	return ""
+}
+
 func (s *stubAdminService) ForceOpenAIPrivacy(ctx context.Context, account *service.Account) string {
 	return ""
 }

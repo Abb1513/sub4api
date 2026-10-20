@@ -261,6 +261,7 @@
                 <PlatformTypeBadge :platform="row.platform" :type="row.type"
                   :auth-mode="getOpenAIAuthMode(row)"
                   :plan-type="getAccountPlanType(row)"
+                  :overages-enabled="isKiroOveragesEnabled(row)"
                   :privacy-mode="row.extra?.privacy_mode || row.parent_privacy_mode"
                   :subscription-expires-at="row.credentials?.subscription_expires_at || row.parent_subscription_expires_at" />
                 <span
@@ -334,6 +335,7 @@
               :request-batched-usage="isDesktopViewport ? queueBatchedUsage : null"
               @account-updated="handleAccountUpdated"
               @usage-loaded="handleAccountUsageLoaded(row.id, $event)"
+              @kiro-usage-meta="handleKiroUsageMeta(row, $event)"
             />
           </template>
           <template #cell-proxy="{ row }">
@@ -776,6 +778,7 @@ const accountSupportsBatchUsage = (account: Account) => {
   if (account.platform === 'antigravity') return account.type === 'oauth'
   if (account.platform === 'openai') return account.type === 'oauth'
   if (account.platform === 'grok') return account.type === 'oauth'
+  if (account.platform === 'kiro') return account.type === 'oauth'
   return false
 }
 
@@ -1433,6 +1436,22 @@ const shouldReplaceAutoRefreshRow = (current: Account, next: Account) => {
     buildOpenAIUsageRefreshKey(current) !== buildOpenAIUsageRefreshKey(next) ||
     buildGrokUsageRefreshKey(current) !== buildGrokUsageRefreshKey(next)
   )
+}
+
+const isKiroOveragesEnabled = (account: Account) => {
+  return account.platform === 'kiro' && account.credentials?.kiro_overages_enabled === true
+}
+
+const handleKiroUsageMeta = (
+  account: Account,
+  meta: { plan_type?: string; kiro_overages_enabled: boolean }
+) => {
+  if (account.platform !== 'kiro') return
+  account.credentials = {
+    ...(account.credentials || {}),
+    ...(meta.plan_type ? { plan_type: meta.plan_type } : {}),
+    kiro_overages_enabled: meta.kiro_overages_enabled
+  }
 }
 
 const syncAccountRefs = (nextAccount: Account) => {

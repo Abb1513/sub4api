@@ -1334,6 +1334,7 @@ function generateRoutedCodexFiles(
     openai_bps: 'OpenAI BPS',
     gemini: 'Gemini',
     antigravity: 'Antigravity',
+    kiro: 'Kiro',
     grok: 'Grok',
     kimi: 'Kimi',
     zhipu: 'Zhipu',

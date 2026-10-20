@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/config"
+	"github.com/MACOS-DO/sub4api/internal/pkg/anthropictokenizer"
 	"github.com/MACOS-DO/sub4api/internal/pkg/antigravity"
 	infraerrors "github.com/MACOS-DO/sub4api/internal/pkg/errors"
 )
@@ -474,6 +475,11 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 		return nil, fmt.Errorf("%s must be one of: %s/%s", SettingKeyOpenAITTFTMode, OpenAITTFTModeSemantic, OpenAITTFTModeVisible)
 	}
 	updates[SettingKeyOpenAITTFTMode] = mode
+	kiroTokenizer, err := normalizeGatewayKiroTokenizer(settings.GatewayKiroTokenizer)
+	if err != nil {
+		return nil, err
+	}
+	updates[SettingKeyGatewayKiroTokenizer] = kiroTokenizer
 	updates[SettingKeyEnableFingerprintUnification] = strconv.FormatBool(settings.EnableFingerprintUnification)
 	updates[SettingKeyEnableMetadataPassthrough] = strconv.FormatBool(settings.EnableMetadataPassthrough)
 	updates[SettingKeyEnableCCHSigning] = strconv.FormatBool(settings.EnableCCHSigning)
@@ -750,6 +756,7 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		anthropicCacheTTL1hInjection:     settings.EnableAnthropicCacheTTL1hInjection,
 		rewriteMessageCacheControl:       settings.RewriteMessageCacheControl,
 		clientDatelineNormalization:      settings.EnableClientDatelineNormalization,
+		kiroTokenizer:                    anthropictokenizer.ParseAlgorithm(settings.GatewayKiroTokenizer),
 		expiresAt:                        time.Now().Add(gatewayForwardingCacheTTL).UnixNano(),
 	})
 	s.antigravityUAVersionSF.Forget("antigravity_user_agent_version")

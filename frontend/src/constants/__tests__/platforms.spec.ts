@@ -7,6 +7,7 @@ const concretePlatforms = [
   'openai_bps',
   'gemini',
   'antigravity',
+  'kiro',
   'grok',
   'kimi',
   'zhipu',

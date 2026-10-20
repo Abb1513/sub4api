@@ -132,6 +132,7 @@ var AllowedQuotaPlatforms = []string{
 	PlatformOpenAI,
 	PlatformGemini,
 	PlatformAntigravity,
+	PlatformKiro,
 	PlatformGrok,
 	PlatformKimi,
 	PlatformZhipu,
@@ -676,6 +677,8 @@ const (
 	SettingKeyOpenAITTFTMode = "openai_ttft_mode"
 	OpenAITTFTModeSemantic   = "semantic"
 	OpenAITTFTModeVisible    = "visible"
+	// SettingKeyGatewayKiroTokenizer 控制 Kiro 渠道的 token 计量算法。
+	SettingKeyGatewayKiroTokenizer = "gateway_kiro_tokenizer"
 	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）
 	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
 	// SettingKeyEnableMetadataPassthrough 是否透传客户端原始 metadata.user_id（默认 false）

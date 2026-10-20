@@ -11,6 +11,7 @@ import (
 
 	"github.com/MACOS-DO/sub4api/internal/config"
 	infraerrors "github.com/MACOS-DO/sub4api/internal/pkg/errors"
+	kiropkg "github.com/MACOS-DO/sub4api/internal/pkg/kiro"
 	"github.com/MACOS-DO/sub4api/internal/pkg/openai"
 	"github.com/MACOS-DO/sub4api/internal/util/logredact"
 )
@@ -183,6 +184,24 @@ func (s *TokenRefreshService) SetRefreshPolicy(policy BackgroundRefreshPolicy) {
 
 func (s *TokenRefreshService) SetAccountRuntimeBlocker(blocker AccountRuntimeBlocker) {
 	s.runtimeBlocker = blocker
+}
+
+// SetKiroOAuthService registers Kiro background token refresh after construction.
+// The constructor keeps its existing signature so tests and callers that do not
+// need Kiro support remain source-compatible.
+func (s *TokenRefreshService) SetKiroOAuthService(kiroOAuthService *KiroOAuthService) {
+	if s == nil || kiroOAuthService == nil {
+		return
+	}
+	for _, registration := range s.registrations {
+		if registration.platform == PlatformKiro {
+			return
+		}
+	}
+	refresher := NewKiroTokenRefresher(kiroOAuthService)
+	s.registrations = append(s.registrations,
+		tokenRefreshRegistration{platform: PlatformKiro, refresher: refresher, executor: refresher},
+	)
 }
 
 func (s *TokenRefreshService) notifyAccountSchedulingBlocked(account *Account, until time.Time, reason string) {
@@ -1201,6 +1220,8 @@ func (s *TokenRefreshService) postRefreshActions(ctx context.Context, account *A
 	s.ensureOpenAIPrivacy(ctx, account)
 	// Antigravity OAuth: 刷新成功后，检查是否已设置 privacy_mode，未设置则调用 setUserSettings
 	s.ensureAntigravityPrivacy(ctx, account)
+	// Kiro OAuth: 刷新成功后，提前解析并回填 profileArn（Enterprise/IdC 账号需要）
+	s.ensureKiroProfileArn(ctx, account)
 	// Grok: clear soft reauth flag after a successful credential refresh.
 	if account != nil && account.Platform == PlatformGrok && accountGrokNeedsReauth(account) {
 		clearGrokNeedsReauthExtra(ctx, s.accountRepo, account.ID)
@@ -1419,6 +1440,10 @@ func isNonRetryableRefreshError(err error) bool {
 	if errors.As(err, &openAIError) {
 		return openAIError.Permanent
 	}
+	var kiroInvalidGrant *kiropkg.RefreshTokenInvalidError
+	if errors.As(err, &kiroInvalidGrant) {
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	nonRetryable := []string{
 		"invalid_grant",             // refresh_token 已失效
@@ -1445,6 +1470,27 @@ func isNonRetryableRefreshError(err error) bool {
 		}
 	}
 	return false
+}
+
+// ensureKiroProfileArn 后台刷新中检查 Kiro OAuth 账号的 profileArn 是否已回填。
+// Enterprise/IdC 账号的 OAuth 流程不返回 profileArn，需要在 token 刷新成功后
+// 主动调用 ListAvailableProfiles API 解析真实 ARN 并持久化。
+func (s *TokenRefreshService) ensureKiroProfileArn(ctx context.Context, account *Account) {
+	if account == nil || account.Platform != PlatformKiro || account.Type != AccountTypeOAuth {
+		return
+	}
+
+	existingARN := strings.TrimSpace(account.GetCredential("profile_arn"))
+	if existingARN != "" && !kiroIsPlaceholderProfileARN(existingARN) {
+		return
+	}
+
+	token := strings.TrimSpace(account.GetCredential("access_token"))
+	if token == "" {
+		return
+	}
+
+	_ = kiroResolveAndPersistProfileArn(ctx, s.accountRepo, account, token)
 }
 
 // ensureOpenAIPrivacy 检查 OpenAI OAuth 账号是否已设置 privacy_mode，

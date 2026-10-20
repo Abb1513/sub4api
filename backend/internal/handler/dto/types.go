@@ -145,6 +145,16 @@ type Group struct {
 	// OpenAI Live 接口开关
 	AllowLive bool `json:"allow_live"`
 
+	// Kiro 模拟缓存配置（仅 Kiro 平台生效）
+	KiroCacheEmulationEnabled       bool    `json:"kiro_cache_emulation_enabled"`
+	KiroAutoStickyEnabled           bool    `json:"kiro_auto_sticky_enabled"`
+	KiroStickySessionTTLSeconds     int     `json:"kiro_sticky_session_ttl_seconds"`
+	KiroCacheEmulationRatio         float64 `json:"kiro_cache_emulation_ratio"`
+	KiroCacheEmulationMode          string  `json:"kiro_cache_emulation_mode"`
+	KiroCacheCreationEmulationRatio float64 `json:"kiro_cache_creation_emulation_ratio"`
+	KiroCacheReadEmulationRatio     float64 `json:"kiro_cache_read_emulation_ratio"`
+	KiroEndpointMode                string  `json:"kiro_endpoint_mode"`
+
 	// 账号过滤控制（仅 OpenAI/Antigravity 平台有效）
 	RequireOAuthOnly  bool `json:"require_oauth_only"`
 	RequirePrivacySet bool `json:"require_privacy_set"`
@@ -240,6 +250,13 @@ type Account struct {
 	RateLimitedAt    *time.Time `json:"rate_limited_at"`
 	RateLimitResetAt *time.Time `json:"rate_limit_reset_at"`
 	OverloadUntil    *time.Time `json:"overload_until"`
+
+	KiroQuotaState     string     `json:"kiro_quota_state,omitempty"`
+	KiroQuotaReason    string     `json:"kiro_quota_reason,omitempty"`
+	KiroQuotaResetAt   *time.Time `json:"kiro_quota_reset_at,omitempty"`
+	KiroRuntimeState   string     `json:"kiro_runtime_state,omitempty"`
+	KiroRuntimeReason  string     `json:"kiro_runtime_reason,omitempty"`
+	KiroRuntimeResetAt *time.Time `json:"kiro_runtime_reset_at,omitempty"`
 
 	TempUnschedulableUntil  *time.Time `json:"temp_unschedulable_until"`
 	TempUnschedulableReason string     `json:"temp_unschedulable_reason"`
@@ -703,6 +720,9 @@ type AdminUsageLog struct {
 	AccountRateMultiplier *float64 `json:"account_rate_multiplier"`
 	// AccountStatsCost 自定义定价规则计算的账号统计费用（nil 表示使用默认公式）
 	AccountStatsCost *float64 `json:"account_stats_cost,omitempty"`
+	// UpstreamCredits 本次请求消耗的上游积分（Kiro credits / Leonardo 积分），仅管理端可见。
+	UpstreamCredits    *float64 `json:"upstream_credits,omitempty"`
+	UpstreamCreditCost *float64 `json:"upstream_credit_cost,omitempty"`
 
 	// IPAddress 用户请求 IP
 	IPAddress *string `json:"ip_address,omitempty"`
