@@ -167,7 +167,7 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 		return nil, fmt.Errorf("kiro requires oauth or apikey token, got %s", tokenType)
 	}
 	if isOnlyWebSearchToolInBody(body) {
-		webSearchResult, webSearchErr := s.executeKiroWebSearch(ctx, account, parsed.Group, body, mappedModel, originalModel, token, c.Request.Header)
+		webSearchResult, webSearchErr := s.executeKiroWebSearch(ctx, account, parsed.Group, parsed, body, mappedModel, originalModel, token, c.Request.Header)
 		switch {
 		case errors.Is(webSearchErr, errKiroWebSearchFallback):
 		case webSearchErr == nil:
@@ -244,7 +244,7 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 		return nil, s.handleKiroHTTPError(ctx, resp, c, account, mappedModel, body)
 	}
 
-	cacheUsage := s.buildKiroCacheEmulationUsage(ctx, account, parsed.Group, body, mappedModel, inputTokens)
+	cacheUsage := s.buildKiroCacheEmulationUsageForParsed(ctx, account, parsed.Group, parsed, body, mappedModel, inputTokens)
 	requestCtx.CacheEmulationUsage = cacheUsage.toKiroUsage()
 	requestCtx.EstimatedInputTokens = inputTokens
 	requestCtx.TokenizerAlgorithm = s.kiroMeteringAlgorithm(ctx)
@@ -299,7 +299,7 @@ func (s *GatewayService) openKiroAnthropicStreamResponse(ctx context.Context, ac
 	if isOnlyWebSearchToolInBody(anthropicBody) {
 		plan := cachePlanOverride
 		if plan == nil {
-			plan = s.prepareKiroCacheEmulationUsage(ctx, account, group, anthropicBody, mappedModel, inputTokens)
+			plan = s.prepareKiroCacheEmulationUsageForParsed(ctx, account, group, parsed, anthropicBody, mappedModel, inputTokens)
 		}
 		pr, pw := io.Pipe()
 		headers := make(http.Header)
@@ -332,7 +332,7 @@ func (s *GatewayService) openKiroAnthropicStreamResponse(ctx context.Context, ac
 	}
 	plan := cachePlanOverride
 	if plan == nil {
-		plan = s.prepareKiroCacheEmulationUsage(ctx, account, group, anthropicBody, mappedModel, inputTokens)
+		plan = s.prepareKiroCacheEmulationUsageForParsed(ctx, account, group, parsed, anthropicBody, mappedModel, inputTokens)
 	}
 	// 请求已确认成功(2xx)，此时提交缓存前缀落盘才是安全的。
 	plan.commit()
@@ -801,7 +801,10 @@ func estimateKiroInputTokens(ctx context.Context, alg anthropictokenizer.Algorit
 func kiroUsageToClaude(usage kiropkg.Usage, fallbackInput int) ClaudeUsage {
 	inputTokens := usage.InputTokens
 	if inputTokens == 0 {
-		inputTokens = fallbackInput
+		inputTokens = fallbackInput - usage.CacheReadInputTokens - usage.CacheCreationInputTokens
+		if inputTokens < 0 {
+			inputTokens = 0
+		}
 	}
 	return ClaudeUsage{
 		InputTokens:              inputTokens,

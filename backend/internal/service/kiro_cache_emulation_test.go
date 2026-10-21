@@ -108,17 +108,17 @@ func TestKiroCacheEmulationIndependentRatiosScaleSeparately(t *testing.T) {
 	group.KiroCacheReadEmulationRatio = 0.25
 	body := kiroCacheRequestBody("independent ratios", false)
 
-	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 2000)
+	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 6000)
 	require.NotNil(t, first)
-	require.Equal(t, 1500, first.CacheCreationInputTokens)
+	require.Positive(t, first.CacheCreationInputTokens)
 	require.Zero(t, first.CacheReadInputTokens)
-	require.Equal(t, 500, first.InputTokens)
+	require.Equal(t, 6000, first.InputTokens+first.CacheCreationInputTokens)
 
-	second := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 2000)
+	second := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 6000)
 	require.NotNil(t, second)
 	require.Zero(t, second.CacheCreationInputTokens)
-	require.Equal(t, 500, second.CacheReadInputTokens)
-	require.Equal(t, 1500, second.InputTokens)
+	require.Positive(t, second.CacheReadInputTokens)
+	require.Equal(t, 6000, second.InputTokens+second.CacheReadInputTokens)
 }
 
 func TestScaleKiroCacheCreationTTLTokensPreservesScaledTotal(t *testing.T) {
@@ -163,9 +163,78 @@ func TestKiroCacheEmulationAccountIsolation(t *testing.T) {
 	}
 }
 
-// 缓存命名空间按 account.ID 隔离，必须对「凭证轮转」完全免疫：access_token 与
-// refresh_token 都会在正常刷新中被覆盖写回（每小时至少一次），若参与键计算就会把该账号
-// 的全部前缀指纹作废、退回冷启动。理由详见 kiroCacheCredentialKey 的 godoc。
+func TestKiroCacheEmulationSessionIsolationAndCrossAccountSharing(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	group := kiroCacheGroup(1)
+	body := kiroCacheMultiMessageBody("session prefix", "session tail")
+	parsedA := &ParsedRequest{
+		MetadataUserID: `{"device_id":"device-a","session_id":"session-a"}`,
+		SessionContext: &SessionContext{APIKeyID: 1001},
+	}
+	parsedB := &ParsedRequest{
+		MetadataUserID: `user_hash_account__session_session-b`,
+		SessionContext: &SessionContext{APIKeyID: 1001},
+	}
+
+	first := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), kiroCacheAccount(401, "refresh-a", "access-a"), group, parsedA, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, first)
+	require.Zero(t, first.CacheReadInputTokens)
+	require.Positive(t, first.CacheCreationInputTokens)
+
+	sameSessionOtherAccount := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), kiroCacheAccount(402, "refresh-b", "access-b"), group, parsedA, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, sameSessionOtherAccount)
+	require.Positive(t, sameSessionOtherAccount.CacheReadInputTokens, "same session should hit across accounts")
+
+	differentSession := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), kiroCacheAccount(401, "refresh-a", "access-a"), group, parsedB, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, differentSession)
+	require.Zero(t, differentSession.CacheReadInputTokens, "different sessions must not share fingerprints")
+	require.Positive(t, differentSession.CacheCreationInputTokens)
+}
+
+func TestKiroCacheEmulationIsolationFallsBackToAPIKeyThenAccount(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	group := kiroCacheGroup(1)
+	body := kiroCacheMultiMessageBody("namespace prefix", "namespace tail")
+	account := kiroCacheAccount(403, "refresh", "access")
+
+	first := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), account, group, &ParsedRequest{SessionContext: &SessionContext{APIKeyID: 2001}}, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, first)
+	require.Positive(t, first.CacheCreationInputTokens)
+
+	sameKeyOtherAccount := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), kiroCacheAccount(404, "refresh-2", "access-2"), group, &ParsedRequest{SessionContext: &SessionContext{APIKeyID: 2001}}, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, sameKeyOtherAccount)
+	require.Positive(t, sameKeyOtherAccount.CacheReadInputTokens, "same API key should share a namespace")
+
+	otherKey := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), account, group, &ParsedRequest{SessionContext: &SessionContext{APIKeyID: 2002}}, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, otherKey)
+	require.Zero(t, otherKey.CacheReadInputTokens)
+
+	// nil ParsedRequest keeps the legacy account-ID fallback instead of disabling cache.
+	legacyFirst := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), account, group, nil, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, legacyFirst)
+	legacySecond := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), account, group, nil, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, legacySecond)
+	require.Positive(t, legacySecond.CacheReadInputTokens)
+}
+
+func TestKiroCacheEmulationModelIsInNamespaceFingerprint(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	group := kiroCacheGroup(1)
+	account := kiroCacheAccount(405, "refresh", "access")
+	parsed := &ParsedRequest{SessionContext: &SessionContext{APIKeyID: 3001}}
+	body := kiroCacheMultiMessageBody("model prefix", "model tail")
+
+	first := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), account, group, parsed, body, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, first)
+	otherModel := svc.buildKiroCacheEmulationUsageForParsed(context.Background(), account, group, parsed, body, "claude-sonnet-5", 6000)
+	require.NotNil(t, otherModel)
+	require.Zero(t, otherModel.CacheReadInputTokens, "different models must not share prefixes")
+}
+
+// 未提供 session/API key 时回退到 account.ID；凭证轮转不得影响命名空间。
 func TestKiroCacheEmulationKeyIsImmuneToCredentialRotation(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
@@ -219,6 +288,125 @@ func TestKiroCacheEmulationContentChangeMisses(t *testing.T) {
 	}
 }
 
+func TestKiroCacheEmulationMultiTurnReadsPriorPrefixAndKeepsInputPositive(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	account := kiroCacheAccount(406, "refresh", "access")
+	group := kiroCacheGroup(1)
+	firstBody := kiroCacheDefaultBreakpointBody("turn-one prefix", "turn-one current")
+	secondBody := kiroCacheDefaultBreakpointBody("turn-one prefix", "turn-two current")
+
+	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, firstBody, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, first)
+	require.Zero(t, first.CacheReadInputTokens)
+	require.Positive(t, first.CacheCreationInputTokens)
+	require.Positive(t, first.InputTokens, "the current turn must never be fully cached")
+
+	second := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, secondBody, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, second)
+	require.Positive(t, second.CacheReadInputTokens, "turn 2 should read turn 1's stable prefix")
+	require.Positive(t, second.InputTokens, "last message must remain uncached")
+	require.Equal(t, 6000, second.InputTokens+second.CacheCreationInputTokens+second.CacheReadInputTokens)
+	require.Equal(t, second.CacheCreationInputTokens,
+		second.CacheCreation5mInputTokens+second.CacheCreation1hInputTokens)
+}
+
+func kiroCacheDefaultBreakpointBody(prefixLabel, tailLabel string) []byte {
+	prefix := strings.Repeat("cacheable prompt chunk "+prefixLabel+" ", 512)
+	tail := strings.Repeat("conversation growth chunk "+tailLabel+" ", 160)
+	return []byte(fmt.Sprintf(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":[{"type":"text","text":%q}]},{"role":"user","content":[{"type":"text","text":%q}]}]}`, prefix, tail))
+}
+
+func TestKiroCacheEmulationUsageBucketsAlwaysSumToInputTokens(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	account := kiroCacheAccount(410, "refresh", "access")
+	group := kiroCacheGroup(0.6)
+
+	for _, inputTokens := range []int{6000, 12000, 24000} {
+		body := kiroCacheDefaultBreakpointBody("invariant prefix", fmt.Sprintf("invariant tail %d", inputTokens))
+		usage := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", inputTokens)
+		if usage == nil {
+			t.Fatalf("expected cache usage for total=%d", inputTokens)
+		}
+		require.Equal(t, inputTokens, usage.InputTokens+usage.CacheReadInputTokens+usage.CacheCreationInputTokens)
+		require.Equal(t, usage.CacheCreationInputTokens,
+			usage.CacheCreation5mInputTokens+usage.CacheCreation1hInputTokens)
+	}
+}
+
+func TestKiroCacheEmulationBelowMinimumRealCacheGetsNoUsage(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	account := kiroCacheAccount(407, "refresh", "access")
+	group := kiroCacheGroup(1)
+	body := kiroCacheMultiMessageBody("minimum prefix", "minimum tail")
+
+	require.NotNil(t, svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 6000))
+	belowMinimum := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 100)
+	require.Nil(t, belowMinimum, "real cache total below model threshold must not report cache")
+}
+
+func TestKiroCacheEmulationDynamicSystemHeadIsSkipped(t *testing.T) {
+	resetKiroCacheTracker()
+	svc := &GatewayService{}
+	account := kiroCacheAccount(408, "refresh", "access")
+	group := kiroCacheGroup(1)
+	stable := strings.Repeat("stable cached system instructions ", 700)
+	tail := strings.Repeat("stable tail conversation ", 150)
+	bodyA := []byte(fmt.Sprintf(
+		`{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"Current time: turn one"},{"type":"text","text":%q,"cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":%q}]},{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}`,
+		stable, tail))
+	bodyB := []byte(fmt.Sprintf(
+		`{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"Current time: turn two, a different value"},{"type":"text","text":%q,"cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":%q}]},{"role":"assistant","content":[{"type":"text","text":"ok"}]}]}`,
+		stable, tail))
+
+	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, bodyA, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, first)
+	second := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, bodyB, "claude-sonnet-4-6", 6000)
+	require.NotNil(t, second)
+	require.Positive(t, second.CacheReadInputTokens, "changing dynamic system head must not invalidate stable prefix")
+}
+
+func TestKiroCacheEmulationTrackerCapacityEvictsLRU(t *testing.T) {
+	resetKiroCacheTracker()
+	globalKiroCacheTracker.capacity = 2
+	svc := &GatewayService{}
+	account := kiroCacheAccount(409, "refresh", "access")
+	group := kiroCacheGroup(1)
+
+	for i := 0; i < 3; i++ {
+		body := kiroCacheMultiMessageBody(fmt.Sprintf("capacity prefix %d", i), "capacity tail")
+		require.NotNil(t, svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 6000))
+	}
+	globalKiroCacheTracker.mu.Lock()
+	defer globalKiroCacheTracker.mu.Unlock()
+	entries := globalKiroCacheTracker.entries[kiroCacheCredentialKey(account, nil, "claude-sonnet-4-6")]
+	require.LessOrEqual(t, len(entries), 2)
+}
+
+func TestKiroCacheEmulationTrackerFullPruneIsThrottled(t *testing.T) {
+	resetKiroCacheTracker()
+	now := time.Now()
+	expiredAt := now.Add(-time.Minute)
+	globalKiroCacheTracker.entries[1] = map[[32]byte]kiroCacheEntry{
+		{1}: {expiresAt: expiredAt},
+	}
+	globalKiroCacheTracker.entries[2] = map[[32]byte]kiroCacheEntry{
+		{2}: {expiresAt: expiredAt},
+	}
+	globalKiroCacheTracker.entryCount = 2
+	globalKiroCacheTracker.lastFullPrune = now
+
+	globalKiroCacheTracker.mu.Lock()
+	globalKiroCacheTracker.pruneLocked(1, now)
+	globalKiroCacheTracker.mu.Unlock()
+
+	require.Empty(t, globalKiroCacheTracker.entries[1], "the touched namespace is always pruned")
+	require.Len(t, globalKiroCacheTracker.entries[2], 1, "other namespaces wait for the throttled full prune")
+	require.Equal(t, 1, globalKiroCacheTracker.entryCount)
+}
+
 func TestKiroCacheEmulationTTLExpiry(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
@@ -266,8 +454,7 @@ func TestKiroCacheEmulationPrefixPartialHit(t *testing.T) {
 	}
 }
 
-// 计量算法切换只改口径：charclass/weighted 在 CJK 流量上应高于官方计数，
-// 且三条协议路径共用的缓存 profile 归一化不因算法改变（最后断点仍映射 totalInputTokens）。
+// 计量算法切换只改口径：charclass/weighted 在 CJK 流量上应高于官方计数。
 func TestKiroInputTokenEstimateInflatesUnderAlternativeAlgorithms(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet-4-6","system":"你是一个专业的编程助手。","messages":[{"role":"user","content":"这是一段用于验证计量口径的中文请求内容。"}]}`)
 	official := estimateKiroInputTokens(context.Background(), anthropictokenizer.AlgorithmOfficial, body)
@@ -283,19 +470,6 @@ func TestKiroInputTokenEstimateInflatesUnderAlternativeAlgorithms(t *testing.T) 
 		t.Fatalf("weighted estimate %d should exceed official %d on CJK payload", weighted, official)
 	}
 
-	for _, alg := range []anthropictokenizer.Algorithm{anthropictokenizer.AlgorithmCharClass, anthropictokenizer.AlgorithmWeighted} {
-		profile, ok := buildKiroCacheProfile(context.Background(), alg, body, "claude-sonnet-4-6", estimateKiroInputTokens(context.Background(), alg, body))
-		if !ok {
-			continue
-		}
-		last := profile.lastCacheableBreakpoint()
-		if last == nil {
-			continue
-		}
-		if got := profile.cacheTokensForBreakpoint(last.cumulativeTokens); got != profile.totalInputTokens {
-			t.Fatalf("algorithm %s: normalized last breakpoint = %d, want totalInputTokens %d", alg, got, profile.totalInputTokens)
-		}
-	}
 }
 
 func TestKiroInputTokenEstimateIgnoresClientMetadata(t *testing.T) {
@@ -381,7 +555,7 @@ func TestKiroCacheEmulationIncludesImageTokensAndKeepsImageFingerprint(t *testin
 	group := kiroCacheGroup(1)
 	prefix := strings.Repeat("cacheable visual prompt ", 700)
 	body := kiroCacheImageRequestBody(t, prefix, color.RGBA{R: 1, A: 255})
-	inputTokens := estimateKiroInputTokens(context.Background(), anthropictokenizer.AlgorithmOfficial, body)
+	inputTokens := 6000
 
 	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", inputTokens)
 	if first == nil || first.CacheCreationInputTokens <= 0 || first.CacheReadInputTokens != 0 {
@@ -412,15 +586,15 @@ func TestKiroResponsesCacheEmulationUsesFullInputPrefix(t *testing.T) {
 	svc := &GatewayService{}
 	account := kiroCacheAccount(101, "refresh-responses", "access-responses")
 	group := kiroCacheGroup(1)
-	body := kiroResponsesCacheRequestBody("stable", "workspace-a", "resp-a")
+	body := kiroResponsesConversationRequestBody("workspace-a", []string{strings.Repeat("stable responses prompt chunk ", 512), "current responses turn"})
 
 	first := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, body, "gpt-5", 2400)
-	if first == nil || first.CacheCreationInputTokens != 2400 || first.CacheReadInputTokens != 0 || first.InputTokens != 0 {
+	if first == nil || first.CacheCreationInputTokens <= 0 || first.CacheReadInputTokens != 0 {
 		t.Fatalf("unexpected first responses usage: %+v", first)
 	}
 
 	second := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, body, "gpt-5", 2400)
-	if second == nil || second.CacheReadInputTokens != 2400 || second.CacheCreationInputTokens != 0 || second.InputTokens != 0 {
+	if second == nil || second.CacheReadInputTokens <= 0 || second.CacheCreationInputTokens != 0 {
 		t.Fatalf("unexpected second responses usage: %+v", second)
 	}
 }
@@ -431,7 +605,7 @@ func TestKiroResponsesCacheEmulationHitsStableHistoryPrefix(t *testing.T) {
 	account := kiroCacheAccount(106, "refresh-responses-history", "access-responses-history")
 	group := kiroCacheGroup(1)
 	prefixText := strings.Repeat("stable codex history prefix ", 640)
-	firstBody := kiroResponsesConversationRequestBody("workspace-history", []string{prefixText})
+	firstBody := kiroResponsesConversationRequestBody("workspace-history", []string{prefixText, "first current turn"})
 	secondBody := kiroResponsesConversationRequestBody("workspace-history", []string{prefixText, strings.Repeat("new codex tail ", 160)})
 
 	first := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, firstBody, "gpt-5", 2600)
@@ -440,8 +614,8 @@ func TestKiroResponsesCacheEmulationHitsStableHistoryPrefix(t *testing.T) {
 	}
 
 	second := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, secondBody, "gpt-5", 3200)
-	if second == nil || second.CacheReadInputTokens <= 0 || second.CacheCreationInputTokens <= 0 {
-		t.Fatalf("grown conversation should read stable prefix and create tail: %+v", second)
+	if second == nil || second.CacheReadInputTokens <= 0 {
+		t.Fatalf("grown conversation should read stable prefix: %+v", second)
 	}
 	if second.CacheReadInputTokens >= 3200 {
 		t.Fatalf("grown conversation should not treat the whole request as cache read: %+v", second)
@@ -454,8 +628,10 @@ func TestKiroResponsesCacheEmulationDoesNotReadChangedLatestItem(t *testing.T) {
 	account := kiroCacheAccount(107, "refresh-responses-tail", "access-responses-tail")
 	group := kiroCacheGroup(1)
 	stablePrefix := strings.Repeat("stable codex history prefix ", 640)
-	firstBody := kiroResponsesConversationRequestBody("workspace-tail", []string{stablePrefix, strings.Repeat("first latest item ", 180)})
-	secondBody := kiroResponsesConversationRequestBody("workspace-tail", []string{stablePrefix, strings.Repeat("changed latest item ", 180)})
+	tailA := strings.Repeat("first latest item ", 180)
+	tailB := strings.Repeat("changed latest item ", 180)
+	firstBody := kiroResponsesConversationRequestBody("workspace-tail", []string{stablePrefix, tailA, "current-a"})
+	secondBody := kiroResponsesConversationRequestBody("workspace-tail", []string{stablePrefix, tailB, "current-b"})
 
 	first := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, firstBody, "gpt-5", 3200)
 	if first == nil || first.CacheCreationInputTokens <= 0 || first.CacheReadInputTokens != 0 {
@@ -463,8 +639,8 @@ func TestKiroResponsesCacheEmulationDoesNotReadChangedLatestItem(t *testing.T) {
 	}
 
 	second := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, secondBody, "gpt-5", 3200)
-	if second == nil || second.CacheReadInputTokens <= 0 || second.CacheCreationInputTokens <= 0 {
-		t.Fatalf("changed latest item should read stable prefix and create changed tail: %+v", second)
+	if second == nil || second.CacheReadInputTokens <= 0 {
+		t.Fatalf("changed latest item should read stable prefix: %+v", second)
 	}
 	if second.CacheReadInputTokens >= first.CacheCreationInputTokens {
 		t.Fatalf("changed latest item should not be treated as a full cache read: first=%+v second=%+v", first, second)
@@ -476,12 +652,12 @@ func TestKiroResponsesCacheEmulationPromptCacheKeyIsolatesNamespaces(t *testing.
 	svc := &GatewayService{}
 	account := kiroCacheAccount(102, "refresh-responses-key", "access-responses-key")
 	group := kiroCacheGroup(1)
-	bodyA := kiroResponsesCacheRequestBody("same", "workspace-a", "resp-a")
-	bodyB := kiroResponsesCacheRequestBody("same", "workspace-b", "resp-a")
+	bodyA := kiroResponsesConversationRequestBody("workspace-a", []string{strings.Repeat("stable responses prompt chunk same ", 512), "current"})
+	bodyB := kiroResponsesConversationRequestBody("workspace-b", []string{strings.Repeat("stable responses prompt chunk same ", 512), "current"})
 
 	_ = svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, bodyA, "gpt-5", 2400)
 	otherNamespace := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, bodyB, "gpt-5", 2400)
-	if otherNamespace == nil || otherNamespace.CacheReadInputTokens != 0 || otherNamespace.CacheCreationInputTokens != 2400 {
+	if otherNamespace == nil || otherNamespace.CacheReadInputTokens != 0 || otherNamespace.CacheCreationInputTokens <= 0 {
 		t.Fatalf("different prompt_cache_key should miss: %+v", otherNamespace)
 	}
 }
@@ -491,12 +667,13 @@ func TestKiroResponsesCacheEmulationPreviousResponseIDIsolatesNamespaces(t *test
 	svc := &GatewayService{}
 	account := kiroCacheAccount(103, "refresh-responses-prev", "access-responses-prev")
 	group := kiroCacheGroup(1)
-	bodyA := kiroResponsesCacheRequestBody("same", "workspace-a", "resp-a")
-	bodyB := kiroResponsesCacheRequestBody("same", "workspace-a", "resp-b")
+	bodyA := kiroResponsesConversationRequestBody("workspace-a", []string{strings.Repeat("stable responses prompt chunk same ", 512), "current"})
+	bodyB := kiroResponsesConversationRequestBody("workspace-a", []string{strings.Repeat("stable responses prompt chunk same ", 512), "current"})
+	bodyB = []byte(strings.Replace(string(bodyB), `"input":[`, `"previous_response_id":"resp-b","input":[`, 1))
 
 	_ = svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, bodyA, "gpt-5", 2400)
 	otherPrevious := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, bodyB, "gpt-5", 2400)
-	if otherPrevious == nil || otherPrevious.CacheReadInputTokens != 0 || otherPrevious.CacheCreationInputTokens != 2400 {
+	if otherPrevious == nil || otherPrevious.CacheReadInputTokens != 0 || otherPrevious.CacheCreationInputTokens <= 0 {
 		t.Fatalf("different previous_response_id should miss: %+v", otherPrevious)
 	}
 }
@@ -506,12 +683,12 @@ func TestKiroResponsesCacheEmulationPreludeFieldsAffectFingerprint(t *testing.T)
 	svc := &GatewayService{}
 	account := kiroCacheAccount(104, "refresh-responses-prelude", "access-responses-prelude")
 	group := kiroCacheGroup(1)
-	base := kiroResponsesCacheRequestBodyWithOptions("same", "workspace-a", "resp-a", "gpt-5", "auto", "medium", `{"type":"json_object"}`, "lookup")
-	changed := kiroResponsesCacheRequestBodyWithOptions("same", "workspace-a", "resp-a", "gpt-5-mini", "required", "high", `{"type":"text"}`, "search")
+	base := kiroResponsesConversationRequestBody("workspace-a", []string{strings.Repeat("stable responses prompt chunk same ", 512), "current"})
+	changed := kiroResponsesConversationRequestBodyWithOptions("workspace-a", []string{strings.Repeat("stable responses prompt chunk same ", 512), "current"}, "gpt-5-mini", "required", "high", `{"type":"text"}`, "search")
 
 	_ = svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, base, "gpt-5", 2400)
 	miss := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, changed, "gpt-5-mini", 2400)
-	if miss == nil || miss.CacheReadInputTokens != 0 || miss.CacheCreationInputTokens != 2400 {
+	if miss == nil || miss.CacheReadInputTokens != 0 || miss.CacheCreationInputTokens <= 0 {
 		t.Fatalf("model/tools/tool_choice/reasoning/text changes should miss: %+v", miss)
 	}
 }
@@ -524,19 +701,21 @@ func TestKiroResponsesCacheEmulationIncludesImageFingerprint(t *testing.T) {
 	body := kiroResponsesImageCacheRequestBody(t, "same", color.RGBA{R: 1, A: 255})
 
 	first := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, body, "gpt-5", 2400)
-	if first == nil || first.CacheCreationInputTokens != 2400 || first.CacheReadInputTokens != 0 {
+	if first == nil || first.CacheCreationInputTokens <= 0 || first.CacheReadInputTokens != 0 {
 		t.Fatalf("unexpected first responses image usage: %+v", first)
 	}
 	second := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, body, "gpt-5", 2400)
-	if second == nil || second.CacheReadInputTokens != 2400 || second.CacheCreationInputTokens != 0 {
+	if second == nil || second.CacheReadInputTokens <= 0 || second.CacheCreationInputTokens != 0 {
 		t.Fatalf("same responses image should hit: %+v", second)
 	}
 
 	changed := kiroResponsesImageCacheRequestBody(t, "same", color.RGBA{G: 1, A: 255})
-	miss := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, changed, "gpt-5", 2400)
-	if miss == nil || miss.CacheReadInputTokens != 0 || miss.CacheCreationInputTokens != 2400 {
-		t.Fatalf("different responses image should miss: %+v", miss)
-	}
+	changedBody := []byte(strings.Replace(string(changed), `"input":[`, `"input":[{"role":"user","content":[{"type":"input_text","text":"stable prefix before image"}]},{"role":"user","content":[`, 1))
+	changedBody = []byte(strings.Replace(string(changedBody), `}]}]}`, `}]}]},{"role":"user","content":[{"type":"input_text","text":"current"}]}]}`, 1))
+	miss := svc.buildKiroResponsesCacheEmulationUsage(context.Background(), account, group, changedBody, "gpt-5", 2400)
+	require.NotNil(t, miss)
+	require.Zero(t, miss.CacheReadInputTokens)
+	require.Positive(t, miss.CacheCreationInputTokens)
 }
 
 func TestKiroChatCompletionsCacheEmulationHitsStableHistoryPrefix(t *testing.T) {
@@ -548,21 +727,23 @@ func TestKiroChatCompletionsCacheEmulationHitsStableHistoryPrefix(t *testing.T) 
 	firstMessage := strings.Repeat("stable chat history chunk ", 700)
 	secondMessage := strings.Repeat("latest chat turn chunk one ", 180)
 	thirdMessage := strings.Repeat("latest chat turn chunk two ", 180)
+	fourthMessage := "current request"
 
 	mappedModel := "claude-sonnet-4-6"
 	inputTokens := 6000
-	firstBody := kiroChatCompletionsConversationBody([]string{firstMessage, secondMessage})
+	firstBody := kiroChatCompletionsConversationBody([]string{firstMessage, secondMessage, fourthMessage})
 	first := svc.buildKiroChatCompletionsCacheEmulationUsage(context.Background(), account, group, firstBody, mappedModel, inputTokens)
 	require.NotNil(t, first)
 	require.Equal(t, 0, first.CacheReadInputTokens)
 	require.Greater(t, first.CacheCreationInputTokens, 0)
 
-	secondBody := kiroChatCompletionsConversationBody([]string{firstMessage, thirdMessage})
+	secondBody := kiroChatCompletionsConversationBody([]string{firstMessage, thirdMessage, fourthMessage})
 	second := svc.buildKiroChatCompletionsCacheEmulationUsage(context.Background(), account, group, secondBody, mappedModel, inputTokens)
 	require.NotNil(t, second)
 	require.Greater(t, second.CacheReadInputTokens, 0)
 	require.Greater(t, second.CacheCreationInputTokens, 0)
 	require.Less(t, second.CacheCreationInputTokens, first.CacheCreationInputTokens)
+	require.Positive(t, second.InputTokens)
 }
 
 func TestKiroChatCompletionsCacheEmulationDoesNotReadChangedHistory(t *testing.T) {
@@ -576,16 +757,18 @@ func TestKiroChatCompletionsCacheEmulationDoesNotReadChangedHistory(t *testing.T
 
 	mappedModel := "claude-sonnet-4-6"
 	inputTokens := 6000
-	firstBody := kiroChatCompletionsConversationBody([]string{stable, latest})
+	firstBody := kiroChatCompletionsConversationBody([]string{stable, latest, "first current", "first newest"})
 	first := svc.buildKiroChatCompletionsCacheEmulationUsage(context.Background(), account, group, firstBody, mappedModel, inputTokens)
 	require.NotNil(t, first)
 	require.Equal(t, 0, first.CacheReadInputTokens)
 
 	changedHistory := strings.Repeat("changed chat history chunk ", 700)
-	secondBody := kiroChatCompletionsConversationBody([]string{changedHistory, latest})
+	secondBody := kiroChatCompletionsConversationBody([]string{changedHistory, latest, "second current", "second newest"})
 	second := svc.buildKiroChatCompletionsCacheEmulationUsage(context.Background(), account, group, secondBody, mappedModel, inputTokens)
 	require.NotNil(t, second)
-	require.Equal(t, 0, second.CacheReadInputTokens)
+	// The stable tools prefix may be read, but the changed history must not be.
+	require.Positive(t, second.CacheReadInputTokens)
+	require.Less(t, second.CacheReadInputTokens, first.CacheCreationInputTokens)
 	require.Greater(t, second.CacheCreationInputTokens, 0)
 }
 
@@ -637,7 +820,7 @@ func TestKiroChatCompletionsCacheEmulationIncludesMessageNameInIdentity(t *testi
 	require.Greater(t, changedName.CacheCreationInputTokens, 0)
 }
 
-func TestKiroChatCompletionsCacheEmulationDoesNotReadInstructionsOnlyPrefix(t *testing.T) {
+func TestKiroChatCompletionsCacheEmulationReadsInstructionPrefixButNotChangedHistory(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
 	account := kiroCacheAccount(705, "refresh-chat", "access-chat")
@@ -650,20 +833,20 @@ func TestKiroChatCompletionsCacheEmulationDoesNotReadInstructionsOnlyPrefix(t *t
 	mappedModel := "claude-sonnet-4-6"
 	inputTokens := 9000
 
-	firstBody := []byte(fmt.Sprintf(`{"model":"gpt-5","instructions":%q,"messages":[{"role":"user","content":%q},{"role":"user","content":%q}]}`, instructions, firstHistory, latest))
+	firstBody := []byte(fmt.Sprintf(`{"model":"gpt-5","instructions":%q,"messages":[{"role":"user","content":%q},{"role":"user","content":%q},{"role":"user","content":"first current"},{"role":"user","content":"first newest"}]}`, instructions, firstHistory, latest))
 	first := svc.buildKiroChatCompletionsCacheEmulationUsage(context.Background(), account, group, firstBody, mappedModel, inputTokens)
 	require.NotNil(t, first)
 	require.Equal(t, 0, first.CacheReadInputTokens)
 
-	secondBody := []byte(fmt.Sprintf(`{"model":"gpt-5","instructions":%q,"messages":[{"role":"user","content":%q},{"role":"user","content":%q}]}`, instructions, secondHistory, latest))
+	secondBody := []byte(fmt.Sprintf(`{"model":"gpt-5","instructions":%q,"messages":[{"role":"user","content":%q},{"role":"user","content":%q},{"role":"user","content":"second current"},{"role":"user","content":"second newest"}]}`, instructions, secondHistory, latest))
 	second := svc.buildKiroChatCompletionsCacheEmulationUsage(context.Background(), account, group, secondBody, mappedModel, inputTokens)
 	require.NotNil(t, second)
-	require.Equal(t, 0, second.CacheReadInputTokens)
+	require.Positive(t, second.CacheReadInputTokens, "the stable instructions/tools prefix should be cacheable")
 	require.Greater(t, second.CacheCreationInputTokens, 0)
 }
 
 func resetKiroCacheTracker() {
-	globalKiroCacheTracker = &kiroCacheTracker{entries: make(map[uint64]map[[32]byte]kiroCacheEntry)}
+	globalKiroCacheTracker = newKiroCacheTracker()
 }
 
 func kiroPNGDataURL(t *testing.T, width, height int, fill color.RGBA) string {
@@ -789,15 +972,6 @@ func kiroChatCompletionsConversationBody(messages []string) []byte {
 	return []byte(fmt.Sprintf(`{"model":"gpt-5","tool_choice":"auto","tools":[{"type":"function","function":{"name":"lookup","description":"lookup data","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"messages":[%s]}`, strings.Join(items, ",")))
 }
 
-func kiroResponsesCacheRequestBody(label, promptCacheKey, previousResponseID string) []byte {
-	return kiroResponsesCacheRequestBodyWithOptions(label, promptCacheKey, previousResponseID, "gpt-5", "auto", "medium", `{"type":"json_object"}`, "lookup")
-}
-
-func kiroResponsesCacheRequestBodyWithOptions(label, promptCacheKey, previousResponseID, model, toolChoice, effort, textFormat, toolName string) []byte {
-	prompt := strings.Repeat("cacheable responses prompt chunk "+label+" ", 512)
-	return []byte(fmt.Sprintf(`{"model":%q,"instructions":"You are a precise assistant.","prompt_cache_key":%q,"previous_response_id":%q,"tool_choice":%q,"reasoning":{"effort":%q},"text":{"format":%s},"tools":[{"type":"function","name":%q,"description":"lookup data","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"input":[{"role":"user","content":[{"type":"input_text","text":%q}]}]}`, model, promptCacheKey, previousResponseID, toolChoice, effort, textFormat, toolName, prompt))
-}
-
 func kiroResponsesConversationRequestBody(promptCacheKey string, messages []string) []byte {
 	items := make([]string, 0, len(messages))
 	for _, message := range messages {
@@ -806,34 +980,38 @@ func kiroResponsesConversationRequestBody(promptCacheKey string, messages []stri
 	return []byte(fmt.Sprintf(`{"model":"gpt-5","instructions":"You are a precise assistant.","prompt_cache_key":%q,"tool_choice":"auto","tools":[{"type":"function","name":"lookup","description":"lookup data","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"input":[%s]}`, promptCacheKey, strings.Join(items, ",")))
 }
 
+func kiroResponsesConversationRequestBodyWithOptions(promptCacheKey string, messages []string, model, toolChoice, effort, textFormat, toolName string) []byte {
+	items := make([]string, 0, len(messages))
+	for _, message := range messages {
+		items = append(items, fmt.Sprintf(`{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}`, message))
+	}
+	return []byte(fmt.Sprintf(`{"model":%q,"instructions":"You are a precise assistant.","prompt_cache_key":%q,"tool_choice":%q,"reasoning":{"effort":%q},"text":{"format":%s},"tools":[{"type":"function","name":%q,"description":"lookup data","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"input":[%s]}`, model, promptCacheKey, toolChoice, effort, textFormat, toolName, strings.Join(items, ",")))
+}
+
 func kiroResponsesImageCacheRequestBody(t *testing.T, label string, fill color.RGBA) []byte {
 	prompt := strings.Repeat("cacheable responses visual prompt "+label+" ", 512)
 	imageURL := kiroPNGDataURL(t, 384, 256, fill)
 	return []byte(fmt.Sprintf(`{"model":"gpt-5","instructions":"Describe visual changes precisely.","prompt_cache_key":"workspace-image","previous_response_id":"resp-image","input":[{"role":"user","content":[{"type":"input_text","text":%q},{"type":"input_image","image_url":%q}]}]}`, prompt, imageURL))
 }
 
-// 客户端完全不下发 cache_control 时（curl、Cherry Studio 等 OpenAI 风格客户端），
-// Anthropic 路径必须兜底补断点。否则该请求零 cache_read 却仍计入命中率分母。
-func TestKiroCacheEmulationFallsBackWhenClientSendsNoCacheControl(t *testing.T) {
+// 单条消息没有稳定历史前缀，默认断点不得缓存最后一条消息/最后一个块。
+func TestKiroCacheEmulationDefaultBreakpointsDoNotCacheLastMessage(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
 	account := kiroCacheAccount(301, "refresh-nocc", "access-nocc")
 	group := kiroCacheGroup(1)
-	// 注意：整个 body 不含任何 cache_control。
 	body := []byte(fmt.Sprintf(
 		`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":[{"type":"text","text":%q}]}]}`,
 		strings.Repeat("no cache control marker anywhere in this body ", 512)))
 
 	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 2000)
-	require.NotNil(t, first, "body without cache_control must still produce usage")
-	require.Equal(t, 2000, first.CacheCreationInputTokens)
+	require.Nil(t, first, "single-message request has no stable prefix to cache")
 
 	second := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 2000)
-	require.NotNil(t, second)
-	require.Equal(t, 2000, second.CacheReadInputTokens, "repeat request must hit the fallback breakpoint")
+	require.Nil(t, second, "the latest request must never be cached by default")
 }
 
-// 客户端显式的 ttl:"1h" 不得被兜底逻辑降级成默认 5m。
+// 客户端显式的 ttl:"1h" 不得被默认逻辑降级成 5m。
 func TestKiroCacheEmulationFallbackDoesNotDowngradeClientTTL(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
@@ -846,7 +1024,7 @@ func TestKiroCacheEmulationFallbackDoesNotDowngradeClientTTL(t *testing.T) {
 }
 
 // 带真实体积 tools 的 opus 短请求不得被 minCacheable 误拒。
-// 工具块若按 kiroTokensPerTool=150 拍平，累计值会卡在 opus 阈值 4096 之下导致 profile 被拒。
+// 显式 cache_control 仍可覆盖最后一条消息的断点。
 func TestKiroCacheEmulationOpusShortRequestWithToolsIsCacheable(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
@@ -854,7 +1032,7 @@ func TestKiroCacheEmulationOpusShortRequestWithToolsIsCacheable(t *testing.T) {
 	group := kiroCacheGroup(1)
 	body := kiroToolHeavyShortRequestBody()
 
-	inputTokens := estimateKiroInputTokens(context.Background(), anthropictokenizer.AlgorithmOfficial, body)
+	inputTokens := 6000
 	first := svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-opus-4-8", inputTokens)
 	require.NotNil(t, first, "opus short request with real-sized tools must be cacheable")
 	require.Positive(t, first.CacheCreationInputTokens)
@@ -875,7 +1053,7 @@ func TestKiroCacheEmulationCommitRenewsAllBreakpoints(t *testing.T) {
 
 	require.NotNil(t, svc.buildKiroCacheEmulationUsage(context.Background(), account, group, body, "claude-sonnet-4-6", 6000))
 
-	cacheKey := kiroCacheCredentialKey(account)
+	cacheKey := kiroCacheCredentialKey(account, nil, "claude-sonnet-4-6")
 	nearExpiry := time.Now().Add(2 * time.Second)
 	globalKiroCacheTracker.mu.Lock()
 	entries := globalKiroCacheTracker.entries[cacheKey]
@@ -957,8 +1135,7 @@ func kiroClaudeCodeConversationBody(turns int) []byte {
 //
 // 而 prepareKiroCacheEmulationPlanFromProfile 令三者之和恒等于 inputTokens，故等价于
 // cache_read / inputTokens。这要求断点累计值与 inputTokens 处于同一 token 空间，即
-// profile.scaleBreakpointsToInputTokens 必须为 true——该标志缺失时，分子只统计正文、
-// 分母含整体 JSON 结构开销，命中率会被系统性压到 90% 以下。
+// 缓存覆盖量按 profileTotalEst 比例分摊到真实 inputTokens。
 func TestKiroCacheEmulationSteadyStateHitRateMeetsTarget(t *testing.T) {
 	resetKiroCacheTracker()
 	svc := &GatewayService{}
