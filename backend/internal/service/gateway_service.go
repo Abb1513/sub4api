@@ -400,10 +400,7 @@ func isClaudeCodeCredentialScopeError(msg string) bool {
 		strings.Contains(m, "cannot be used for other api requests")
 }
 
-// sseDataRe matches SSE data lines with optional whitespace after colon.
-// Some upstream APIs return non-standard "data:" without space (should be "data: ").
 var (
-	sseDataRe            = regexp.MustCompile(`^data:\s*`)
 	claudeCliUserAgentRe = regexp.MustCompile(`(?i)^claude-cli/\d+\.\d+\.\d+`)
 
 	// claudeCodePromptPrefixes 用于检测 Claude Code 系统提示词的前缀列表
@@ -1046,7 +1043,27 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		)
 	}
 
-	// 2. 提取带 cache_control: {type: "ephemeral"} 的内容
+	// 2. Kiro sticky routing. Explicit/body session identifiers always work;
+	// automatic inference is opt-in per group and anchors on fields that stay
+	// stable as conversation messages grow.
+	if isKiroGroup(parsed.Group) {
+		if sessionID := kiroExplicitSessionID(parsed); sessionID != "" {
+			return s.hashKiroSessionSeed(parsed, "explicit", sessionID)
+		}
+		if !parsed.Group.EffectiveKiroAutoStickyEnabled() {
+			return ""
+		}
+		anchor := extractTextFromSystemRaw(parsed.SystemRaw())
+		if anchor == "" && parsed.Body != nil {
+			anchor = extractFirstUserText(parsed.Body.Bytes())
+		}
+		if anchor != "" {
+			return s.hashKiroSessionSeed(parsed, "auto", anchor)
+		}
+		return ""
+	}
+
+	// 3. 提取带 cache_control: {type: "ephemeral"} 的内容
 	cacheableContent := s.extractCacheableContent(parsed)
 	if cacheableContent != "" {
 		hash := s.hashContent(cacheableContent)
@@ -1057,7 +1074,7 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 		return hash
 	}
 
-	// 3. 最后 fallback: 使用 session上下文 + system + 所有消息的完整摘要串
+	// 4. 最后 fallback: 使用 session上下文 + system + 所有消息的完整摘要串
 	var combined strings.Builder
 	// 混入请求上下文区分因子，避免不同用户相同消息产生相同 hash
 	if parsed.SessionContext != nil {
@@ -1087,6 +1104,48 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 	}
 
 	return ""
+}
+
+func isKiroGroup(group *Group) bool {
+	return group != nil && group.Platform == PlatformKiro
+}
+
+func kiroExplicitSessionID(parsed *ParsedRequest) string {
+	if parsed == nil {
+		return ""
+	}
+	if sessionID := strings.TrimSpace(parsed.ExplicitSessionID); sessionID != "" {
+		return sessionID
+	}
+	if parsed.Body == nil {
+		return ""
+	}
+	return extractBodySessionID(parsed.Body.Bytes())
+}
+
+func extractBodySessionID(body []byte) string {
+	for _, path := range []string{
+		"prompt_cache_key",
+		"conversation_id",
+		"sessionId",
+		"metadata.session_id",
+		"session_id",
+		"thread_id",
+	} {
+		if sessionID := strings.TrimSpace(gjson.GetBytes(body, path).String()); sessionID != "" {
+			return sessionID
+		}
+	}
+	return ""
+}
+
+func (s *GatewayService) hashKiroSessionSeed(parsed *ParsedRequest, source, anchor string) string {
+	apiKeyID := int64(0)
+	if parsed != nil && parsed.SessionContext != nil {
+		apiKeyID = parsed.SessionContext.APIKeyID
+	}
+	return s.hashContent("kiro-sticky-v1|" + source + "|" +
+		strconv.FormatInt(apiKeyID, 10) + "|" + anchor)
 }
 
 // BindStickySession sets session -> account binding with standard TTL.

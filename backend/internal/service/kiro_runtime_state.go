@@ -101,13 +101,6 @@ func (s *GatewayService) markKiroSuspended(ctx context.Context, tokenKey string)
 	return s.kiroCooldownStore.MarkSuspended(ctx, tokenKey)
 }
 
-func (s *GatewayService) getKiroCooldownState(ctx context.Context, tokenKey string) (*kirocooldown.State, error) {
-	if s == nil || s.kiroCooldownStore == nil {
-		return nil, errKiroCooldownStoreUnavailable
-	}
-	return s.kiroCooldownStore.GetState(ctx, tokenKey)
-}
-
 func kiroRuntimeStateSnapshot(state *kirocooldown.State) (string, string, *time.Time) {
 	if state == nil || !state.Active {
 		return "", "", nil

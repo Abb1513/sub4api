@@ -115,6 +115,8 @@ func (w *auditResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, http.ErrNotSupported
 }
 func (w *auditResponseWriter) CloseNotify() <-chan bool {
+	// Gin's ResponseWriter still exposes CloseNotify for legacy stream handlers.
+	//nolint:staticcheck // SA1019: this wrapper must preserve the underlying writer's optional interface.
 	if n, ok := w.ResponseWriter.(http.CloseNotifier); ok {
 		return n.CloseNotify()
 	}

@@ -157,8 +157,10 @@ func TestOpenAIBPSToolsAndStableTurns(t *testing.T) {
 	original := bpsJSON(native)
 	response, err := s.bpsTransformResponse(c.Request.Context(), a, first, bpsResponse(map[string]any{"id": "rs1", "type": "reasoning", "encrypted_content": "ciphertext"}, native))
 	require.NoError(t, err)
-	output := response["output"].([]any)
-	client := output[1].(map[string]any)
+	output, ok := response["output"].([]any)
+	require.True(t, ok)
+	client, ok := output[1].(map[string]any)
+	require.True(t, ok)
 	require.Equal(t, "exec", client["name"])
 	require.Equal(t, "functions", client["namespace"])
 	source["input"] = []any{bpsMessage("user", "implement"), output[0], client, map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "/workspace"}}
@@ -171,7 +173,11 @@ func TestOpenAIBPSToolsAndStableTurns(t *testing.T) {
 	require.JSONEq(t, original, nativeRestored)
 	secondOutput, err := s.bpsTransformResponse(c.Request.Context(), a, second, bpsResponse(bpsNative("call_2", "functions.exec", map[string]any{"command": "ls"})))
 	require.NoError(t, err)
-	source["input"] = append(source["input"].([]any), secondOutput["output"].([]any)[0], map[string]any{"type": "function_call_output", "call_id": "call_2", "output": "files"})
+	sourceInput, ok := source["input"].([]any)
+	require.True(t, ok)
+	secondResponseOutput, ok := secondOutput["output"].([]any)
+	require.True(t, ok)
+	source["input"] = append(sourceInput, secondResponseOutput[0], map[string]any{"type": "function_call_output", "call_id": "call_2", "output": "files"})
 	third, err := s.prepareOpenAIBPS(c.Request.Context(), c, a, []byte(bpsJSON(source)))
 	require.NoError(t, err)
 	require.Equal(t, "3", gjson.GetBytes(third.Body, "metadata.agent_iteration").String())
@@ -197,7 +203,9 @@ func TestOpenAIBPSCustomAndPlan(t *testing.T) {
 	native := map[string]any{"type": "function_call", "id": "fc_p", "call_id": "p", "name": "update_plan", "arguments": `{"plan":[{"description":"fix it","status":"done"}]}`}
 	client, err := bpsConvertTool(native, r)
 	require.NoError(t, err)
-	require.JSONEq(t, `{"plan":[{"step":"fix it","status":"completed"}]}`, client["arguments"].(string))
+	clientArguments, ok := client["arguments"].(string)
+	require.True(t, ok)
+	require.JSONEq(t, `{"plan":[{"step":"fix it","status":"completed"}]}`, clientArguments)
 	native["name"] = "run_officejs"
 	native["arguments"] = bpsJSON(map[string]any{"code": bpsJSON(map[string]any{"name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"})})
 	client, err = bpsConvertTool(native, r)
@@ -220,7 +228,9 @@ func TestOpenAIBPSCompactionAndIsolation(t *testing.T) {
 	require.Empty(t, r.Tools)
 	compact, err := s.bpsTransformResponse(c.Request.Context(), a, r, bpsResponse(bpsText("Real summary containing pending work.")))
 	require.NoError(t, err)
-	ref := compact["output"].([]any)[0]
+	compactOutput, ok := compact["output"].([]any)
+	require.True(t, ok)
+	ref := compactOutput[0]
 	require.Contains(t, bpsJSON(ref), bpsCompactPrefix)
 	nextBody := []byte(bpsJSON(map[string]any{"model": "gpt-6-astra", "input": []any{ref, bpsMessage("user", "continue")}, "tools": []any{bpsFunction("exec")}}))
 	// A new service instance, same shared store, can continue the conversation.
@@ -241,7 +251,8 @@ func TestOpenAIBPSCompactionAndIsolation(t *testing.T) {
 	require.Error(t, next.bpsBind(c2.Request.Context(), r.Scope, &other))
 	stranger, _ := bpsContext(2, "/v1/responses")
 	require.ErrorContains(t, next.PrepareOpenAIBPSRouting(stranger, nextBody), "expired")
-	store := s.cache.(*bpsMemoryStore)
+	store, ok := s.cache.(*bpsMemoryStore)
+	require.True(t, ok)
 	store.data = map[string][]byte{}
 	require.ErrorContains(t, next.PrepareOpenAIBPSRouting(c2, nextBody), "expired")
 }
@@ -308,7 +319,8 @@ func TestOpenAIBPSForward(t *testing.T) {
 		require.NoError(t, err)
 		require.Contains(t, rec.Body.String(), bpsCompactPrefix)
 		require.NotContains(t, rec.Body.String(), `"text":"summary"`)
-		up := s.httpUpstream.(*bpsHTTPStub)
+		up, ok := s.httpUpstream.(*bpsHTTPStub)
+		require.True(t, ok)
 		require.NotContains(t, string(up.requestBody), "compaction_trigger")
 	})
 }
@@ -510,7 +522,9 @@ func TestOpenAIBPSCompactionWithoutSessionHeader(t *testing.T) {
 	require.NoError(t, s.bpsBind(c.Request.Context(), r.Scope, a))
 	response, err := s.bpsTransformResponse(c.Request.Context(), a, r, bpsResponse(bpsText("real summary")))
 	require.NoError(t, err)
-	nextBody := bpsRequestBody(append(response["output"].([]any), bpsMessage("user", "continue")), false)
+	responseOutput, ok := response["output"].([]any)
+	require.True(t, ok)
+	nextBody := bpsRequestBody(append(responseOutput, bpsMessage("user", "continue")), false)
 	next, _ := bpsContext(9, "/responses")
 	next.Request.Header.Del("session_id")
 	fresh := &OpenAIGatewayService{cache: s.cache}

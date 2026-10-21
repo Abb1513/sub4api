@@ -1059,6 +1059,9 @@ func (a *Account) GetBaseURL() string {
 		if a.Platform == PlatformTypeSafe {
 			return typesafe.DefaultBaseURL
 		}
+		if a.Platform == PlatformKiro {
+			return ""
+		}
 		return "https://api.anthropic.com"
 	}
 	if a.Platform == PlatformAntigravity {

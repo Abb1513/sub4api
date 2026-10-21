@@ -4,18 +4,17 @@ import (
 	"testing"
 
 	"entgo.io/ent"
-	"entgo.io/ent/entc/load"
 	"entgo.io/ent/schema/field"
 	"github.com/stretchr/testify/require"
 )
 
 func TestAuthIdentityFoundationSchemas(t *testing.T) {
-	spec, err := (&load.Config{Path: "."}).Load()
-	require.NoError(t, err)
-
-	schemas := map[string]*load.Schema{}
-	for _, schema := range spec.Schemas {
-		schemas[schema.Name] = schema
+	schemas := map[string]ent.Interface{
+		"AuthIdentity":             AuthIdentity{},
+		"AuthIdentityChannel":      AuthIdentityChannel{},
+		"PendingAuthSession":       PendingAuthSession{},
+		"IdentityAdoptionDecision": IdentityAdoptionDecision{},
+		"User":                     User{},
 	}
 
 	authIdentity := requireSchema(t, schemas, "AuthIdentity")
@@ -78,9 +77,8 @@ func TestAuthIdentityFoundationSchemas(t *testing.T) {
 	requireSchemaFields(t, userSchema, "signup_source", "last_login_at", "last_active_at")
 	signupSource := requireSchemaField(t, userSchema, "signup_source")
 	require.Equal(t, field.TypeString, signupSource.Info.Type)
-	require.True(t, signupSource.Default)
-	require.Equal(t, "email", signupSource.DefaultValue)
-	require.Equal(t, 1, signupSource.Validators)
+	require.Equal(t, "email", signupSource.Default)
+	require.Len(t, signupSource.Validators, 1)
 
 	validator := requireStringFieldValidator(t, User{}.Fields(), "signup_source")
 	for _, value := range []string{"email", "linuxdo", "wechat", "oidc", "github", "google", "dingtalk"} {
@@ -89,7 +87,7 @@ func TestAuthIdentityFoundationSchemas(t *testing.T) {
 	require.Error(t, validator("unknown"))
 }
 
-func requireSchema(t *testing.T, schemas map[string]*load.Schema, name string) *load.Schema {
+func requireSchema(t *testing.T, schemas map[string]ent.Interface, name string) ent.Interface {
 	t.Helper()
 
 	schema, ok := schemas[name]
@@ -97,30 +95,31 @@ func requireSchema(t *testing.T, schemas map[string]*load.Schema, name string) *
 	return schema
 }
 
-func requireSchemaFields(t *testing.T, schema *load.Schema, names ...string) {
+func requireSchemaFields(t *testing.T, schema ent.Interface, names ...string) {
 	t.Helper()
 
 	fields := map[string]struct{}{}
-	for _, field := range schema.Fields {
-		fields[field.Name] = struct{}{}
+	for _, schemaField := range schema.Fields() {
+		fields[schemaField.Descriptor().Name] = struct{}{}
 	}
 
 	for _, name := range names {
 		_, ok := fields[name]
-		require.True(t, ok, "schema %s should include field %s", schema.Name, name)
+		require.True(t, ok, "schema %T should include field %s", schema, name)
 	}
 }
 
-func requireSchemaField(t *testing.T, schema *load.Schema, name string) *load.Field {
+func requireSchemaField(t *testing.T, schema ent.Interface, name string) *field.Descriptor {
 	t.Helper()
 
-	for _, schemaField := range schema.Fields {
-		if schemaField.Name == name {
-			return schemaField
+	for _, schemaField := range schema.Fields() {
+		descriptor := schemaField.Descriptor()
+		if descriptor.Name == name {
+			return descriptor
 		}
 	}
 
-	require.Failf(t, "missing schema field", "schema %s should include field %s", schema.Name, name)
+	require.Failf(t, "missing schema field", "schema %T should include field %s", schema, name)
 	return nil
 }
 
@@ -142,10 +141,11 @@ func requireStringFieldValidator(t *testing.T, fields []ent.Field, name string) 
 	return nil
 }
 
-func requireHasUniqueIndex(t *testing.T, schema *load.Schema, fields ...string) {
+func requireHasUniqueIndex(t *testing.T, schema ent.Interface, fields ...string) {
 	t.Helper()
 
-	for _, index := range schema.Indexes {
+	for _, schemaIndex := range schema.Indexes() {
+		index := schemaIndex.Descriptor()
 		if !index.Unique {
 			continue
 		}
@@ -164,5 +164,5 @@ func requireHasUniqueIndex(t *testing.T, schema *load.Schema, fields ...string) 
 		}
 	}
 
-	require.Failf(t, "missing unique index", "schema %s should include unique index on %v", schema.Name, fields)
+	require.Failf(t, "missing unique index", "schema %T should include unique index on %v", schema, fields)
 }

@@ -58,6 +58,9 @@ func sleepKiroRetry(ctx context.Context, attempt int) error {
 	return kiroRetrySleep(ctx, kiroRetryBackoffDelay(attempt))
 }
 
+// Keep the direct-mode dispatch entry point anchored until it is wired into
+// the shared forwarder; its runtime and fallback helpers are still maintained.
+
 func resolveKiroUpstreamModel(mappedModel string) string {
 	upstreamModel := kiropkg.MapModel(mappedModel)
 	if strings.TrimSpace(upstreamModel) == "" {

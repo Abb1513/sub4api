@@ -2102,13 +2102,6 @@ func truncateKiroPayloadToLimit(payload *KiroPayload, hasPriming bool) error {
 	)
 }
 
-func dropLeadingKiroAssistantHistory(tail []KiroHistoryMessage) []KiroHistoryMessage {
-	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
-		tail = tail[1:]
-	}
-	return tail
-}
-
 func kiroHistoryEntryByteSize(entry KiroHistoryMessage) int {
 	raw, err := json.Marshal(entry)
 	if err != nil {

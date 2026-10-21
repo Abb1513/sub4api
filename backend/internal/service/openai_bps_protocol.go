@@ -448,7 +448,7 @@ func bpsConvertTool(native map[string]any, r *bpsRequest) (map[string]any, error
 	if !ok && bpsIsNativePlan(nativeName) {
 		for key, candidate := range r.Tools {
 			if candidate.Name == "update_plan" {
-				if ok {
+				if ok && key != name {
 					return invalid("Ambiguous update_plan namespace")
 				}
 				name, tool, ok = key, candidate, true

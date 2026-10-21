@@ -152,7 +152,7 @@ func TestBuildKiroRelayModelsRequestUsesBaseURL(t *testing.T) {
 		},
 	}
 
-	req, err := svc.buildKiroRelayModelsRequest(context.Background(), account)
+	req, err := svc.buildAnthropicUpstreamModelsRequest(context.Background(), account)
 	require.NoError(t, err)
 	require.Equal(t, "https://relay.example.com/v1/models", req.URL.String())
 	require.Equal(t, "relay-key", req.Header.Get("x-api-key"))

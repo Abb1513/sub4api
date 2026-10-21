@@ -225,12 +225,10 @@ func TestKiroStickySession_EmptySystemPromptUsesFirstUserMessage(t *testing.T) {
 	require.NotEqual(t, hash1, hash3, "不同第一条 user 消息应产生不同 hash")
 }
 
-// TestIsKiroGroup 验证 isKiroGroup 辅助函数。
 func TestKiroStickySession_DisabledSkipsAutoInference(t *testing.T) {
 	svc := &GatewayService{}
 	body := newKiroRequestBody("stable system prompt", 1)
-	ref := NewRequestBodyRef(body)
-	parsed, err := ParseGatewayRequest(ref, "anthropic")
+	parsed, err := ParseGatewayRequest(NewRequestBodyRef(body), "anthropic")
 	require.NoError(t, err)
 	parsed.Group = &Group{Platform: PlatformKiro, KiroAutoStickyEnabled: false}
 	parsed.SessionContext = &SessionContext{APIKeyID: 42}
@@ -302,6 +300,16 @@ func TestKiroStickySession_BodySessionIDWorksWhenAutoInferenceDisabled(t *testin
 	require.NotEmpty(t, svc.GenerateSessionHash(parsed))
 }
 
+func TestKiroGroupHelpers(t *testing.T) {
+	require.True(t, (&Group{Platform: PlatformKiro, KiroAutoStickyEnabled: true}).EffectiveKiroAutoStickyEnabled())
+	require.False(t, (&Group{Platform: PlatformAnthropic, KiroAutoStickyEnabled: true}).EffectiveKiroAutoStickyEnabled())
+	require.False(t, (&Group{Platform: PlatformOpenAI, KiroAutoStickyEnabled: true}).EffectiveKiroAutoStickyEnabled())
+	require.False(t, (*Group)(nil).EffectiveKiroAutoStickyEnabled())
+	require.True(t, isKiroGroup(&Group{Platform: PlatformKiro, KiroAutoStickyEnabled: false}))
+	require.False(t, isKiroGroup(&Group{Platform: PlatformAnthropic}))
+	require.False(t, isKiroGroup(nil))
+}
+
 func TestExtractBodySessionID(t *testing.T) {
 	cases := []struct {
 		name string
@@ -317,14 +325,7 @@ func TestExtractBodySessionID(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, extractBodySessionID(tc.body))
+			require.Equal(t, tc.want, extractBodySessionID([]byte(tc.body)))
 		})
 	}
-}
-
-func TestIsKiroGroup(t *testing.T) {
-	require.True(t, isKiroGroup(&Group{Platform: PlatformKiro}))
-	require.False(t, isKiroGroup(&Group{Platform: PlatformAnthropic}))
-	require.False(t, isKiroGroup(&Group{Platform: PlatformOpenAI}))
-	require.False(t, isKiroGroup(nil))
 }
