@@ -140,7 +140,8 @@ func TestCodexTicketWSPassthroughObservesSuccessAndFailure(t *testing.T) {
 				_ = client.CloseNow()
 			}
 			select {
-			case <-done:
+			case err := <-done:
+				_ = err
 			case <-time.After(5 * time.Second):
 				t.Fatal("passthrough did not exit")
 			}

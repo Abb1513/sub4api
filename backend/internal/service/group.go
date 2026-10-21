@@ -266,6 +266,11 @@ func normalizeKiroCacheEmulationRatio(ratio float64) float64 {
 	return ratio
 }
 
+// NormalizeKiroCacheEmulationMode maps unknown or empty modes to uniform.
+func NormalizeKiroCacheEmulationMode(mode string) string {
+	return normalizeKiroCacheEmulationMode(mode)
+}
+
 func normalizeKiroCacheEmulationMode(mode string) string {
 	switch mode {
 	case KiroCacheEmulationModeIndependent:
