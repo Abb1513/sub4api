@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/MACOS-DO/sub4api/internal/config"
+	"github.com/MACOS-DO/sub4api/internal/pkg/anthropictokenizer"
 	"github.com/MACOS-DO/sub4api/internal/pkg/antigravity"
 	infraerrors "github.com/MACOS-DO/sub4api/internal/pkg/errors"
 	"github.com/MACOS-DO/sub4api/internal/pkg/openai"
@@ -864,6 +865,7 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
 	// Gateway forwarding behavior (defaults: fingerprint=true, metadata_passthrough=false,
 	// cch_signing=false, claude_oauth_system_prompt_injection=true)
 	result.OpenAITTFTMode = normalizeOpenAITTFTMode(settings[SettingKeyOpenAITTFTMode])
+	result.GatewayKiroTokenizer = string(anthropictokenizer.ParseAlgorithm(settings[SettingKeyGatewayKiroTokenizer]))
 	if v, ok := settings[SettingKeyEnableFingerprintUnification]; ok && v != "" {
 		result.EnableFingerprintUnification = v == "true"
 	} else {
@@ -1033,6 +1035,25 @@ func normalizeOpenAITTFTMode(mode string) string {
 		return OpenAITTFTModeVisible
 	}
 	return OpenAITTFTModeSemantic
+}
+
+// normalizeGatewayKiroTokenizer 归一并校验 Kiro 计量算法设置值。
+func normalizeGatewayKiroTokenizer(raw string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", string(anthropictokenizer.AlgorithmOfficial),
+		string(anthropictokenizer.AlgorithmCharClass),
+		string(anthropictokenizer.AlgorithmWeighted):
+		if v == "" {
+			return string(anthropictokenizer.AlgorithmOfficial), nil
+		}
+		return v, nil
+	default:
+		return "", fmt.Errorf("%s must be one of: %s/%s/%s",
+			SettingKeyGatewayKiroTokenizer,
+			anthropictokenizer.AlgorithmOfficial,
+			anthropictokenizer.AlgorithmCharClass,
+			anthropictokenizer.AlgorithmWeighted)
+	}
 }
 
 func clampAffiliateRebateRate(value float64) float64 {

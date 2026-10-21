@@ -127,6 +127,23 @@ func TestCompositeTokenCacheInvalidator_OpenAI(t *testing.T) {
 	require.Equal(t, []string{"openai:account:500"}, cache.deletedKeys)
 }
 
+func TestCompositeTokenCacheInvalidator_Kiro(t *testing.T) {
+	cache := &geminiTokenCacheStub{}
+	invalidator := NewCompositeTokenCacheInvalidator(cache)
+	account := &Account{
+		ID:       30,
+		Platform: PlatformKiro,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"access_token": "kiro-token",
+		},
+	}
+
+	err := invalidator.InvalidateToken(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, []string{"kiro:account:30"}, cache.deletedKeys)
+}
+
 func TestCompositeTokenCacheInvalidator_Claude(t *testing.T) {
 	cache := &geminiTokenCacheStub{}
 	invalidator := NewCompositeTokenCacheInvalidator(cache)

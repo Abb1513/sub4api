@@ -59,14 +59,15 @@ const (
 	providerGeminiPathTemplate = "/v1beta/models/%s:generateContent"
 
 	// MonitorProviderOpenAI 等 provider 字符串常量（也是 ent enum 的实际值）。
-	// 后 4 个 provider（antigravity/kimi/zhipu/deepseek）为配额模式引入：
-	// antigravity 无探活 adapter（仅配额），其余 3 个复用 OpenAI 兼容探活。
+	// antigravity/kiro 无探活 adapter（仅配额）；kimi/zhipu/deepseek 复用
+	// OpenAI 兼容探活，minimax 走各自的配额通道。
 	MonitorProviderOpenAI      = "openai"
 	MonitorProviderOpenAIBPS   = "openai_bps"
 	MonitorProviderAnthropic   = "anthropic"
 	MonitorProviderGemini      = "gemini"
 	MonitorProviderGrok        = "grok"
 	MonitorProviderAntigravity = "antigravity"
+	MonitorProviderKiro        = "kiro"
 	MonitorProviderKimi        = "kimi"
 	MonitorProviderZhipu       = "zhipu"
 	MonitorProviderDeepseek    = "deepseek"
