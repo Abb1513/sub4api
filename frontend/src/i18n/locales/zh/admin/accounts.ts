@@ -870,6 +870,13 @@ export default {
       openai: {
         baseUrlHint: '留空使用官方 OpenAI API',
         apiKeyHint: '您的 OpenAI API Key',
+        bedrockToggle: 'AWS Bedrock（OpenAI 兼容）',
+        bedrockToggleDesc: '通过 Bearer 认证将此 API Key 账号转发到 Bedrock mantle 端点。',
+        bedrockRegion: 'AWS Region',
+        bedrockRegionHint: '例如 us-east-1、us-west-2、eu-west-1',
+        bedrockBaseUrlHint: '自动生成：https://bedrock-mantle.{region}.api.aws/openai/v1',
+        bedrockApiKeyRequired: 'Bedrock API Key *',
+        bedrockApiKeyHint: '您的 AWS Bedrock API Key',
         requestTimezone: '请求时区',
         requestTimezoneDesc: '此 OpenAI 账号环境上下文中的时区，默认新加坡；保留客户端原始日期、时间和语言偏好。',
         requestTimezoneLoadFailed: '时区列表加载失败，仍可使用默认的新加坡时区。',

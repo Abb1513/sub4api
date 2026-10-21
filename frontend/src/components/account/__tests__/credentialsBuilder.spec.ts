@@ -2,6 +2,7 @@ import { openAIPlanTypeLabel } from '@/utils/planType'
 import { describe, it, expect } from 'vitest'
 import {
   ANTIGRAVITY_PROJECT_ID_CREDENTIAL_KEY,
+  DEFAULT_OPENAI_BEDROCK_REGION,
   HEADER_OVERRIDE_ENABLED_CREDENTIAL_KEY,
   HEADER_OVERRIDES_CREDENTIAL_KEY,
   OPENCODE_GO_PROTOCOL_RULES_KEY,
@@ -10,13 +11,17 @@ import {
   applyInterceptWarmup,
   applyOpenCodeGoProtocolRules,
   applyPlanType,
+  buildOpenAIBedrockBaseURL,
   buildHeaderOverridesObject,
   buildPlanTypeOptions,
   cloneOpenCodeGoProtocolRules,
   cnQuotaCellVisible,
+  defaultOpenAIBedrockModelMappings,
   defaultCNBaseUrl,
   defaultOpenCodeProtocolRules,
+  isDefaultOpenAIBedrockModelMappings,
   isCustomGrokBaseUrl,
+  isOpenAIBedrockCredential,
   resolveOpenCodeAccountMode,
   isHeaderOverrideCapable,
   GROK_BASE_URL_PRESETS,
@@ -28,6 +33,28 @@ import {
   splitHeaderOverridesObject,
   validateHeaderOverrideRows
 } from '../credentialsBuilder'
+
+describe('OpenAI Bedrock helpers', () => {
+  it('derives the mantle base URL with a default region', () => {
+    expect(DEFAULT_OPENAI_BEDROCK_REGION).toBe('us-east-1')
+    expect(buildOpenAIBedrockBaseURL('')).toBe('https://bedrock-mantle.us-east-1.api.aws/openai/v1')
+    expect(buildOpenAIBedrockBaseURL(' eu-west-1 ')).toBe('https://bedrock-mantle.eu-west-1.api.aws/openai/v1')
+  })
+
+  it('recognizes stored boolean and string markers', () => {
+    expect(isOpenAIBedrockCredential(true)).toBe(true)
+    expect(isOpenAIBedrockCredential('true')).toBe(true)
+    expect(isOpenAIBedrockCredential('false')).toBe(false)
+    expect(isOpenAIBedrockCredential(undefined)).toBe(false)
+  })
+
+  it('provides the default mapping and detects it', () => {
+    const mappings = defaultOpenAIBedrockModelMappings()
+    expect(mappings).toContainEqual({ from: 'gpt-6.1-sol', to: 'openai.gpt-6.1-sol' })
+    expect(isDefaultOpenAIBedrockModelMappings(mappings)).toBe(true)
+    expect(isDefaultOpenAIBedrockModelMappings(mappings.slice(1))).toBe(false)
+  })
+})
 
 describe('applyInterceptWarmup', () => {
   it('create + enabled=true: should set intercept_warmup_requests to true', () => {

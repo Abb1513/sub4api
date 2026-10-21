@@ -1236,12 +1236,21 @@ func normalizeOpenAIResponsesImageOnlyModel(reqBody map[string]any) bool {
 
 func normalizeOpenAIModelForUpstream(account *Account, model string) string {
 	if openai.IsGPT61SolModelSpelling(model) {
-		return "gpt-6.1-sol"
+		model = "gpt-6.1-sol"
 	}
 	if account == nil || account.UsesOpenAICodexProtocol() {
 		return normalizeCodexModel(model)
 	}
 	model = strings.TrimSpace(model)
+	if account.IsOpenAIBedrock() && model != "" {
+		lowerModel := strings.ToLower(model)
+		if strings.HasPrefix(lowerModel, "openai/") {
+			return "openai." + model[len("openai/"):]
+		}
+		if !strings.HasPrefix(lowerModel, "openai.") {
+			return "openai." + model
+		}
+	}
 	if account.Platform == PlatformDeepseek {
 		// DeepSeek 走 OpenAI 兼容入口，不经 Anthropic 入站的 [1m] 后缀归一
 		// （parseGatewayRequestCurrentBody 仅处理 PlatformAnthropic 协议）。

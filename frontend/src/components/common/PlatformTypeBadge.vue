@@ -84,6 +84,7 @@ interface Props {
   privacyMode?: string
   subscriptionExpiresAt?: string
   overagesEnabled?: boolean
+  bedrock?: boolean
 }
 
 const props = defineProps<Props>()
@@ -100,6 +101,7 @@ const typeLabel = computed(() => {
     if (normalizedAuthMode.value === 'agentidentity') return 'Agent Identity'
     if (normalizedAuthMode.value === 'personalaccesstoken') return 'PAT'
   }
+  if (props.platform === 'openai' && props.type === 'apikey' && props.bedrock) return 'Bedrock'
   switch (props.type) {
     case 'oauth':
       return 'OAuth'

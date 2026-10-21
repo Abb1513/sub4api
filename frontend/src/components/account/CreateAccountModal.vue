@@ -1616,7 +1616,44 @@
 
       <!-- API Key input (only for apikey type, excluding Antigravity which has its own fields) -->
       <div v-if="form.type === 'apikey' && form.platform !== 'antigravity' && form.platform !== 'kiro'" class="space-y-4">
-        <div v-if="!isMultiProtocolPlatform || apiProtocol !== 'adaptive'">
+        <div
+          v-if="form.platform === 'openai' && accountCategory === 'apikey'"
+          class="flex items-center justify-between gap-4 rounded-lg border border-gray-200 p-4 dark:border-dark-600"
+        >
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.bedrockToggle') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.bedrockToggleDesc') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="openAIBedrockEnabled"
+            data-testid="openai-bedrock-toggle"
+            :aria-label="t('admin.accounts.openai.bedrockToggle')"
+          />
+        </div>
+        <div v-if="isOpenAIBedrockAccount">
+          <label class="input-label">{{ t('admin.accounts.openai.bedrockRegion') }}</label>
+          <input
+            v-model="openAIBedrockRegion"
+            type="text"
+            class="input"
+            placeholder="us-east-1"
+            data-testid="openai-bedrock-region"
+          />
+          <p class="input-hint">{{ t('admin.accounts.openai.bedrockRegionHint') }}</p>
+        </div>
+        <div v-if="isOpenAIBedrockAccount">
+          <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
+          <input
+            :value="openAIBedrockBaseUrl"
+            type="text"
+            readonly
+            class="input bg-gray-50 font-mono dark:bg-dark-700"
+          />
+          <p class="input-hint">{{ t('admin.accounts.openai.bedrockBaseUrlHint') }}</p>
+        </div>
+        <div v-else-if="!isMultiProtocolPlatform || apiProtocol !== 'adaptive'">
           <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
           <input
             v-model="apiKeyBaseUrl"
@@ -1665,7 +1702,11 @@
           :plan="openCodeAccountMode"
         />
         <div>
-          <label class="input-label">{{ t('admin.accounts.apiKeyRequired') }}</label>
+          <label class="input-label">{{
+            isOpenAIBedrockAccount
+              ? t('admin.accounts.openai.bedrockApiKeyRequired')
+              : t('admin.accounts.apiKeyRequired')
+          }}</label>
           <input
             v-model="apiKeyValue"
             type="password"
@@ -4263,13 +4304,18 @@ import {
   applyHeaderOverride,
   applyInterceptWarmup,
   applyOpenCodeGoProtocolRules,
+  buildOpenAIBedrockBaseURL,
   cloneOpenCodeGoProtocolRules,
   cnSupportsNativeResponses,
+  DEFAULT_OPENAI_BEDROCK_MODEL_MAPPING,
+  DEFAULT_OPENAI_BEDROCK_REGION,
   defaultCNAdaptiveBaseUrls,
   defaultCNBaseUrl,
+  defaultOpenAIBedrockModelMappings,
   defaultOpenCodeProtocolRules,
   isCNProviderPlatform,
   isHeaderOverrideCapable,
+  isDefaultOpenAIBedrockModelMappings,
   validateHeaderOverrideRows,
   type CnAccountMode,
   type CnApiProtocol,
@@ -4343,6 +4389,7 @@ const withUpstreamRequestIdHeader = <T extends Record<string, unknown> | undefin
 }
 
 const baseUrlHint = computed(() => {
+  if (isOpenAIBedrockAccount.value) return t('admin.accounts.openai.bedrockBaseUrlHint')
   if (form.platform === 'openai') return t('admin.accounts.openai.baseUrlHint')
   if (form.platform === 'gemini') return t('admin.accounts.gemini.baseUrlHint')
   if (form.platform === 'kiro') return t('admin.accounts.kiro.baseUrlHint')
@@ -4351,6 +4398,7 @@ const baseUrlHint = computed(() => {
 })
 
 const apiKeyHint = computed(() => {
+  if (isOpenAIBedrockAccount.value) return t('admin.accounts.openai.bedrockApiKeyHint')
   if (form.platform === 'openai') return t('admin.accounts.openai.apiKeyHint')
   if (form.platform === 'gemini') return t('admin.accounts.gemini.apiKeyHint')
   if (form.platform === 'kiro') return t('admin.accounts.kiro.apiKeyHint')
@@ -4492,7 +4540,44 @@ const accountCategory = ref<'oauth-based' | 'apikey' | 'bedrock' | 'service_acco
 const addMethod = ref<AddMethod>('oauth') // For oauth-based: 'oauth' or 'setup-token'
 const apiKeyBaseUrl = ref('https://api.anthropic.com')
 const apiKeyValue = ref('')
+const openAIBedrockEnabled = ref(false)
+const openAIBedrockRegion = ref(DEFAULT_OPENAI_BEDROCK_REGION)
 const upstreamBillingAutoProbeEnabled = ref(true)
+const isOpenAIBedrockAccount = computed(
+  () => form.platform === 'openai' && accountCategory.value === 'apikey' && openAIBedrockEnabled.value
+)
+const openAIBedrockBaseUrl = computed(() => buildOpenAIBedrockBaseURL(openAIBedrockRegion.value))
+watch(openAIBedrockEnabled, (enabled) => {
+  if (form.platform !== 'openai' || accountCategory.value !== 'apikey') return
+  if (enabled) {
+    openAIBedrockRegion.value = openAIBedrockRegion.value.trim() || DEFAULT_OPENAI_BEDROCK_REGION
+    apiKeyBaseUrl.value = openAIBedrockBaseUrl.value
+    if (modelMappings.value.length === 0) {
+      modelRestrictionMode.value = 'mapping'
+      modelMappings.value = defaultOpenAIBedrockModelMappings()
+    }
+    return
+  }
+  if (isDefaultOpenAIBedrockModelMappings(modelMappings.value)) {
+    modelMappings.value = []
+    modelRestrictionMode.value = 'whitelist'
+  }
+  apiKeyBaseUrl.value = 'https://api.openai.com'
+})
+watch(openAIBedrockRegion, () => {
+  if (isOpenAIBedrockAccount.value) {
+    apiKeyBaseUrl.value = openAIBedrockBaseUrl.value
+  }
+})
+watch(accountCategory, (category) => {
+  if (category !== 'apikey') {
+    openAIBedrockEnabled.value = false
+    return
+  }
+  if (openAIBedrockEnabled.value) {
+    apiKeyBaseUrl.value = openAIBedrockBaseUrl.value
+  }
+})
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）账号类型、API 协议与端点 ──
 const accountMode = ref<CnAccountMode>('payg')
@@ -4675,7 +4760,9 @@ function onCnPresetSelect(preset: { mode: CnAccountMode; protocol: CnApiProtocol
 
 const syncPreviewCredentials = computed(() => {
   if (!apiKeyValue.value) return undefined
-  const baseUrl = isMultiProtocolPlatform.value && apiProtocol.value === 'adaptive'
+  const baseUrl = isOpenAIBedrockAccount.value
+    ? openAIBedrockBaseUrl.value
+    : isMultiProtocolPlatform.value && apiProtocol.value === 'adaptive'
     ? adaptiveBaseUrls.value.chat_completions.trim() || apiKeyBaseUrl.value.trim()
     : apiKeyBaseUrl.value.trim()
   const modelMapping = buildModelMappingObject(
@@ -4683,13 +4770,21 @@ const syncPreviewCredentials = computed(() => {
     allowedModels.value,
     modelMappings.value
   )
-  return {
+  const credentials = {
     platform: form.platform,
     type: form.type,
     base_url: baseUrl || undefined,
     api_key: apiKeyValue.value,
     ...(modelMapping ? { model_mapping: modelMapping } : {})
   }
+  if (isOpenAIBedrockAccount.value) {
+    return {
+      ...credentials,
+      bedrock: true,
+      aws_region: openAIBedrockRegion.value.trim() || DEFAULT_OPENAI_BEDROCK_REGION
+    }
+  }
+  return credentials
 })
 
 const editQuotaLimit = ref<number | null>(null)
@@ -5297,6 +5392,8 @@ watch(
       interceptWarmupRequests.value = false
     }
     if (newPlatform !== 'openai') {
+      openAIBedrockEnabled.value = false
+      openAIBedrockRegion.value = DEFAULT_OPENAI_BEDROCK_REGION
       openaiPassthroughEnabled.value = false
       openaiFlattenNamespacesEnabled.value = false
       openAIEndpointCapabilities.value = ['chat_completions', 'embeddings']
@@ -5742,6 +5839,8 @@ const resetForm = () => {
   adaptiveBaseUrls.value = { chat_completions: '', anthropic: '', responses: '' }
   apiKeyBaseUrl.value = 'https://api.anthropic.com'
   apiKeyValue.value = ''
+  openAIBedrockEnabled.value = false
+  openAIBedrockRegion.value = DEFAULT_OPENAI_BEDROCK_REGION
   upstreamRequestIdHeader.value = ''
   upstreamBillingAutoProbeEnabled.value = true
   editQuotaLimit.value = null
@@ -6284,7 +6383,9 @@ const handleSubmit = async () => {
 
   // Determine default base URL based on platform
   const defaultBaseUrl =
-    form.platform === 'openai'
+    isOpenAIBedrockAccount.value
+      ? openAIBedrockBaseUrl.value
+      : form.platform === 'openai'
       ? 'https://api.openai.com'
       : form.platform === 'gemini'
         ? 'https://generativelanguage.googleapis.com'
@@ -6298,6 +6399,12 @@ const handleSubmit = async () => {
   const credentials: Record<string, unknown> = {
     base_url: apiKeyBaseUrl.value.trim() || defaultBaseUrl,
     api_key: apiKeyValue.value.trim()
+  }
+  if (isOpenAIBedrockAccount.value) {
+    const region = openAIBedrockRegion.value.trim() || DEFAULT_OPENAI_BEDROCK_REGION
+    credentials.base_url = buildOpenAIBedrockBaseURL(region)
+    credentials.bedrock = true
+    credentials.aws_region = region
   }
   if (form.platform === 'gemini') {
     credentials.tier_id = geminiTierAIStudio.value
@@ -6342,6 +6449,8 @@ const handleSubmit = async () => {
     const modelMapping = buildModelMappingObject(modelRestrictionMode.value, allowedModels.value, modelMappings.value)
     if (modelMapping) {
       credentials.model_mapping = modelMapping
+    } else if (isOpenAIBedrockAccount.value) {
+      credentials.model_mapping = { ...DEFAULT_OPENAI_BEDROCK_MODEL_MAPPING }
     }
   }
   if (form.platform === 'openai') {

@@ -21,6 +21,8 @@ func TestBuildOpenAIEndpointURLPreservesURLComponents(t *testing.T) {
 		{name: "fragment is removed", base: "https://upstream.example/v1#stale", endpoint: "/v1/alpha/search", want: "https://upstream.example/v1/alpha/search"},
 		{name: "ipv6", base: "http://[2001:db8::1]:8080/v1?tenant=a#stale", endpoint: "/v1/responses/input_tokens", want: "http://[2001:db8::1]:8080/v1/responses/input_tokens?tenant=a"},
 		{name: "already complete", base: "https://upstream.example/v1/images/generations?tenant=a", endpoint: "/v1/images/generations", want: "https://upstream.example/v1/images/generations?tenant=a"},
+		{name: "bedrock responses", base: "https://bedrock-mantle.us-east-1.api.aws/openai/v1", endpoint: "/v1/responses", want: "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses"},
+		{name: "bedrock chat completions", base: "https://bedrock-mantle.us-east-1.api.aws/openai/v1", endpoint: "/v1/chat/completions", want: "https://bedrock-mantle.us-east-1.api.aws/openai/v1/chat/completions"},
 	}
 
 	for _, tt := range tests {

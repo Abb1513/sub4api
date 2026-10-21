@@ -329,6 +329,30 @@ describe('EditAccountModal', () => {
     authIsSimpleMode.value = true
   })
 
+  it('loads and saves an OpenAI Bedrock account without losing the marker', async () => {
+    updateAccountMock.mockReset().mockResolvedValue({})
+    const account = {
+      ...buildAccount(),
+      credentials: {
+        bedrock: true,
+        aws_region: 'us-west-2',
+        base_url: 'https://bedrock-mantle.us-west-2.api.aws/openai/v1',
+        api_key: 'bedrock-key',
+        model_mapping: { 'gpt-6.1-sol': 'openai.gpt-6.1-sol' }
+      }
+    } as any
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="openai-bedrock-region"]').setValue('eu-west-1')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials).toMatchObject({
+      bedrock: true,
+      aws_region: 'eu-west-1',
+      base_url: 'https://bedrock-mantle.eu-west-1.api.aws/openai/v1'
+    })
+  })
+
   afterEach(() => vi.useRealTimers())
 
   it('passes existing non-identity mappings to the whitelist selector and preserves them on save', async () => {
