@@ -237,3 +237,15 @@ var DefaultBedrockModelMapping = map[string]string{
 	"claude-haiku-4-5":          "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 	"claude-haiku-4-5-20251001": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 }
+
+// DefaultOpenAIBedrockModelMapping maps OpenAI model names to Bedrock mantle model IDs.
+var DefaultOpenAIBedrockModelMapping = map[string]string{
+	"gpt-6.1-sol":   "openai.gpt-6.1-sol",
+	"gpt-6-sol":     "openai.gpt-6-sol",
+	"gpt-6-luna":    "openai.gpt-6-luna",
+	"gpt-6-astra":   "openai.gpt-6-astra",
+	"gpt-5.6-sol":   "openai.gpt-5.6-sol",
+	"gpt-5.6-terra": "openai.gpt-5.6-terra",
+	"gpt-5.6-luna":  "openai.gpt-5.6-luna",
+	"gpt-5.6":       "openai.gpt-5.6",
+}

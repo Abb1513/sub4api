@@ -82,6 +82,8 @@ function filenameFromDisposition(value: unknown, format: UserRequestAuditExportF
   const match = value.match(/filename\*?=(?:UTF-8''|"?)([^";]+)"?/i)
   let candidate = ''
   try { candidate = match?.[1] ? decodeURIComponent(match[1]) : '' } catch { candidate = '' }
+  // Strip control characters from the server-provided filename before using it.
+  // eslint-disable-next-line no-control-regex
   candidate = candidate.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim()
   return candidate || fallback
 }

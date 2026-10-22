@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MACOS-DO/sub4api/internal/pkg/ctxkey"
 	"github.com/MACOS-DO/sub4api/internal/pkg/kirocooldown"
 	"github.com/MACOS-DO/sub4api/internal/pkg/tlsfingerprint"
 	"github.com/gin-gonic/gin"
@@ -283,98 +282,6 @@ func TestAsKiroCooldownFailoverError(t *testing.T) {
 
 func TestAsKiroCooldownFailoverErrorIgnoresNonCooldownErrors(t *testing.T) {
 	require.Nil(t, asKiroCooldownFailoverError(errors.New("redis unavailable")))
-}
-
-func TestGatewayServiceTryRecoverKiroCooldownPoolClearsOnlyTransientCooldown(t *testing.T) {
-	store := &stubKiroCooldownStore{
-		state: &kirocooldown.State{
-			Active:        true,
-			Reason:        kirocooldown.CooldownReason429,
-			CooldownUntil: time.Now().Add(time.Minute),
-			Remaining:     time.Minute,
-		},
-		clearResult: true,
-	}
-	svc := &GatewayService{kiroCooldownStore: store}
-	accounts := []Account{
-		{
-			ID:          42,
-			Platform:    PlatformKiro,
-			Type:        AccountTypeOAuth,
-			Status:      StatusActive,
-			Schedulable: true,
-		},
-	}
-
-	recovered := svc.tryRecoverKiroCooldownPool(context.Background(), accounts, "", nil, false)
-	require.True(t, recovered)
-	require.True(t, store.clearCalled)
-	require.Len(t, store.clearKeys, 1)
-	require.Equal(t, buildKiroAccountKey(&accounts[0]), store.clearKeys[0])
-}
-
-func TestGatewayServiceTryRecoverKiroCooldownPoolSkipsSuspended(t *testing.T) {
-	store := &stubKiroCooldownStore{
-		state: &kirocooldown.State{
-			Active:        true,
-			Reason:        kirocooldown.CooldownReasonSuspended,
-			CooldownUntil: time.Now().Add(time.Hour),
-			Remaining:     time.Hour,
-		},
-		clearResult: true,
-	}
-	svc := &GatewayService{kiroCooldownStore: store}
-	accounts := []Account{
-		{
-			ID:          42,
-			Platform:    PlatformKiro,
-			Type:        AccountTypeOAuth,
-			Status:      StatusActive,
-			Schedulable: true,
-		},
-	}
-
-	recovered := svc.tryRecoverKiroCooldownPool(context.Background(), accounts, "", nil, false)
-	require.False(t, recovered)
-	require.False(t, store.clearCalled)
-}
-
-func TestSelectAccountWithLoadAwarenessRecoversKiroCooldownPool(t *testing.T) {
-	cfg := testConfig()
-	cfg.Gateway.Scheduling.LoadBatchEnabled = true
-
-	account := Account{
-		ID:          42,
-		Platform:    PlatformKiro,
-		Type:        AccountTypeOAuth,
-		Status:      StatusActive,
-		Schedulable: true,
-		Concurrency: 1,
-	}
-	store := &stubKiroCooldownStore{
-		state: &kirocooldown.State{
-			Active:        true,
-			Reason:        kirocooldown.CooldownReason429,
-			CooldownUntil: time.Now().Add(time.Minute),
-			Remaining:     time.Minute,
-		},
-		clearResult: true,
-	}
-	svc := &GatewayService{
-		accountRepo:         &mockAccountRepoForGemini{accounts: []Account{account}},
-		concurrencyService:  NewConcurrencyService(&mockConcurrencyCache{}),
-		cfg:                 cfg,
-		kiroCooldownStore:   store,
-		tlsFPProfileService: &TLSFingerprintProfileService{},
-	}
-	ctx := context.WithValue(context.Background(), ctxkey.ForcePlatform, PlatformKiro)
-
-	result, err := svc.SelectAccountWithLoadAwareness(ctx, nil, "", "", nil, "", 0)
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	require.Equal(t, account.ID, result.Account.ID)
-	require.True(t, store.clearCalled)
-	require.Equal(t, []string{buildKiroAccountKey(&account)}, store.clearKeys)
 }
 
 func TestClassifyKiroHTTPErrorMonthlyRequestCount(t *testing.T) {

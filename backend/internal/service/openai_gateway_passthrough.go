@@ -786,6 +786,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	if err := applyMappedGPT55LiteCompatibility(req, account, body); err != nil {
 		return nil, err
 	}
+	stripOpenAIBedrockCodexHeaders(account, req.Header)
 	return req, nil
 }
 

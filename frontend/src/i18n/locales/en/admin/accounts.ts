@@ -739,6 +739,15 @@ export default {
       openai: {
         baseUrlHint: 'Leave default for official OpenAI API',
         apiKeyHint: 'Your OpenAI API Key',
+        bedrockToggle: 'AWS Bedrock (OpenAI-compatible)',
+        bedrockToggleDesc:
+          'Route this API-key account to Bedrock mantle with Bearer authentication.',
+        bedrockRegion: 'AWS Region',
+        bedrockRegionHint: 'e.g. us-east-1, us-west-2, eu-west-1',
+        bedrockBaseUrlHint:
+          'Derived automatically as https://bedrock-mantle.{region}.api.aws/openai/v1',
+        bedrockApiKeyRequired: 'Bedrock API Key *',
+        bedrockApiKeyHint: 'Your AWS Bedrock API Key',
         requestTimezone: 'Request timezone',
         requestTimezoneDesc: 'Timezone in environment context for this OpenAI account. Defaults to Singapore; preserves original client dates, times and language preferences.',
         requestTimezoneLoadFailed: 'Timezone choices could not be loaded. The default Singapore timezone remains available.',

@@ -347,6 +347,28 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(syncUpstreamModelsMock).toHaveBeenCalledWith(42)
   })
 
+  it('creates an OpenAI Bedrock API-key account with the mantle endpoint and default mapping', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await selectButtonByText(wrapper, 'API Key')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Bedrock account')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('bedrock-key')
+    await wrapper.get('[data-testid="openai-bedrock-toggle"]').trigger('click')
+    await wrapper.get('[data-testid="openai-bedrock-region"]').setValue('eu-west-1')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock.mock.calls[0]?.[0]?.credentials).toMatchObject({
+      bedrock: true,
+      aws_region: 'eu-west-1',
+      base_url: 'https://bedrock-mantle.eu-west-1.api.aws/openai/v1',
+      api_key: 'bedrock-key',
+      model_mapping: {
+        'gpt-6.1-sol': 'openai.gpt-6.1-sol'
+      }
+    })
+  })
+
   it('includes the current concrete model mapping in preview credentials', async () => {
     const wrapper = mountModal()
     await selectButtonByText(wrapper, 'OpenAI')

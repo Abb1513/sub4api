@@ -649,6 +649,9 @@ func (a *Account) GetModelMapping() map[string]string {
 
 func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]string {
 	if a.Credentials == nil {
+		if a.IsOpenAIBedrock() {
+			return domain.DefaultOpenAIBedrockModelMapping
+		}
 		// Antigravity 平台使用默认映射
 		if a.Platform == domain.PlatformAntigravity {
 			return domain.DefaultAntigravityModelMapping
@@ -663,6 +666,9 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
 		return nil
 	}
 	if len(rawMapping) == 0 {
+		if a.IsOpenAIBedrock() {
+			return domain.DefaultOpenAIBedrockModelMapping
+		}
 		if a.IsGeminiGoogleOne() {
 			return geminicli.GoogleOneModelMapping()
 		}
@@ -715,6 +721,9 @@ func (a *Account) resolveModelMapping(rawMapping map[string]any) map[string]stri
 	// Antigravity 平台使用默认映射
 	if a.IsGeminiGoogleOne() {
 		return geminicli.GoogleOneModelMapping()
+	}
+	if a.IsOpenAIBedrock() {
+		return domain.DefaultOpenAIBedrockModelMapping
 	}
 	if a.Platform == domain.PlatformAntigravity {
 		return domain.DefaultAntigravityModelMapping
@@ -894,6 +903,26 @@ func (a *Account) IsModelSupported(requestedModel string) bool {
 	if a.IsOpenAIPassthroughEnabled() {
 		return true
 	}
+	if a.IsOpenAIBedrock() {
+		model := strings.ToLower(strings.TrimSpace(requestedModel))
+		if model == "" {
+			return false
+		}
+		mapping := a.GetModelMapping()
+		if mappingSupportsRequestedModel(mapping, requestedModel) {
+			return true
+		}
+		normalized := normalizeRequestedModelForLookup(a.Platform, requestedModel)
+		if normalized != requestedModel && mappingSupportsRequestedModel(mapping, normalized) {
+			return true
+		}
+		if strings.HasPrefix(model, "gpt-") || strings.HasPrefix(model, "openai.") {
+			return true
+		}
+		// `openai/...` is accepted elsewhere as an OpenAI model alias.
+		return strings.HasPrefix(model, "openai/") &&
+			strings.HasPrefix(strings.ToLower(lastOpenAIModelSegment(model)), "gpt-")
+	}
 	mapping := a.GetModelMapping()
 	if len(mapping) == 0 {
 		if a.IsOpenAIOAuth() {
@@ -1029,6 +1058,9 @@ func (a *Account) GetBaseURL() string {
 		// TypeSafe keys must never fall back to the Anthropic host.
 		if a.Platform == PlatformTypeSafe {
 			return typesafe.DefaultBaseURL
+		}
+		if a.Platform == PlatformKiro {
+			return ""
 		}
 		return "https://api.anthropic.com"
 	}
@@ -1421,6 +1453,41 @@ func (a *Account) IsOpenAIApiKey() bool {
 	return a.IsOpenAI() && a.Type == AccountTypeAPIKey
 }
 
+// IsOpenAIBedrock reports whether this OpenAI API-key account targets Bedrock's
+// OpenAI-compatible mantle endpoint.
+func (a *Account) IsOpenAIBedrock() bool {
+	if a == nil || !a.IsOpenAIApiKey() || a.Credentials == nil {
+		return false
+	}
+	switch value := a.Credentials["bedrock"].(type) {
+	case bool:
+		return value
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		return err == nil && parsed
+	case json.Number:
+		parsed, err := strconv.ParseBool(value.String())
+		return err == nil && parsed
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case int64:
+		return value != 0
+	default:
+		return false
+	}
+}
+
+// BuildOpenAIBedrockBaseURL returns the Bedrock mantle OpenAI-compatible base URL.
+func BuildOpenAIBedrockBaseURL(region string) string {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = defaultBedrockRegion
+	}
+	return fmt.Sprintf("https://bedrock-mantle.%s.api.aws/openai/v1", region)
+}
+
 // GetOpenAIBaseURL 解析 OpenAI 协议族账号的上游 base_url。
 // 适用 openai、国产 OpenAI 兼容供应商（kimi/zhipu/deepseek）与 OpenCode Go；
 // grok 走 GetGrokBaseURL，此处对 grok 返回 "" 以保持原有行为。
@@ -1439,6 +1506,9 @@ func (a *Account) GetOpenAIBaseURL() string {
 		if baseURL := strings.TrimSpace(a.GetCredential("base_url")); baseURL != "" {
 			return baseURL
 		}
+	}
+	if a.IsOpenAIBedrock() {
+		return BuildOpenAIBedrockBaseURL(a.GetCredential("aws_region"))
 	}
 	// 平台默认 base_url：CN 供应商按 account_mode 选择 payg / coding 默认值。
 	switch a.Platform {

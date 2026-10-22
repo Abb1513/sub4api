@@ -105,9 +105,9 @@ func TestClaudeCodeControlHeaders_ResponseToNextRequest(t *testing.T) {
 				_ = resp.Body.Close()
 				next := buildClaudeControlTestRequest(t, s, endpoint, account, http.Header{}, true)
 				got := filterClaudeCodeControlHeaders(next.Header)
-				require.Equal(t, []string{"replacement"}, got["anthropic-usage-limit"])
-				require.Equal(t, []string{""}, got["x-cc-compaction-request"])
-				require.Equal(t, []string{"initial-x-claude-code-compaction", "second"}, got["x-claude-code-compaction"])
+				require.Equal(t, []string{"replacement"}, got[claudeCodeControlHeaderNames[0]])
+				require.Equal(t, []string{""}, got[claudeCodeControlHeaderNames[5]])
+				require.Equal(t, []string{"initial-x-claude-code-compaction", "second"}, got[claudeCodeControlHeaderNames[4]])
 				require.Equal(t, cache.headers[account.ID], got)
 
 				caller := http.Header{}
@@ -167,7 +167,7 @@ func TestClaudeCodeControlHeaders_ModeAndProviderBoundaries(t *testing.T) {
 			}
 			s.applyClaudeCodeControlHeaders(context.Background(), req, http.Header{}, account, "oauth", tc.mimic)
 			if tc.use {
-				require.Equal(t, http.Header{"anthropic-usage-limit": {"new"}}, filterClaudeCodeControlHeaders(req.Header))
+				require.Equal(t, http.Header{claudeCodeControlHeaderNames[0]: {"new"}}, filterClaudeCodeControlHeaders(req.Header))
 			} else {
 				require.Empty(t, filterClaudeCodeControlHeaders(req.Header))
 			}
@@ -182,13 +182,13 @@ func TestClaudeCodeControlHeaders_MissingFieldsAndCacheFailure(t *testing.T) {
 	s := &GatewayService{identityService: NewIdentityService(cache), httpUpstream: upstream}
 	account := &Account{ID: 1, Platform: PlatformAnthropic, Type: AccountTypeOAuth}
 	req := httptest.NewRequest(http.MethodPost, "https://upstream.test", nil)
-	resp, err := s.doClaudeUpstreamRequest(context.Background(), req, "", account, nil)
+	_, err := s.doClaudeUpstreamRequest(context.Background(), req, "", account, nil)
 	require.NoError(t, err)
 	require.Zero(t, cache.updates)
-	require.Equal(t, []string{"retained"}, cache.headers[1]["anthropic-usage-limit"])
+	require.Equal(t, []string{"retained"}, cache.headers[1][claudeCodeControlHeaderNames[0]])
 	cache.writeErr = errors.New("cache unavailable")
 	upstream.resp.Header.Set("Anthropic-Usage-Limit", "ignored-on-cache-error")
-	resp, err = s.doClaudeUpstreamRequest(context.Background(), req, "", account, nil)
+	resp, err := s.doClaudeUpstreamRequest(context.Background(), req, "", account, nil)
 	require.NoError(t, err)
 	require.Same(t, upstream.resp, resp)
 	require.Equal(t, 200, resp.StatusCode)

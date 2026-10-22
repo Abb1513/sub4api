@@ -58,6 +58,14 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 	}
 
 	body := parsed.Body.Bytes()
+	if isKiroDirectModeAccount(account) {
+		inputTokens := estimateKiroInputTokens(ctx, s.kiroMeteringAlgorithm(ctx), body)
+		if inputTokens < 1 {
+			inputTokens = 1
+		}
+		c.JSON(http.StatusOK, gin.H{"input_tokens": inputTokens})
+		return nil
+	}
 	replaceBody := func(next []byte) error {
 		if err := parsed.ReplaceBody(next); err != nil {
 			return fmt.Errorf("rewrite count_tokens body: %w", err)

@@ -14,7 +14,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 24 // v24: group model_allowlist field (renamed from models_list_config, enforcing semantics)
+const apiKeyAuthSnapshotVersion = 25 // v25: group kiro runtime fields (cache emulation, sticky, endpoint mode)
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -435,6 +435,14 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			ProfitControlEnabled:            apiKey.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 apiKey.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              apiKey.Group.ProfitSafetyBuffer,
+			KiroCacheEmulationEnabled:       apiKey.Group.KiroCacheEmulationEnabled,
+			KiroAutoStickyEnabled:           apiKey.Group.KiroAutoStickyEnabled,
+			KiroStickySessionTTLSeconds:     apiKey.Group.KiroStickySessionTTLSeconds,
+			KiroCacheEmulationRatio:         apiKey.Group.KiroCacheEmulationRatio,
+			KiroCacheEmulationMode:          apiKey.Group.KiroCacheEmulationMode,
+			KiroCacheCreationEmulationRatio: apiKey.Group.KiroCacheCreationEmulationRatio,
+			KiroCacheReadEmulationRatio:     apiKey.Group.KiroCacheReadEmulationRatio,
+			KiroEndpointMode:                apiKey.Group.KiroEndpointMode,
 		}
 	}
 	return snapshot
@@ -537,6 +545,14 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			ProfitControlEnabled:            snapshot.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 snapshot.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              snapshot.Group.ProfitSafetyBuffer,
+			KiroCacheEmulationEnabled:       snapshot.Group.KiroCacheEmulationEnabled,
+			KiroAutoStickyEnabled:           snapshot.Group.KiroAutoStickyEnabled,
+			KiroStickySessionTTLSeconds:     snapshot.Group.KiroStickySessionTTLSeconds,
+			KiroCacheEmulationRatio:         snapshot.Group.KiroCacheEmulationRatio,
+			KiroCacheEmulationMode:          snapshot.Group.KiroCacheEmulationMode,
+			KiroCacheCreationEmulationRatio: snapshot.Group.KiroCacheCreationEmulationRatio,
+			KiroCacheReadEmulationRatio:     snapshot.Group.KiroCacheReadEmulationRatio,
+			KiroEndpointMode:                snapshot.Group.KiroEndpointMode,
 		}
 	}
 	s.compileAPIKeyIPRules(apiKey)

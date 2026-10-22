@@ -1,5 +1,44 @@
 import { openAIPlanTypeKey, openAIPlanTypeLabel, openAIPlanTypes } from '@/utils/planType'
 
+export const DEFAULT_OPENAI_BEDROCK_REGION = 'us-east-1'
+
+export const DEFAULT_OPENAI_BEDROCK_MODEL_MAPPING: Readonly<Record<string, string>> = {
+  'gpt-6.1-sol': 'openai.gpt-6.1-sol',
+  'gpt-6-sol': 'openai.gpt-6-sol',
+  'gpt-6-luna': 'openai.gpt-6-luna',
+  'gpt-6-astra': 'openai.gpt-6-astra',
+  'gpt-5.6': 'openai.gpt-5.6',
+  'gpt-5.6-sol': 'openai.gpt-5.6-sol',
+  'gpt-5.6-terra': 'openai.gpt-5.6-terra',
+  'gpt-5.6-luna': 'openai.gpt-5.6-luna'
+}
+
+export interface ModelMappingRow {
+  from: string
+  to: string
+}
+
+export function buildOpenAIBedrockBaseURL(region: string): string {
+  const normalized = region.trim() || DEFAULT_OPENAI_BEDROCK_REGION
+  return `https://bedrock-mantle.${normalized}.api.aws/openai/v1`
+}
+
+export function isOpenAIBedrockCredential(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') return value.trim().toLowerCase() === 'true'
+  return value === 1
+}
+
+export function defaultOpenAIBedrockModelMappings(): ModelMappingRow[] {
+  return Object.entries(DEFAULT_OPENAI_BEDROCK_MODEL_MAPPING).map(([from, to]) => ({ from, to }))
+}
+
+export function isDefaultOpenAIBedrockModelMappings(rows: ModelMappingRow[]): boolean {
+  const expected = defaultOpenAIBedrockModelMappings()
+  return rows.length === expected.length &&
+    expected.every((entry, index) => rows[index]?.from === entry.from && rows[index]?.to === entry.to)
+}
+
 export function applyInterceptWarmup(
   credentials: Record<string, unknown>,
   enabled: boolean,

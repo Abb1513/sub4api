@@ -30,7 +30,44 @@
 
       <!-- API Key fields (only for apikey type) -->
       <div v-if="account.type === 'apikey'" class="space-y-4">
-        <div v-if="!isCNApiKeyAccount || editApiProtocol !== 'adaptive'">
+        <div
+          v-if="account.platform === 'openai'"
+          class="flex items-center justify-between gap-4 rounded-lg border border-gray-200 p-4 dark:border-dark-600"
+        >
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.openai.bedrockToggle') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.bedrockToggleDesc') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="openAIBedrockEnabled"
+            data-testid="openai-bedrock-toggle"
+            :aria-label="t('admin.accounts.openai.bedrockToggle')"
+          />
+        </div>
+        <div v-if="isOpenAIBedrockAccount">
+          <label class="input-label">{{ t('admin.accounts.openai.bedrockRegion') }}</label>
+          <input
+            v-model="openAIBedrockRegion"
+            type="text"
+            class="input"
+            placeholder="us-east-1"
+            data-testid="openai-bedrock-region"
+          />
+          <p class="input-hint">{{ t('admin.accounts.openai.bedrockRegionHint') }}</p>
+        </div>
+        <div v-if="isOpenAIBedrockAccount">
+          <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
+          <input
+            :value="openAIBedrockBaseUrl"
+            type="text"
+            readonly
+            class="input bg-gray-50 font-mono dark:bg-dark-700"
+          />
+          <p class="input-hint">{{ t('admin.accounts.openai.bedrockBaseUrlHint') }}</p>
+        </div>
+        <div v-else-if="!isCNApiKeyAccount || editApiProtocol !== 'adaptive'">
           <label class="input-label">{{ t('admin.accounts.baseUrl') }}</label>
           <input
             v-model="editBaseUrl"
@@ -209,7 +246,11 @@
           <p class="input-hint mt-2">{{ t('admin.accounts.cnProviders.zhipuTeam.hint') }}</p>
         </div>
         <div>
-          <label class="input-label">{{ t('admin.accounts.apiKey') }}</label>
+          <label class="input-label">{{
+            isOpenAIBedrockAccount
+              ? t('admin.accounts.openai.bedrockApiKeyRequired')
+              : t('admin.accounts.apiKey')
+          }}</label>
           <input
             v-model="editApiKey"
             type="password"
@@ -3354,9 +3395,15 @@ import {
   applyInterceptWarmup,
   applyOpenCodeGoProtocolRules,
   applyPlanType,
+  buildOpenAIBedrockBaseURL,
   buildPlanTypeOptions,
   cloneOpenCodeGoProtocolRules,
+  DEFAULT_OPENAI_BEDROCK_MODEL_MAPPING,
+  DEFAULT_OPENAI_BEDROCK_REGION,
   defaultOpenCodeProtocolRules,
+  defaultOpenAIBedrockModelMappings,
+  isDefaultOpenAIBedrockModelMappings,
+  isOpenAIBedrockCredential,
   parseOpenCodeGoProtocolRules,
   readPlanType,
   resolveOpenCodeAccountMode,
@@ -3568,6 +3615,37 @@ interface TempUnschedRuleForm {
 const submitting = ref(false)
 const editBaseUrl = ref('https://api.anthropic.com')
 const editApiKey = ref('')
+const openAIBedrockEnabled = ref(false)
+const openAIBedrockRegion = ref(DEFAULT_OPENAI_BEDROCK_REGION)
+const isOpenAIBedrockAccount = computed(
+  () =>
+    props.account?.platform === 'openai' &&
+    props.account?.type === 'apikey' &&
+    openAIBedrockEnabled.value
+)
+const openAIBedrockBaseUrl = computed(() => buildOpenAIBedrockBaseURL(openAIBedrockRegion.value))
+watch(openAIBedrockRegion, () => {
+  if (isOpenAIBedrockAccount.value) {
+    editBaseUrl.value = openAIBedrockBaseUrl.value
+  }
+})
+watch(openAIBedrockEnabled, (enabled) => {
+  if (props.account?.platform !== 'openai' || props.account?.type !== 'apikey') return
+  if (enabled) {
+    openAIBedrockRegion.value = openAIBedrockRegion.value.trim() || DEFAULT_OPENAI_BEDROCK_REGION
+    editBaseUrl.value = openAIBedrockBaseUrl.value
+    if (modelMappings.value.length === 0) {
+      modelRestrictionMode.value = 'mapping'
+      modelMappings.value = defaultOpenAIBedrockModelMappings()
+    }
+    return
+  }
+  if (isDefaultOpenAIBedrockModelMappings(modelMappings.value)) {
+    modelMappings.value = []
+    modelRestrictionMode.value = 'whitelist'
+  }
+  editBaseUrl.value = 'https://api.openai.com'
+})
 
 // ── 国产供应商（Kimi / Zhipu / DeepSeek）account_mode / api_protocol 编辑 ──
 // account_mode 决定额度/余额监控路径，api_protocol 决定转发端点与格式；
@@ -4647,6 +4725,14 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   // Initialize API Key fields for apikey type
   if (newAccount.type === 'apikey' && newAccount.credentials) {
     const credentials = newAccount.credentials as Record<string, unknown>
+    openAIBedrockEnabled.value =
+      newAccount.platform === 'openai' && isOpenAIBedrockCredential(credentials.bedrock)
+    openAIBedrockRegion.value =
+      newAccount.platform === 'openai' &&
+      typeof credentials.aws_region === 'string' &&
+      credentials.aws_region.trim()
+        ? credentials.aws_region.trim()
+        : DEFAULT_OPENAI_BEDROCK_REGION
     // 国产供应商：读取 account_mode 与 api_protocol 作为可编辑初始值
     // （编辑弹窗允许修正两者，用于修复早期存错默认值的账号）。
     if (isCNProviderPlatform(newAccount.platform) || newAccount.platform === 'opencode_go') {
@@ -4725,15 +4811,21 @@ const syncFormFromAccount = (newAccount: Account | null) => {
                 newAccount.platform === 'opencode_go'
               ? defaultCNBaseUrl(newAccount.platform, currentOpenCodeOrCNMode(), editApiProtocol.value)
               : 'https://api.anthropic.com'
-    editBaseUrl.value = isCNApiKeyAccount.value && editApiProtocol.value === 'adaptive'
-      ? editAdaptiveBaseUrls.value.chat_completions
-      : (credentials.base_url as string) || platformDefaultUrl
+    editBaseUrl.value = newAccount.platform === 'openai' && openAIBedrockEnabled.value
+      ? buildOpenAIBedrockBaseURL(openAIBedrockRegion.value)
+      : isCNApiKeyAccount.value && editApiProtocol.value === 'adaptive'
+        ? editAdaptiveBaseUrls.value.chat_completions
+        : (credentials.base_url as string) || platformDefaultUrl
 
     // Kiro only supports model mapping; other platforms infer whitelist vs mapping.
     if (newAccount.platform === 'kiro') {
       loadKiroModelMappings(newAccount, credentials.model_mapping as Record<string, unknown> | undefined)
     } else {
       loadModelRestrictionFromMapping(credentials.model_mapping as Record<string, unknown> | undefined)
+    }
+    if (newAccount.platform === 'openai' && openAIBedrockEnabled.value && modelMappings.value.length === 0) {
+      modelRestrictionMode.value = 'mapping'
+      modelMappings.value = defaultOpenAIBedrockModelMappings()
     }
 
     // Load pool mode
@@ -5477,6 +5569,15 @@ const handleSubmit = async () => {
         ...currentCredentials,
         base_url: newBaseUrl
       }
+      if (props.account.platform === 'openai' && openAIBedrockEnabled.value) {
+        const region = openAIBedrockRegion.value.trim() || DEFAULT_OPENAI_BEDROCK_REGION
+        newCredentials.bedrock = true
+        newCredentials.aws_region = region
+        newCredentials.base_url = buildOpenAIBedrockBaseURL(region)
+      } else if (props.account.platform === 'openai') {
+        delete newCredentials.bedrock
+        delete newCredentials.aws_region
+      }
 
       // 国产供应商：模式与协议写入凭据（决定额度/余额探测与转发端点/格式）。
       if (isCNApiKeyAccount.value) {
@@ -5532,6 +5633,8 @@ const handleSubmit = async () => {
           : buildModelRestrictionMapping()
         if (modelMapping) {
           newCredentials.model_mapping = modelMapping
+        } else if (props.account.platform === 'openai' && openAIBedrockEnabled.value) {
+          newCredentials.model_mapping = { ...DEFAULT_OPENAI_BEDROCK_MODEL_MAPPING }
         } else {
           delete newCredentials.model_mapping
         }

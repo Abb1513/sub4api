@@ -16,6 +16,7 @@ import (
 	"github.com/MACOS-DO/sub4api/internal/config"
 	"github.com/MACOS-DO/sub4api/internal/pkg/claude"
 	"github.com/MACOS-DO/sub4api/internal/pkg/ctxkey"
+	"github.com/MACOS-DO/sub4api/internal/pkg/kirocooldown"
 	"github.com/MACOS-DO/sub4api/internal/pkg/logger"
 	"github.com/MACOS-DO/sub4api/internal/pkg/usagestats"
 )
@@ -1149,6 +1150,12 @@ func (s *GatewayService) isAccountAllowedForPlatform(account *Account, platform 
 func (s *GatewayService) isAccountSchedulableForSelection(account *Account) bool {
 	if account == nil {
 		return false
+	}
+	if account.Platform == PlatformKiro && s != nil && s.kiroCooldownStore != nil {
+		state, err := s.kiroCooldownStore.GetState(context.Background(), buildKiroAccountKey(account))
+		if err == nil && state != nil && state.Active && state.Reason != kirocooldown.CooldownReasonSuspended {
+			return false
+		}
 	}
 	return account.IsSchedulable()
 }

@@ -230,6 +230,15 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldProfitControlEnabled,
 				group.FieldProfitMinMargin,
 				group.FieldProfitSafetyBuffer,
+				// Kiro 转发读认证快照里的分组配置，漏选会让模拟缓存/粘性/endpoint 静默回落零值。
+				group.FieldKiroCacheEmulationEnabled,
+				group.FieldKiroAutoStickyEnabled,
+				group.FieldKiroStickySessionTTLSeconds,
+				group.FieldKiroCacheEmulationRatio,
+				group.FieldKiroCacheEmulationMode,
+				group.FieldKiroCacheCreationEmulationRatio,
+				group.FieldKiroCacheReadEmulationRatio,
+				group.FieldKiroEndpointMode,
 			)
 		}).
 		Only(ctx)

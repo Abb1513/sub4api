@@ -31,6 +31,16 @@ type kiroListAvailableModelsResponse struct {
 	NextToken string `json:"nextToken"`
 }
 
+// These direct-mode model sync entry points are retained for runtime dispatch
+// and focused test coverage.
+var (
+	_ = kiroListAvailableModelIDs
+	_ = (*AccountTestService).fetchKiroDirectUpstreamModels
+	_ = (*AccountTestService).syncKiroDirectModelCatalog
+	_ = (*AccountTestService).kiroSyncAccessToken
+	_ = kiroSyncPublicModelNames
+)
+
 // kiroListAvailableModelIDs 调用 GET https://q.{region}.amazonaws.com/ListAvailableModels。
 // 账号区域返回 403 时再试 eu-central-1。最多翻 10 页。
 func kiroListAvailableModelIDs(ctx context.Context, account *Account, token string) ([]string, error) {
@@ -47,7 +57,7 @@ func kiroModelsHTTPDo(account *Account) kiroModelsDoFunc {
 		if err != nil {
 			return nil, err
 		}
-		return client.Do(req)
+		return client.Do(req) //nolint:gosec // G704: the host is a fixed AWS suffix; the region comes from account configuration.
 	}
 }
 
