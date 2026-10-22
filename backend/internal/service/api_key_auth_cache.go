@@ -140,6 +140,17 @@ type APIKeyAuthGroupSnapshot struct {
 	ProfitControlEnabled bool    `json:"profit_control_enabled"`
 	ProfitMinMargin      float64 `json:"profit_min_margin"`
 	ProfitSafetyBuffer   float64 `json:"profit_safety_buffer"`
+
+	// Kiro 分组运行时配置：Kiro 转发读的是认证快照还原出的 Group，漏列会让模拟缓存、
+	// 粘性会话和 endpoint 模式静默回落到零值。
+	KiroCacheEmulationEnabled       bool    `json:"kiro_cache_emulation_enabled"`
+	KiroAutoStickyEnabled           bool    `json:"kiro_auto_sticky_enabled"`
+	KiroStickySessionTTLSeconds     int     `json:"kiro_sticky_session_ttl_seconds"`
+	KiroCacheEmulationRatio         float64 `json:"kiro_cache_emulation_ratio"`
+	KiroCacheEmulationMode          string  `json:"kiro_cache_emulation_mode"`
+	KiroCacheCreationEmulationRatio float64 `json:"kiro_cache_creation_emulation_ratio"`
+	KiroCacheReadEmulationRatio     float64 `json:"kiro_cache_read_emulation_ratio"`
+	KiroEndpointMode                string  `json:"kiro_endpoint_mode"`
 }
 
 // APIKeyAuthCacheEntry 缓存条目，支持负缓存
