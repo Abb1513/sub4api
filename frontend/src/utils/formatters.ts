@@ -15,3 +15,15 @@ export function formatMultiplier(val: number): string {
   if (val < 0.0001) return val.toPrecision(2)
   return val.toFixed(4).replace(/(\.\d{2}\d*?)0+$/, '$1')
 }
+
+/**
+ * 格式化上游积分（Kiro credits）：至多 4 位小数并去掉末尾 0，>= 1000 用 K/M 缩写
+ * （0.0283 -> "0.0283"，1.5 -> "1.5"，12345 -> "12.3K"）
+ */
+export function formatCredits(val: number | null | undefined): string {
+  if (val == null || !Number.isFinite(val) || val <= 0) return '0'
+  if (val >= 1000000) return `${(val / 1000000).toFixed(1)}M`
+  if (val >= 1000) return `${(val / 1000).toFixed(1)}K`
+  const fixed = val.toFixed(4).replace(/\.?0+$/, '')
+  return fixed === '0' ? val.toPrecision(2) : fixed
+}

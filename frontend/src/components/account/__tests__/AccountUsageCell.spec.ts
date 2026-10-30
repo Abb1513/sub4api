@@ -994,6 +994,67 @@ describe('AccountUsageCell', () => {
 		expect(badges.some(node => node.attributes('title') === 'usage.userBilled')).toBe(true)
   })
 
+  it('Kiro 直连 API Key 账号在今日徽章里展示积分消耗', async () => {
+		const wrapper = mount(AccountUsageCell, {
+		  props: {
+		    account: makeAccount({
+		      id: 3002,
+		      platform: 'kiro',
+		      type: 'apikey'
+		    }),
+		    todayStats: {
+		      requests: 12,
+		      tokens: 3400,
+		      cost: 1.2,
+		      standard_cost: 1.2,
+		      user_cost: 1.2,
+		      kiro_credits: 3.4567
+		    }
+		  },
+		  global: {
+		    stubs: {
+		      UsageProgressBar: true,
+		      AccountQuotaInfo: true
+		    }
+		  }
+		})
+
+		await flushPromises()
+
+		expect(wrapper.get('[data-testid="key-today-credits"]').text()).toBe('3.4567 cr')
+  })
+
+  it('Kiro OAuth 账号在 credits 进度下方展示今日积分消耗', async () => {
+    getUsage.mockResolvedValue({
+      kiro_credit: { current_usage: 125, usage_limit: 2000, percentage_used: 6.25 }
+    })
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({ id: 3004, platform: 'kiro', type: 'oauth' }),
+        todayStats: { requests: 3, tokens: 900, cost: 0.3, standard_cost: 0.3, user_cost: 0.3, kiro_credits: 0.17 }
+      },
+      global: { stubs: { UsageProgressBar: true, AccountQuotaInfo: true } }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="kiro-today-credits"]').text()).toContain('0.17')
+  })
+
+  it('今日无积分消耗时不展示积分徽章', async () => {
+		const wrapper = mount(AccountUsageCell, {
+		  props: {
+		    account: makeAccount({ id: 3003, platform: 'anthropic', type: 'apikey' }),
+		    todayStats: { requests: 1, tokens: 10, cost: 0.1, standard_cost: 0.1, user_cost: 0.1, kiro_credits: 0 }
+		  },
+		  global: { stubs: { UsageProgressBar: true, AccountQuotaInfo: true } }
+		})
+
+		await flushPromises()
+
+		expect(wrapper.find('[data-testid="key-today-credits"]').exists()).toBe(false)
+  })
+
   it('Grok OAuth compact UI drops local chips and header quota bars', async () => {
     getUsage.mockResolvedValue({
       grok_local_usage: {

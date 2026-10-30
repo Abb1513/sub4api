@@ -524,6 +524,7 @@ export default {
       upstreamRequestId: 'Upstream ID',
       requestIdCopied: 'Request ID copied',
       upstreamRequestIdCopied: 'Upstream ID copied',
+      upstreamCredits: 'Upstream credits',
       allModels: 'All Models',
       allAccounts: 'All Accounts',
       allGroups: 'All Groups',

@@ -497,6 +497,10 @@
           <span v-if="kiroOverageSummary" class="inline-flex items-center gap-1 font-medium">
             {{ kiroOverageSummary }}
           </span>
+          <span v-if="kiroTodayCredits" data-testid="kiro-today-credits" class="inline-flex items-center gap-1">
+            <span class="text-gray-400 dark:text-gray-500">{{ t('admin.accounts.usageWindow.kiroToday') }}</span>
+            <span class="font-medium tabular-nums text-amber-600 dark:text-amber-400">{{ kiroTodayCredits }}</span>
+          </span>
         </div>
       </div>
       <div v-else class="text-xs text-gray-400">-</div>
@@ -696,6 +700,14 @@
           >
             U ${{ formatKeyUserCost }}
           </span>
+          <span
+            v-if="kiroTodayCredits"
+            data-testid="key-today-credits"
+            class="rounded bg-amber-50 px-1.5 py-0.5 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300"
+            :title="t('admin.accounts.stats.todayCredits')"
+          >
+            {{ kiroTodayCredits }} cr
+          </span>
         </div>
       </div>
       <!-- Loading skeleton for today stats -->
@@ -749,6 +761,7 @@ import type { Account, AccountUsageInfo, GeminiCredentials, WindowStats } from '
 import { buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { enqueueUsageRequest } from '@/utils/usageLoadQueue'
 import { formatCompactNumber } from '@/utils/format'
+import { formatCredits } from '@/utils/formatters'
 import UsageProgressBar from './UsageProgressBar.vue'
 import AccountQuotaInfo from './AccountQuotaInfo.vue'
 import ClaudeResetCreditsCell from './ClaudeResetCreditsCell.vue'
@@ -1503,6 +1516,11 @@ const clampKiroPercent = (value?: number | null) => {
 
 const kiroCreditPercent = computed(() => clampKiroPercent(usageInfo.value?.kiro_credit?.percentage_used))
 const kiroBonusPercent = computed(() => clampKiroPercent(usageInfo.value?.kiro_bonus?.percentage_used))
+// Today's Kiro credit spend aggregated from usage_logs.kiro_credits (empty when nothing was consumed).
+const kiroTodayCredits = computed(() => {
+  const credits = props.todayStats?.kiro_credits ?? 0
+  return credits > 0 ? formatCredits(credits) : ''
+})
 
 const formatKiroAmount = (value?: number | null) => {
   if (value == null || !Number.isFinite(value)) return '0'

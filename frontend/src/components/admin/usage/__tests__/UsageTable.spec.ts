@@ -175,6 +175,41 @@ describe('admin UsageTable tooltip', () => {
     expect(wrapper.get('[data-testid="long-context-billing-marker"]').text()).toBe('x2')
   })
 
+  it('shows upstream credits only for rows that consumed credits', () => {
+    const DataTableCreditsStub = {
+      props: ['data'],
+      template: `
+        <div>
+          <div v-for="row in data" :key="row.request_id">
+            <slot name="cell-upstream_credits" :row="row" />
+          </div>
+        </div>
+      `,
+    }
+    const wrapper = mount(UsageTable, {
+      props: {
+        data: [
+          { ...baseImageRow, request_id: 'req-kiro-credits', upstream_credits: 0.0283 },
+          { ...baseImageRow, request_id: 'req-no-credits', upstream_credits: null },
+        ],
+        loading: false,
+        columns: [],
+      },
+      global: {
+        stubs: {
+          DataTable: DataTableCreditsStub,
+          EmptyState: true,
+          Icon: true,
+          Teleport: true,
+        },
+      },
+    })
+
+    const cells = wrapper.findAll('[data-testid="upstream-credits-cell"]')
+    expect(cells.map((cell) => cell.text())).toEqual(['0.0283', '-'])
+    expect(wrapper.text()).not.toContain('$0.0283')
+  })
+
   it('keeps the request type badge and adds a separate badge only for native compaction rows', () => {
     const DataTableStreamStub = {
       props: ['data'],

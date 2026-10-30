@@ -1824,6 +1824,7 @@ export default {
         todayRequests: 'Today Requests',
         todayTokens: 'Today Tokens',
         todayCost: 'Today Cost',
+        todayCredits: 'Today Credits',
         usageTrend: '30-Day Cost & Request Trend',
         noData: 'No usage data available for this account'
       },
@@ -1839,6 +1840,7 @@ export default {
         kiroCredits: 'Credits',
         kiroBonus: 'Bonus',
         kiroReset: 'Reset',
+        kiroToday: 'Today',
         kiroOverage: 'Overage',
         kiroDaysLeft: '{days}d left',
         kiroExpires: 'Expires',

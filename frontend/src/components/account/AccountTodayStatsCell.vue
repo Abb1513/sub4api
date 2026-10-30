@@ -46,6 +46,13 @@
           formatCurrency(props.stats.user_cost)
         }}</span>
       </div>
+      <!-- Upstream credits (Kiro) -->
+      <div v-if="(props.stats.kiro_credits ?? 0) > 0" class="flex items-center gap-1">
+        <span class="text-gray-500 dark:text-gray-400">{{ t('admin.accounts.stats.todayCredits') }}:</span>
+        <span class="font-medium tabular-nums text-amber-600 dark:text-amber-400">{{
+          formatCredits(props.stats.kiro_credits)
+        }}</span>
+      </div>
     </div>
 
     <!-- No data -->
@@ -57,6 +64,7 @@
 import { useI18n } from 'vue-i18n'
 import type { WindowStats } from '@/types'
 import { formatNumber, formatCurrency } from '@/utils/format'
+import { formatCredits } from '@/utils/formatters'
 
 const props = withDefaults(
   defineProps<{

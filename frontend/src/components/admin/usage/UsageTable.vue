@@ -231,6 +231,16 @@
           </div>
         </template>
 
+        <template #cell-upstream_credits="{ row }">
+          <span
+            v-if="row.upstream_credits != null && row.upstream_credits > 0"
+            data-testid="upstream-credits-cell"
+            class="text-sm font-medium tabular-nums text-amber-600 dark:text-amber-400"
+            :title="String(row.upstream_credits)"
+          >{{ formatCredits(row.upstream_credits) }}</span>
+          <span v-else data-testid="upstream-credits-cell" class="text-sm text-gray-400 dark:text-gray-500">-</span>
+        </template>
+
         <!-- 合并首字/总耗时的健康度列：左侧色条上端随首字档、下端随总耗时档，中段(40%-60%)短渐变过渡，便于纵向扫视整体健康状况 -->
         <template #cell-latency="{ row }">
           <div class="flex items-stretch gap-2">
@@ -536,7 +546,7 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { formatDateTime, formatReasoningEffort, reasoningEffortValuesEqual } from '@/utils/format'
-import { formatCacheTokens, formatMultiplier } from '@/utils/formatters'
+import { formatCacheTokens, formatCredits, formatMultiplier } from '@/utils/formatters'
 import { formatTokenPricePerMillion } from '@/utils/usagePricing'
 import { getUsageServiceTierLabel } from '@/utils/usageServiceTier'
 import { resolveUsageRequestType } from '@/utils/usageRequestType'

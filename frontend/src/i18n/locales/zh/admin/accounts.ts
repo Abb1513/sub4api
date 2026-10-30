@@ -629,6 +629,7 @@ export default {
         kiroCredits: 'Credits',
         kiroBonus: 'Bonus',
         kiroReset: '重置',
+        kiroToday: '今日消耗',
         kiroOverage: '超额',
         kiroDaysLeft: '剩余 {days} 天',
         kiroExpires: '到期',
@@ -1922,6 +1923,7 @@ export default {
         todayRequests: '今日请求',
         todayTokens: '今日 Token',
         todayCost: '今日费用',
+        todayCredits: '今日积分',
         usageTrend: '30天费用与请求趋势',
         noData: '该账号暂无使用数据'
       }

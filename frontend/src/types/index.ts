@@ -1411,6 +1411,7 @@ export interface WindowStats {
   cost: number // Account cost (account multiplier)
   standard_cost?: number
   user_cost?: number
+  kiro_credits?: number // Kiro credits consumed in this window (Kiro accounts only)
 }
 
 export interface UsageProgress {
@@ -1898,6 +1899,8 @@ export interface AdminUsageLog extends UsageLog {
   account_rate_multiplier?: number | null
   // 自定义定价规则计算的账号统计费用（nil 时使用 total_cost * multiplier）
   account_stats_cost?: number | null
+  // 本次请求消耗的上游积分（Kiro credits，仅管理员可见）
+  upstream_credits?: number | null
 
   // 渠道 ID 和计费等级（仅管理员可见）
   channel_id?: number | null
