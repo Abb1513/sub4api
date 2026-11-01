@@ -120,20 +120,25 @@ func (s *GatewayService) streamKiroWebSearchAsAnthropic(
 	currentToolUseID := "srvtoolu_" + kiropkg.GenerateToolUseID()
 	nextContentBlockIndex := 0
 
-	if err := writeAnthropicMessageStart(w, "", requestModel, inputTokens, plan.result()); err != nil {
-		return err
-	}
-
 	for iteration := 0; iteration < kiroMaxWebSearchIterations; iteration++ {
-		s.prefetchKiroWebSearchDescription(ctx, account, token)
-
 		results, nextToken, mcpErr := s.callKiroWebSearchMCP(ctx, account, token, query)
+		// Pure native search is served by MCP. Sending those results back through
+		// generateAssistantResponse makes Kiro reject the request with 400.
+		if iteration == 0 && mcpErr == nil {
+			return writeSSEChunks(w, kiropkg.GeneratePureWebSearchEvents(requestModel, query, currentToolUseID, results, inputTokens))
+		}
 		if strings.TrimSpace(nextToken) != "" {
 			token = nextToken
 		}
 		if mcpErr != nil {
 			results = nil
 		}
+		if iteration == 0 {
+			if err := writeAnthropicMessageStart(w, "", requestModel, inputTokens, plan.result()); err != nil {
+				return err
+			}
+		}
+		s.prefetchKiroWebSearchDescription(ctx, account, token)
 
 		if err := writeSSEChunks(w, kiropkg.GenerateSearchIndicatorEvents(query, currentToolUseID, results, nextContentBlockIndex)); err != nil {
 			return err
@@ -217,15 +222,36 @@ func (s *GatewayService) executeKiroWebSearch(ctx context.Context, account *Acco
 	cacheUsageResolved := false
 
 	for iteration := 0; iteration < kiroMaxWebSearchIterations; iteration++ {
-		s.prefetchKiroWebSearchDescription(ctx, account, token)
-
 		results, nextToken, mcpErr := s.callKiroWebSearchMCP(ctx, account, token, query)
+		if iteration == 0 && mcpErr == nil {
+			body, err := kiropkg.BuildPureWebSearchResponse(requestModel, query, currentToolUseID, results, inputTokens)
+			if err != nil {
+				return nil, err
+			}
+			var decoded struct {
+				Usage struct {
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				return nil, err
+			}
+			return &kiroWebSearchExecution{
+				ResponseBody: body,
+				Usage: ClaudeUsage{
+					InputTokens:  inputTokens,
+					OutputTokens: decoded.Usage.OutputTokens,
+				},
+				RequestID: requestID,
+			}, nil
+		}
 		if strings.TrimSpace(nextToken) != "" {
 			token = nextToken
 		}
 		if mcpErr != nil {
 			results = nil
 		}
+		s.prefetchKiroWebSearchDescription(ctx, account, token)
 		searches = append(searches, kiropkg.SearchIndicator{
 			ToolUseID: currentToolUseID,
 			Query:     query,

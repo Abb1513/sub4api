@@ -136,3 +136,25 @@ func TestSearchGuidanceText_IsStructured(t *testing.T) {
 	require.Contains(t, guidance, "Then you MUST use the web_search tool again with a refined query.")
 	require.Contains(t, guidance, "Rephrasing in English for better coverage")
 }
+
+func TestBuildPureWebSearchResponseEndsWithoutModelGeneration(t *testing.T) {
+	snippet := "Shanghai is cloudy."
+	results := &WebSearchResults{Results: []WebSearchResult{{
+		Title:   "Shanghai Weather",
+		URL:     "https://example.com/weather",
+		Snippet: &snippet,
+	}}}
+
+	body, err := BuildPureWebSearchResponse("claude-sonnet", "shanghai weather", "srvtoolu_test", results, 12)
+	require.NoError(t, err)
+	require.Equal(t, "end_turn", gjson.GetBytes(body, "stop_reason").String())
+	require.Contains(t, gjson.GetBytes(body, "content.0.text").String(), `I'll search for "shanghai weather".`)
+	require.Equal(t, "server_tool_use", gjson.GetBytes(body, "content.1.type").String())
+	require.Equal(t, "web_search", gjson.GetBytes(body, "content.1.name").String())
+	require.Equal(t, "web_search_tool_result", gjson.GetBytes(body, "content.2.type").String())
+	require.Equal(t, "https://example.com/weather", gjson.GetBytes(body, "content.2.content.0.url").String())
+	require.Contains(t, gjson.GetBytes(body, "content.3.text").String(), "Shanghai Weather")
+	require.Contains(t, gjson.GetBytes(body, "content.3.text").String(), "https://example.com/weather")
+	require.NotContains(t, gjson.GetBytes(body, "content.3.text").String(), `"url":`)
+	require.Equal(t, int64(1), gjson.GetBytes(body, "usage.server_tool_use.web_search_requests").Int())
+}
