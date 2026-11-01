@@ -389,10 +389,12 @@ func GeneratePureWebSearchSummary(query string, results *WebSearchResults) strin
 			}
 			fmt.Fprintf(&builder, "   Source: %s\n\n", strings.TrimSpace(result.URL))
 		}
-	} else {
-		builder.WriteString("No results found.\n")
+	} else if _, err := builder.WriteString("No results found.\n"); err != nil {
+		return ""
 	}
-	builder.WriteString("\nPlease note that these are web search results and may not be fully accurate or up-to-date.")
+	if _, err := builder.WriteString("\nPlease note that these are web search results and may not be fully accurate or up-to-date."); err != nil {
+		return ""
+	}
 	return builder.String()
 }
 
