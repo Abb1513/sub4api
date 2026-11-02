@@ -366,3 +366,224 @@ Then you MUST use the web_search tool again with a refined query. Try:
 Do NOT apologize for bad results without first attempting a re-search.
 </search_guidance>`, now.Format("January 2, 2006"), now.Format("Monday"))
 }
+
+func GeneratePureWebSearchSummary(query string, results *WebSearchResults) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Here are the search results for \"%s\":\n\n", strings.TrimSpace(query))
+	if results != nil && len(results.Results) > 0 {
+		for i, result := range results.Results {
+			title := strings.TrimSpace(result.Title)
+			if title == "" {
+				title = "Untitled"
+			}
+			fmt.Fprintf(&builder, "%d. **%s**\n", i+1, title)
+			if result.Snippet != nil {
+				snippet := strings.TrimSpace(*result.Snippet)
+				runes := []rune(snippet)
+				if len(runes) > 200 {
+					snippet = string(runes[:200]) + "..."
+				}
+				if snippet != "" {
+					fmt.Fprintf(&builder, "   %s\n", snippet)
+				}
+			}
+			fmt.Fprintf(&builder, "   Source: %s\n\n", strings.TrimSpace(result.URL))
+		}
+	} else if _, err := builder.WriteString("No results found.\n"); err != nil {
+		return ""
+	}
+	if _, err := builder.WriteString("\nPlease note that these are web search results and may not be fully accurate or up-to-date."); err != nil {
+		return ""
+	}
+	return builder.String()
+}
+
+func pureWebSearchDecision(query string) string {
+	return fmt.Sprintf("I'll search for \"%s\".", strings.TrimSpace(query))
+}
+
+func BuildPureWebSearchResponse(model, query, toolUseID string, results *WebSearchResults, inputTokens int) ([]byte, error) {
+	if strings.TrimSpace(toolUseID) == "" {
+		toolUseID = "srvtoolu_" + GenerateToolUseID()
+	}
+	summary := GeneratePureWebSearchSummary(query, results)
+	response := map[string]any{
+		"id":            "msg_" + GenerateToolUseID(),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       buildPureWebSearchContent(query, toolUseID, results, summary),
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage": map[string]any{
+			"input_tokens":                inputTokens,
+			"output_tokens":               estimatePureWebSearchOutputTokens(summary),
+			"cache_creation_input_tokens": 0,
+			"cache_read_input_tokens":     0,
+			"server_tool_use": map[string]any{
+				"web_search_requests": 1,
+			},
+		},
+	}
+	return json.Marshal(response)
+}
+
+func GeneratePureWebSearchEvents(model, query, toolUseID string, results *WebSearchResults, inputTokens int) [][]byte {
+	if strings.TrimSpace(model) == "" {
+		model = "kiro"
+	}
+	if strings.TrimSpace(toolUseID) == "" {
+		toolUseID = "srvtoolu_" + GenerateToolUseID()
+	}
+	summary := GeneratePureWebSearchSummary(query, results)
+	outputTokens := estimatePureWebSearchOutputTokens(summary)
+	searchContent := buildSearchResultContent(results)
+	decision := pureWebSearchDecision(query)
+	events := []struct {
+		eventType string
+		payload   map[string]any
+	}{
+		{
+			eventType: "message_start",
+			payload: map[string]any{
+				"type": "message_start",
+				"message": map[string]any{
+					"id":            "msg_" + GenerateToolUseID(),
+					"type":          "message",
+					"role":          "assistant",
+					"model":         model,
+					"content":       []any{},
+					"stop_reason":   nil,
+					"stop_sequence": nil,
+					"usage": map[string]any{
+						"input_tokens":                inputTokens,
+						"output_tokens":               0,
+						"cache_creation_input_tokens": 0,
+						"cache_read_input_tokens":     0,
+					},
+				},
+			},
+		},
+		{
+			eventType: "content_block_start",
+			payload: map[string]any{
+				"type":          "content_block_start",
+				"index":         0,
+				"content_block": map[string]any{"type": "text", "text": ""},
+			},
+		},
+		{
+			eventType: "content_block_delta",
+			payload: map[string]any{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]any{"type": "text_delta", "text": decision},
+			},
+		},
+		{
+			eventType: "content_block_stop",
+			payload:   map[string]any{"type": "content_block_stop", "index": 0},
+		},
+		{
+			eventType: "content_block_start",
+			payload: map[string]any{
+				"type":  "content_block_start",
+				"index": 1,
+				"content_block": map[string]any{
+					"type":  "server_tool_use",
+					"id":    toolUseID,
+					"name":  "web_search",
+					"input": map[string]any{"query": query},
+				},
+			},
+		},
+		{
+			eventType: "content_block_stop",
+			payload:   map[string]any{"type": "content_block_stop", "index": 1},
+		},
+		{
+			eventType: "content_block_start",
+			payload: map[string]any{
+				"type":  "content_block_start",
+				"index": 2,
+				"content_block": map[string]any{
+					"type":    "web_search_tool_result",
+					"content": searchContent,
+				},
+			},
+		},
+		{
+			eventType: "content_block_stop",
+			payload:   map[string]any{"type": "content_block_stop", "index": 2},
+		},
+		{
+			eventType: "content_block_start",
+			payload: map[string]any{
+				"type":          "content_block_start",
+				"index":         3,
+				"content_block": map[string]any{"type": "text", "text": ""},
+			},
+		},
+		{
+			eventType: "content_block_delta",
+			payload: map[string]any{
+				"type":  "content_block_delta",
+				"index": 3,
+				"delta": map[string]any{"type": "text_delta", "text": summary},
+			},
+		},
+		{
+			eventType: "content_block_stop",
+			payload:   map[string]any{"type": "content_block_stop", "index": 3},
+		},
+		{
+			eventType: "message_delta",
+			payload: map[string]any{
+				"type":  "message_delta",
+				"delta": map[string]any{"stop_reason": "end_turn"},
+				"usage": map[string]any{
+					"output_tokens": outputTokens,
+					"server_tool_use": map[string]any{
+						"web_search_requests": 1,
+					},
+				},
+			},
+		},
+		{
+			eventType: "message_stop",
+			payload:   map[string]any{"type": "message_stop"},
+		},
+	}
+
+	out := make([][]byte, 0, len(events))
+	for _, event := range events {
+		payload, _ := json.Marshal(event.payload)
+		out = append(out, []byte("event: "+event.eventType+"\ndata: "+string(payload)+"\n\n"))
+	}
+	return out
+}
+
+func buildPureWebSearchContent(query, toolUseID string, results *WebSearchResults, summary string) []map[string]any {
+	return []map[string]any{
+		{"type": "text", "text": pureWebSearchDecision(query)},
+		{
+			"type":  "server_tool_use",
+			"id":    toolUseID,
+			"name":  "web_search",
+			"input": map[string]any{"query": query},
+		},
+		{
+			"type":    "web_search_tool_result",
+			"content": buildSearchResultContent(results),
+		},
+		{"type": "text", "text": summary},
+	}
+}
+
+func estimatePureWebSearchOutputTokens(summary string) int {
+	tokens := (len([]rune(summary)) + 3) / 4
+	if tokens < 1 {
+		return 1
+	}
+	return tokens
+}

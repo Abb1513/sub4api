@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -631,6 +632,38 @@ func BuildKiroPayloadWithContext(claudeBody []byte, modelID, profileArn, origin 
 	return &KiroBuildResult{Payload: payloadBytes, Context: requestCtx}, nil
 }
 
+// kiroModelAccessRestrictedError is an empty upstream completion caused by a
+// temporary model-level access restriction, not a normal end_turn.
+type kiroModelAccessRestrictedError struct{}
+
+func (e *kiroModelAccessRestrictedError) Error() string {
+	return "kiro model access temporarily restricted due to excessive content refusals"
+}
+
+// IsModelAccessRestricted reports whether err is the Kiro model-access restriction.
+func IsModelAccessRestricted(err error) bool {
+	var target *kiroModelAccessRestrictedError
+	return errors.As(err, &target)
+}
+
+func noteKiroModelAccessSignals(payload []byte, sawFiltered, sawExplanation *bool) {
+	if len(payload) == 0 || sawFiltered == nil || sawExplanation == nil {
+		return
+	}
+	lower := bytes.ToLower(payload)
+	if bytes.Contains(lower, []byte("content_filtered")) &&
+		(bytes.Contains(lower, []byte("stopreason")) || bytes.Contains(lower, []byte("stop_reason"))) {
+		*sawFiltered = true
+	}
+	if bytes.Contains(lower, []byte("temporarily restricted")) && bytes.Contains(lower, []byte("excessive content refusals")) {
+		*sawExplanation = true
+	}
+}
+
+func kiroModelAccessRestricted(sawFiltered, sawExplanation bool) bool {
+	return sawFiltered && sawExplanation
+}
+
 func ParseNonStreamingEventStreamWithContext(body io.Reader, model string, requestCtx KiroRequestContext) (*ParseResult, error) {
 	content, toolUses, usage, stopReason, err := parseEventStream(body, requestCtx.TokenizerAlgorithm)
 	if err != nil {
@@ -663,6 +696,8 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 	messageStartSent := false
 	textBlockOpen := false
 	thinkingBlockOpen := false
+	sawKiroContentFiltered := false
+	sawKiroAccessRestriction := false
 	processedIDs := make(map[string]bool)
 	emittedToolContents := make(map[string]bool)
 	streamingToolNames := make(map[string]string)
@@ -1325,6 +1360,7 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		if err := decoder.Decode(&trailing); err != io.EOF {
 			continue
 		}
+		noteKiroModelAccessSignals(msg.Payload, &sawKiroContentFiltered, &sawKiroAccessRestriction)
 
 		if kiroUpstreamTraceEnabled {
 			payloadPrefix := string(msg.Payload)
@@ -1354,6 +1390,10 @@ func StreamEventStreamAsAnthropicWithContext(ctx context.Context, body io.Reader
 		}
 	}
 
+	if kiroModelAccessRestricted(sawKiroContentFiltered, sawKiroAccessRestriction) &&
+		!messageStartSent && !toolBlockEmitted && !textBlockOpen && !thinkingBlockOpen && pendingAssistantText == "" {
+		return nil, &kiroModelAccessRestrictedError{}
+	}
 	if err := closeOpenStreamingTool(); err != nil {
 		return nil, err
 	}
@@ -3169,6 +3209,8 @@ func parseEventStream(body io.Reader, alg anthropictokenizer.Algorithm) (string,
 	var toolUses []KiroToolUse
 	var usage Usage
 	stopReason := ""
+	sawKiroContentFiltered := false
+	sawKiroAccessRestriction := false
 	processedIDs := make(map[string]bool)
 	var currentTool *toolUseState
 	reasoningOpen := false
@@ -3202,6 +3244,7 @@ func parseEventStream(body io.Reader, alg anthropictokenizer.Algorithm) (string,
 		if err := decoder.Decode(&trailing); err != io.EOF {
 			continue
 		}
+		noteKiroModelAccessSignals(msg.Payload, &sawKiroContentFiltered, &sawKiroAccessRestriction)
 		if sr := readStopReason(event); sr != "" {
 			stopReason = sr
 		}
@@ -3286,6 +3329,10 @@ func parseEventStream(body io.Reader, alg anthropictokenizer.Algorithm) (string,
 		} else {
 			stopReason = "end_turn"
 		}
+	}
+	if kiroModelAccessRestricted(sawKiroContentFiltered, sawKiroAccessRestriction) &&
+		strings.TrimSpace(cleanText) == "" && !hasUsableToolUses(toolUses) {
+		return "", nil, usage, "CONTENT_FILTERED", &kiroModelAccessRestrictedError{}
 	}
 	return cleanText, toolUses, usage, stopReason, nil
 }

@@ -3588,3 +3588,50 @@ func TestBuildKiroPayloadTrailingAssistantThenSystemStillAttachesTools(t *testin
 	require.Greater(t, gjson.GetBytes(payload, "conversationState.currentMessage.userInputMessage.userInputMessageContext.tools.#").Int(), int64(0))
 	require.Contains(t, gjson.GetBytes(payload, "conversationState.history.0.userInputMessage.content").String(), "TRAILING NOTE")
 }
+
+func kiroModelAccessRestrictionFrame(t *testing.T) []byte {
+	t.Helper()
+	return buildEventStreamFrame(t, "metadataEvent", map[string]any{
+		"stopDetails": map[string]any{
+			"refusal": map[string]any{
+				"explanation": "Your access to this model has been temporarily restricted due to excessive content refusals.",
+			},
+		},
+		"stopReason": "CONTENT_FILTERED",
+	})
+}
+
+func TestStreamModelAccessRestrictionFailsOverWithoutWriting(t *testing.T) {
+	stream := bytes.NewBuffer(kiroModelAccessRestrictionFrame(t))
+	var out bytes.Buffer
+	_, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-opus-4-8", 3, KiroRequestContext{})
+	require.Error(t, err)
+	require.True(t, IsModelAccessRestricted(err))
+	require.Empty(t, out.String())
+}
+
+func TestStreamModelAccessRestrictionKeepsExistingContent(t *testing.T) {
+	stream := bytes.NewBuffer(nil)
+	_, _ = stream.Write(buildEventStreamFrame(t, "assistantResponseEvent", map[string]any{
+		"assistantResponseEvent": map[string]any{"content": "hello"},
+	}))
+	_, _ = stream.Write(kiroModelAccessRestrictionFrame(t))
+	var out bytes.Buffer
+	_, err := StreamEventStreamAsAnthropicWithContext(context.Background(), stream, &out, "claude-opus-4-8", 3, KiroRequestContext{})
+	require.NoError(t, err)
+	require.Contains(t, out.String(), "hello")
+}
+
+func TestParseModelAccessRestrictionDoesNotLookLikeEmptySuccess(t *testing.T) {
+	_, err := ParseNonStreamingEventStreamWithContext(bytes.NewReader(kiroModelAccessRestrictionFrame(t)), "claude-opus-4-8", KiroRequestContext{})
+	require.True(t, IsModelAccessRestricted(err))
+}
+
+func TestParseOrdinaryContentFilterIsNotModelAccessRestriction(t *testing.T) {
+	frame := buildEventStreamFrame(t, "metadataEvent", map[string]any{
+		"stopReason": "CONTENT_FILTERED",
+	})
+	result, err := ParseNonStreamingEventStreamWithContext(bytes.NewReader(frame), "claude-opus-4-8", KiroRequestContext{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}

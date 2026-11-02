@@ -1,6 +1,8 @@
 package kiro
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -70,4 +72,27 @@ func TestAdjustSSEChunk_OffsetsIndicesAndDropsMessageStart(t *testing.T) {
 	adjusted, shouldForward := AdjustSSEChunk([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"), 3)
 	require.True(t, shouldForward)
 	require.Contains(t, string(adjusted), `"index":3`)
+}
+
+func TestGeneratePureWebSearchEventsEndsTurnWithoutToolUse(t *testing.T) {
+	events := GeneratePureWebSearchEvents("claude-sonnet", "shanghai weather", "srvtoolu_test", nil, 4)
+
+	require.NotEmpty(t, events)
+	joined := string(bytes.Join(events, nil))
+	require.Contains(t, joined, `"type":"message_start"`)
+	require.Contains(t, joined, `"type":"server_tool_use"`)
+	require.Contains(t, joined, `"name":"web_search"`)
+	require.Contains(t, joined, `"type":"web_search_tool_result"`)
+	require.Contains(t, joined, `"stop_reason":"end_turn"`)
+	require.Contains(t, joined, `"type":"message_stop"`)
+	require.NotContains(t, joined, `"type":"tool_use"`)
+	require.Equal(t, 1, strings.Count(joined, "event: message_start"))
+	decision := strings.Index(joined, `I'll search for \"shanghai weather\".`)
+	tool := strings.Index(joined, `"type":"server_tool_use"`)
+	result := strings.Index(joined, `"type":"web_search_tool_result"`)
+	summary := strings.Index(joined, "No results found.")
+	require.GreaterOrEqual(t, decision, 0)
+	require.Less(t, decision, tool)
+	require.Less(t, tool, result)
+	require.Less(t, result, summary)
 }
