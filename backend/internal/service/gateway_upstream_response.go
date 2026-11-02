@@ -1005,6 +1005,10 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
 			if ev.err != nil {
+				var modelRestricted *kiroModelAccessRestrictedFailover
+				if errors.As(ev.err, &modelRestricted) && modelRestricted != nil && modelRestricted.UpstreamFailoverError != nil && !c.Writer.Written() {
+					return nil, modelRestricted.UpstreamFailoverError
+				}
 				if sawTerminalEvent {
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 				}

@@ -69,6 +69,44 @@ func resolveKiroUpstreamModel(mappedModel string) string {
 	return upstreamModel
 }
 
+const kiroModelAccessRestrictedCooldown = 30 * time.Minute
+
+// kiroModelAccessRestrictedFailover marks an empty Kiro completion whose
+// stop reason is a temporary model-access restriction. Unwrap exposes the
+// failover error the handler already switches accounts on.
+type kiroModelAccessRestrictedFailover struct {
+	*UpstreamFailoverError
+}
+
+func (e *kiroModelAccessRestrictedFailover) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.UpstreamFailoverError
+}
+
+func (s *GatewayService) newKiroModelAccessRestrictedFailover(ctx context.Context, account *Account) *kiroModelAccessRestrictedFailover {
+	if s != nil && s.accountRepo != nil && account != nil {
+		until := time.Now().Add(kiroModelAccessRestrictedCooldown)
+		reason := "CONTENT_FILTERED: model access temporarily restricted due to excessive content refusals (auto temp-unschedule 30m)"
+		if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
+			logger.LegacyPrintf("service.gateway", "[kiro] temp_unschedule_failed account=%d error=%v", account.ID, err)
+		}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "api_error",
+			"message": "upstream model access temporarily restricted due to excessive content refusals",
+		},
+	})
+	return &kiroModelAccessRestrictedFailover{UpstreamFailoverError: &UpstreamFailoverError{
+		StatusCode:             http.StatusForbidden,
+		ResponseBody:           body,
+		RetryableOnSameAccount: false,
+	}}
+}
+
 func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest, startTime time.Time) (*ForwardResult, error) {
 	if account == nil || parsed == nil {
 		return nil, fmt.Errorf("kiro forward: missing account or request")
@@ -250,6 +288,9 @@ func (s *GatewayService) forwardKiroMessages(ctx context.Context, c *gin.Context
 	requestCtx.TokenizerAlgorithm = s.kiroMeteringAlgorithm(ctx)
 	parseResult, err := kiropkg.ParseNonStreamingEventStreamWithContext(resp.Body, originalModel, requestCtx)
 	if err != nil {
+		if kiropkg.IsModelAccessRestricted(err) {
+			return nil, s.newKiroModelAccessRestrictedFailover(ctx, account)
+		}
 		c.JSON(http.StatusBadGateway, gin.H{
 			"type": "error",
 			"error": gin.H{
@@ -350,6 +391,10 @@ func (s *GatewayService) openKiroAnthropicStreamResponse(ctx context.Context, ac
 		defer func() { _ = resp.Body.Close() }()
 		_, streamErr := kiropkg.StreamEventStreamAsAnthropicWithContext(upstreamCtx, resp.Body, pw, requestModel, inputTokens, requestCtx)
 		if streamErr != nil {
+			if kiropkg.IsModelAccessRestricted(streamErr) {
+				_ = pw.CloseWithError(s.newKiroModelAccessRestrictedFailover(upstreamCtx, account))
+				return
+			}
 			_, _ = io.WriteString(pw, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream interrupted\"}}\n\n")
 			_ = pw.CloseWithError(streamErr)
 			return

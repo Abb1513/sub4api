@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/MACOS-DO/sub4api/internal/config"
 	"github.com/MACOS-DO/sub4api/internal/domain"
@@ -615,4 +616,78 @@ func TestBuildKiroPayloadForAccount_StableConversationIDByDefault(t *testing.T) 
 	randomized, err := (&GatewayService{}).buildKiroPayloadForAccount(context.Background(), account, parsed, body, "claude-sonnet-4.5", "kiro-access-token", "claude-sonnet-4.5", nil)
 	require.NoError(t, err)
 	require.NotEqual(t, firstID, gjson.GetBytes(randomized.Payload, "conversationState.conversationId").String())
+}
+
+func kiroRestrictionUpstreamBody(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	body := bytes.NewBuffer(nil)
+	_, _ = body.Write(buildKiroEventStreamFrame(t, "metadataEvent", map[string]any{
+		"stopDetails": map[string]any{
+			"refusal": map[string]any{
+				"explanation": "Your access to this model has been temporarily restricted due to excessive content refusals.",
+			},
+		},
+		"stopReason": "CONTENT_FILTERED",
+	}))
+	return body
+}
+
+func TestForwardKiroModelAccessRestrictionSwitchesAccountAndTempUnschedules(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, stream := range []bool{true, false} {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		account := &Account{
+			ID:          30,
+			Name:        "kiro-restricted",
+			Platform:    PlatformKiro,
+			Type:        AccountTypeOAuth,
+			Status:      StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Credentials: map[string]any{
+				"access_token": "kiro-access-token",
+				"profile_arn":  "arn:aws:codewhisperer:us-east-1:123456789012:profile/RESTRICTED",
+			},
+		}
+		repo := &recordingKiroTempUnschedRepo{}
+		upstream := &queuedHTTPUpstream{
+			responses: []*http.Response{{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/vnd.amazon.eventstream"}},
+				Body:       io.NopCloser(kiroRestrictionUpstreamBody(t)),
+			}},
+		}
+		svc := &GatewayService{
+			accountRepo:         repo,
+			httpUpstream:        upstream,
+			kiroCooldownStore:   &stubKiroCooldownStore{},
+			tlsFPProfileService: &TLSFingerprintProfileService{},
+			cfg: &config.Config{Gateway: config.GatewayConfig{
+				StreamDataIntervalTimeout: 0,
+				MaxLineSize:               defaultMaxLineSize,
+			}},
+			rateLimitService: &RateLimitService{},
+		}
+		requestBody := []byte(`{"model":"claude-opus-4-8","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+		if stream {
+			requestBody = []byte(`{"model":"claude-opus-4-8","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		}
+		parsed, err := ParseGatewayRequest(NewRequestBodyRef(requestBody), domain.PlatformAnthropic)
+		require.NoError(t, err)
+
+		before := time.Now()
+		_, err = svc.Forward(context.Background(), c, account, parsed)
+		var failoverErr *UpstreamFailoverError
+		require.ErrorAs(t, err, &failoverErr)
+		require.Equal(t, http.StatusForbidden, failoverErr.StatusCode)
+		require.False(t, failoverErr.RetryableOnSameAccount)
+		require.NotContains(t, rec.Body.String(), "message_start")
+		require.NotContains(t, rec.Body.String(), `"stop_reason"`)
+		require.True(t, repo.called)
+		require.Equal(t, account.ID, repo.id)
+		require.Contains(t, repo.reason, "auto temp-unschedule 30m")
+		require.WithinDuration(t, before.Add(30*time.Minute), repo.until, 2*time.Second)
+	}
 }
